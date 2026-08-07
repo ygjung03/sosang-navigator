@@ -153,6 +153,43 @@ def test_cost_relief():
     return r
 
 
+def test_refinance_then_forgiveness():
+    """대환 + 채무조정을 함께 적용해도 기존 부채가 이중 계산되지 않는지.
+
+    조합 문법상 융자1 + 채무조정1이 가능하므로 실제로 생길 수 있는 조합이다.
+    대환이 기존 부채 일부를 가져간 뒤, 채무조정은 '남은 부분'에만 적용돼야 한다.
+    """
+    p = UserProfile(
+        cash_on_hand=300 * MAN,
+        monthly_revenue=trend_revenue(1_100 * MAN, -0.03),
+        fixed_cost=950 * MAN,
+        variable_ratio=0.32,
+        existing_debt=9_500 * MAN,
+        existing_debt_payment=165 * MAN,
+        existing_debt_rate=0.07,
+        overdue_months=4,
+    )
+    r = simulate(
+        p,
+        [
+            Applied(db.find("fund_refinance__2y8y"), 3_000 * MAN),  # 3,000만 전환
+            Applied(db.find("new_start__default")),                  # 나머지 감면
+        ],
+    )
+    report("대환 3,000만 + 새출발기금 (동시 적용)", r)
+
+    # 대환이 3,000만을 가져갔으므로 채무조정 대상은 6,500만이어야 한다.
+    # 감면율 80% -> 감면액 5,200만 (9,500만의 80%인 7,600만이 아님)
+    expected = 6_500 * MAN * 0.8
+    print(f"   감면액 {r.forgiven/MAN:,.0f}만원 (기대 {expected/MAN:,.0f}만원)")
+    assert abs(r.forgiven - expected) < 1 * MAN, (
+        f"채무조정이 기존 부채 전액(9,500만)에 적용되면 이중 계산이다. "
+        f"실제 {r.forgiven:,.0f} / 기대 {expected:,.0f}"
+    )
+    assert sum(r.inflow) == 0, "대환·채무조정 모두 현금 유입이 없어야 함"
+    return r
+
+
 def test_combination():
     """대환 + 긴급경영안정 - 기획서 예시 1의 1순위 조합."""
     p = snack_shop_profile()
@@ -178,6 +215,7 @@ def main() -> None:
         test_bullet_repayment,
         test_refinance,
         test_debt_forgiveness,
+        test_refinance_then_forgiveness,
         test_repayment_extension,
         test_cost_relief,
         test_combination,
