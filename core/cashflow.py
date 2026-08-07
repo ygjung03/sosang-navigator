@@ -10,10 +10,10 @@
 
 핵심 계산식 (기획서 5.1)
 ------------------------
-    balance[n] = balance[n-1]
-                 + 영업 현금흐름          (매출 - 고정비 - 변동비)
-                 - 상환액                 (기존 부채 + 새로 받은 정책자금)
-                 + 유입액                 (융자 실행금 · 보조금)
+    balance_at[n] = balance_at[n-1]
+                    + 영업 현금흐름   (매출 - 고정비 - 변동비)
+                    - 상환액          (기존 부채 + 새로 받은 정책자금)
+                    + 유입액          (융자 실행금 · 보조금)
 
 이 한 줄을 36번 반복하는 것이 전부다.
 나머지 코드는 전부 "상환액·유입액 배열을 어떻게 채울 것인가"를 다룬다.
@@ -22,19 +22,39 @@
 월 적자가 매달 커지기 때문이다. 흑자·적자를 같은 식으로 처리한다.
 
 
-인덱스 규칙 (헷갈리기 쉬움)
----------------------------
-    payment[i], inflow[i]   길이 = horizon      (i+1)개월차에 나가는/들어오는 돈
-    balance[i], debt[i]     길이 = horizon + 1  i개월차 '말'의 잔고/부채
+═══════════════════════════════════════════════════════════
+좌표계 — 이 파일에서 가장 헷갈리는 부분
+═══════════════════════════════════════════════════════════
 
-잔고는 시작 시점이 필요해서 한 칸 더 길다. balance[0] = 지금 이 순간의 보유 현금.
-따라서 payment[23]은 24개월차, payment[24]는 25개월차다.
+두 가지 세는 법이 공존한다. 돈이 나가는 것은 '달 동안' 일어나고,
+잔액은 '시점'에 찍히기 때문이다.
+
+    시점 좌표 (0-based)   0 ─────── 1 ─────── 2 ─────── 3 ───────
+                          지금      1달 뒤    2달 뒤    3달 뒤
+
+    기간 좌표 (1-based)      [1개월차] [2개월차] [3개월차]
+
+이름으로 구분한다.
+
+    ~_at      저량(stock). 시점의 '상태'.   길이 horizon + 1
+              debt_at[i]    = i시점에 남아 있는 빚
+              balance_at[i] = i시점의 현금 잔고
+              balance_at[0] = 지금 이 순간 (그래서 한 칸 더 길다)
+
+    ~_during  유량(flow). 기간에 '일어난 일'. 길이 horizon
+              payment_during[i] = (i+1)개월차에 나간 돈
+              inflow_during[i]  = (i+1)개월차에 들어온 돈
+
+    시점 스칼라에도 _at 을 붙인다: start_at, grace_end_at, payout_at
+    기간 변수는 month 하나뿐이다 (1-based, 몇 개월차인지)
+
+따라서 payment_during[23]은 24개월차, payment_during[24]는 25개월차다.
+`~_at[month - 1]`은 "이번 달 시작 시점", `~_at[month]`는 "이번 달 말"이다.
 
 
 명명 규칙
 ---------
-코드 식별자는 영어, JSON 키는 한글 그대로 (loader.py 참조).
-주석·docstring은 한글.
+코드 식별자는 영어, JSON 키는 한글 그대로 (loader.py 참조). 주석은 한글.
 
 
 ═══════════════════════════════════════════════════════════
@@ -43,12 +63,17 @@
 
 A1. 상환 방식은 '원금균등분할'로 계산한다.
     공고문은 "균등분할상환"이라고만 하고 원리금균등인지 원금균등인지
-    명시하지 않는다. 원금균등이 계산이 단순하고 초기 상환 부담을
-    보수적으로(크게) 잡으므로 채택했다. -> 문의목록 A-7 확인 대상.
+    명시하지 않는다. 원금균등은 매달 갚는 '원금'이 고정(원금 / 상환개월)이고
+    이자는 남은 빚에 붙어 점점 줄어든다. 초기 상환 부담을 크게(보수적으로)
+    잡으므로 채택했다. -> 문의목록 A-7 확인 대상.
 
     ※ 거치기간에도 이자는 납부한다. '거치'는 원금 상환을 미루는 것이지
       돈을 안 내는 것이 아니다. 그래서 거치가 길수록 총 이자가 늘어
       "생존 개월수는 늘지만 순부채도 는다"는 2축 트레이드오프가 생긴다.
+
+    ※ 월 금리 = 연 금리 / 12. 이자를 매달 갚아 원금에 얹히지 않으므로
+      복리가 붙지 않는다. 7,000만원 4.45%면 매달 259,583원, 12개월 모으면
+      3,115,000원 = 7,000만 x 4.45%로 정확히 일치한다.
 
 B1. 기존 부채는 사용자가 '총 잔액'과 '월 상환액'만 입력한다.
     금리를 모르면 월 상환액 전액이 원금 상환이라고 가정한다.
@@ -81,7 +106,7 @@ from typing import Sequence
 from .loader import Candidate
 
 SIM_MONTHS = 36  # 시뮬레이션·그래프 기간 (기획서 확정값)
-NET_DEBT_MONTH = 30  # 순부채를 측정하는 시점 (기획서 확정값)
+NET_DEBT_AT = 30  # 순부채를 측정하는 시점 (기획서 확정값)
 
 
 # ══════════════════════════════════════════════════════════
@@ -98,7 +123,7 @@ class UserProfile:
 
     # ── 현재 재무 상태 ──
     cash_on_hand: int
-    """보유 현금(원). 지금 당장 쓸 수 있는 돈. balance[0]의 출발점."""
+    """보유 현금(원). 지금 당장 쓸 수 있는 돈. balance_at[0]의 출발점."""
 
     monthly_revenue: Sequence[int]
     """앞으로 horizon개월간의 **예상** 월 매출(원).
@@ -146,16 +171,16 @@ class UserProfile:
                 f"variable_ratio는 0 이상 1 미만이어야 합니다: {self.variable_ratio}"
             )
 
-    def operating_cashflow(self, month_index: int) -> float:
+    def operating_cashflow(self, month: int) -> float:
         """N개월차의 영업 현금흐름. 흑자면 양수, 적자면 음수.
 
         Args:
-            month_index: 몇 개월차인지 (1-based). **달력 월이 아니다.**
-                         t=0(현재)으로부터의 경과 개월이며, 1 = 다음 달.
+            month: 몇 개월차인지 (1-based, 기간 좌표). **달력 월이 아니다.**
+                   t=0(현재)으로부터의 경과 개월이며, 1 = 다음 달.
 
         흑자·적자에 분기가 없다. 결과가 양수면 잔고가 늘고 음수면 준다.
         """
-        revenue = self.monthly_revenue[month_index - 1]  # 배열은 0-based라 -1
+        revenue = self.monthly_revenue[month - 1]  # 배열은 0-based라 -1
         variable_cost = revenue * self.variable_ratio  # 매출에 비례하는 비용
         return revenue - self.fixed_cost - variable_cost
 
@@ -209,10 +234,13 @@ def loan_schedule(
     grace_months: int,
     repay_months: int,
     method: str = "균등분할",
-    start_month: int = 0,
+    start_at: int = 0,
     horizon: int = SIM_MONTHS,
 ) -> tuple[list[float], list[float]]:
-    """대출 하나의 월별 상환액과 잔액을 계산한다.
+    """대출 **하나**의 월별 상환액과 남은 빚을 계산한다.
+
+    이 함수는 다른 빚을 보지 않는다. 사용자의 기존 부채나 다른 융자는
+    호출한 쪽(simulate)에서 각각 계산해 합산한다.
 
     Args:
         principal:    대출 원금(원). 실제로 빌리는 금액.
@@ -221,64 +249,69 @@ def loan_schedule(
                       만기일시 방식에서는 '만기'로 해석한다.
         repay_months: 상환 개월. 거치가 끝난 뒤 원금을 나눠 갚는 기간.
         method:       "균등분할"(원금균등, 가정 A1) 또는 "만기일시".
-        start_month:  대출이 실행되는 개월차. 0 = 지금.
+        start_at:     대출이 실행되는 **시점**(0-based). 0 = 지금.
                       미래 자격 후보는 N개월 뒤이므로 N을 넣는다.
         horizon:      시뮬레이션 총 개월수.
 
     Returns:
-        (payments, balances)
-            payments[i] : (i+1)개월차에 나가는 돈 (이자 + 원금). 길이 horizon
-            balances[i] : i개월차 말에 남은 빚.               길이 horizon + 1
+        (payment_during, debt_at)
+            payment_during[i] : (i+1)개월차에 나가는 돈 (이자 + 원금). 길이 horizon
+            debt_at[i]        : i시점에 남아 있는 빚.               길이 horizon + 1
     """
-    payments = [0.0] * horizon  # 월별 상환액
-    balances = [0.0] * (horizon + 1)  # 월말 잔액
+    payment_during = [0.0] * horizon  # 유량: 월별 상환액
+    debt_at = [0.0] * (horizon + 1)  # 저량: 시점별 남은 빚
 
-    monthly_rate = annual_rate / 12  # 월 금리
-    grace_end_month = start_month + grace_months  # 거치가 끝나는 개월차
+    monthly_rate = annual_rate / 12  # 월 금리 (복리 아님 - 가정 A1 참조)
+    grace_end_at = start_at + grace_months  # 거치가 끝나는 시점
 
-    for month in range(1, horizon + 1):  # month = 몇 개월차인지 (1-based)
-        # 아직 대출을 받기 전이면 잔액 0
-        if month <= start_month:
-            balances[month] = 0.0
+    for month in range(1, horizon + 1):  # month = 몇 개월차 (1-based, 기간 좌표)
+        # ① 아직 대출을 받기 전이면 이 대출의 빚은 0
+        if month <= start_at:
+            debt_at[month] = 0.0
             continue
 
-        # 대출이 실행되는 순간: 직전 달 말 잔액에 원금을 꽂는다.
-        # balances[i]는 'i월 말'이므로, start_month 말에 빚이 생긴 것으로 본다.
-        if month == start_month + 1:
-            balances[month - 1] = principal
+        # ② 대출이 실행되는 순간: 그 '시점'에 원금이 꽂힌다.
+        #    N개월차의 시작 = (N-1)시점 이므로 month-1 을 쓴다.
+        #    start_at=0 -> month=1 -> debt_at[0] = 원금 (지금 실행)
+        #    start_at=3 -> month=4 -> debt_at[3] = 원금 (3개월 뒤 실행)
+        if month == start_at + 1:
+            debt_at[month - 1] = principal
 
-        opening_balance = balances[month - 1]  # 이번 달 시작 시점의 빚
-        if opening_balance <= 0:  # 이미 다 갚았으면 계산할 것이 없다
-            balances[month] = 0.0
+        opening_debt = debt_at[month - 1]  # 이번 달 시작 시점의 빚
+        if opening_debt <= 0:  # 이미 다 갚았으면 계산할 것이 없다
+            debt_at[month] = 0.0
             continue
 
-        interest = opening_balance * monthly_rate  # 이번 달 이자 (남은 빚에 붙는다)
+        interest = opening_debt * monthly_rate  # 이자는 '남은 빚'에 붙는다
 
         if method == "만기일시":
-            # '2년만기 일시상환' = 24개월차에 원금 전액 (거치 절벽이 아니라 낭떠러지)
-            # 만기 전까지는 이자만 내고, 만기 달에 원금을 통째로 갚는다.
-            if month < grace_end_month:
-                payments[month - 1] = interest
-                balances[month] = opening_balance
+            # '2년만기 일시상환' = 24개월차에 원금 전액 (절벽이 아니라 낭떠러지)
+            # grace_months를 만기로 해석한다.
+            if month < grace_end_at:
+                payment_during[month - 1] = interest
+                debt_at[month] = opening_debt
             else:
-                payments[month - 1] = interest + opening_balance
-                balances[month] = 0.0
+                payment_during[month - 1] = interest + opening_debt
+                debt_at[month] = 0.0
 
-        elif month <= grace_end_month:
-            # 거치기간: 원금은 그대로 두고 이자만 낸다
-            payments[month - 1] = interest
-            balances[month] = opening_balance
+        elif month <= grace_end_at:
+            # 거치기간: 원금은 그대로 두고 이자만 낸다.
+            # ※ 만기일시가 '<' 인데 여기가 '<=' 인 것은 의도된 차이다.
+            #    만기일시의 24개월차는 '갚는 달', 균등분할의 24개월차는 '마지막 거치 달'.
+            payment_during[month - 1] = interest
+            debt_at[month] = opening_debt
 
         else:
-            # 상환기간: 원금을 균등하게 나눠 갚는다 (가정 A1)
-            # repay_months가 0이면 나눗셈이 터지므로 잔액 전액으로 방어
-            principal_part = principal / repay_months if repay_months else opening_balance
+            # 상환기간: 원금을 균등하게 나눠 갚는다 (가정 A1).
+            # 나누는 기준은 '남은 빚'이 아니라 '처음 빌린 원금'이다.
+            # 7,000만 / 36개월 = 매달 194만원 고정.
+            principal_part = principal / repay_months if repay_months else opening_debt
             # 마지막 달에 반올림 오차로 남은 빚보다 많이 갚는 것을 방지
-            principal_part = min(principal_part, opening_balance)
-            payments[month - 1] = interest + principal_part
-            balances[month] = opening_balance - principal_part
+            principal_part = min(principal_part, opening_debt)
+            payment_during[month - 1] = interest + principal_part
+            debt_at[month] = opening_debt - principal_part
 
-    return payments, balances
+    return payment_during, debt_at
 
 
 def existing_debt_schedule(
@@ -287,39 +320,39 @@ def existing_debt_schedule(
     """사용자가 이미 지고 있는 빚의 상환 스케줄 (가정 B1).
 
     Returns:
-        (payments, balances) — loan_schedule과 같은 형식
+        (payment_during, debt_at) — loan_schedule과 같은 형식
     """
-    payments = [0.0] * horizon
-    balances = [0.0] * (horizon + 1)
-    balances[0] = profile.existing_debt  # 지금 시점의 빚
+    payment_during = [0.0] * horizon
+    debt_at = [0.0] * (horizon + 1)
+    debt_at[0] = profile.existing_debt  # 지금 시점의 빚
 
     # 빚이 없거나 상환액을 모르면 계산할 것이 없다
     if profile.existing_debt <= 0 or profile.existing_debt_payment <= 0:
-        return payments, balances
+        return payment_during, debt_at
 
     # 금리를 모르면 0 -> 월 상환액 전액이 원금 상환이 된다 (가정 B1)
     monthly_rate = (profile.existing_debt_rate or 0.0) / 12
 
     for month in range(1, horizon + 1):
-        opening_balance = balances[month - 1]
-        if opening_balance <= 0:
-            balances[month] = 0.0
+        opening_debt = debt_at[month - 1]
+        if opening_debt <= 0:
+            debt_at[month] = 0.0
             continue
 
-        interest = opening_balance * monthly_rate
-        principal_part = min(profile.existing_debt_payment - interest, opening_balance)
+        interest = opening_debt * monthly_rate
+        principal_part = min(profile.existing_debt_payment - interest, opening_debt)
 
         if principal_part <= 0:
             # 이자가 월 상환액보다 큰 경우: 갚는데도 빚이 늘어난다.
             # 고금리 다중채무 상황에서 실제로 발생한다.
-            payments[month - 1] = profile.existing_debt_payment
-            balances[month] = opening_balance + (interest - profile.existing_debt_payment)
+            payment_during[month - 1] = profile.existing_debt_payment
+            debt_at[month] = opening_debt + (interest - profile.existing_debt_payment)
             continue
 
-        payments[month - 1] = interest + principal_part
-        balances[month] = opening_balance - principal_part
+        payment_during[month - 1] = interest + principal_part
+        debt_at[month] = opening_debt - principal_part
 
-    return payments, balances
+    return payment_during, debt_at
 
 
 # ══════════════════════════════════════════════════════════
@@ -331,23 +364,23 @@ def existing_debt_schedule(
 class SimResult:
     """36개월 시뮬레이션 결과."""
 
-    balance: list[float]
-    """월말 현금 잔고. 길이 horizon+1. balance[0] = 보유 현금."""
+    balance_at: list[float]
+    """저량 — 시점별 **현금 잔고**. 길이 horizon+1. balance_at[0] = 보유 현금."""
 
-    payment: list[float]
-    """월별 총 상환액 (기존 부채 + 신규 정책자금). 길이 horizon."""
+    debt_at: list[float]
+    """저량 — 시점별 **총 부채 잔액**(기존 + 신규). 길이 horizon+1."""
 
-    debt: list[float]
-    """월말 총 부채 잔액. 길이 horizon+1."""
+    payment_during: list[float]
+    """유량 — 월별 총 상환액. 길이 horizon. [23]이 24개월차."""
 
-    inflow: list[float]
-    """월별 현금 유입 (융자 실행금·보조금). 길이 horizon."""
+    inflow_during: list[float]
+    """유량 — 월별 현금 유입(융자 실행금·보조금). 길이 horizon."""
 
     survival_months: int
     """축 1 — 잔고가 0 이하가 되는 첫 시점. 끝까지 버티면 horizon."""
 
     net_debt_at_30: float
-    """축 2 — 30개월차 말의 총 부채 잔액."""
+    """축 2 — 30시점의 총 부채 잔액."""
 
     survives_full_term: bool
     """36개월 내내 잔고가 0 아래로 안 내려갔는지."""
@@ -388,18 +421,18 @@ def simulate(
         2단계 — 채워진 배열로 월별 누적 차감을 돌려 잔고를 구한다
     """
     # ── 1단계에서 채울 배열들 ──
-    inflow = [0.0] * horizon  # 정책에서 들어오는 현금
-    new_payment = [0.0] * horizon  # 새로 생기는 상환액
-    new_balance = [0.0] * (horizon + 1)  # 새로 생기는 부채 잔액
-    cost_relief = [0.0] * horizon  # 비용감면으로 줄어드는 고정비
+    inflow_during = [0.0] * horizon  # 정책에서 들어오는 현금
+    new_payment_during = [0.0] * horizon  # 새로 생기는 상환액
+    new_debt_at = [0.0] * (horizon + 1)  # 새로 생기는 부채 잔액
+    relief_during = [0.0] * horizon  # 비용감면으로 줄어드는 고정비
 
     forgiven = 0.0  # 감면된 원금 누적
     notes: list[str] = []  # 사람이 읽는 적용 내역
 
     # 기존 부채 스케줄. 대환·채무조정·상환유예가 이 배열을 변형한다.
-    old_payment, old_balance = existing_debt_schedule(profile, horizon)
-    old_payment = list(old_payment)
-    old_balance = list(old_balance)
+    old_payment_during, old_debt_at = existing_debt_schedule(profile, horizon)
+    old_payment_during = list(old_payment_during)
+    old_debt_at = list(old_debt_at)
 
     # 아직 손대지 않은 기존 부채 원금.
     # profile.existing_debt를 매번 읽으면 여러 효과가 겹칠 때 이중 계산된다.
@@ -415,23 +448,25 @@ def simulate(
 
         # ── 1) 신규유입 — 융자 실행금 또는 보조금이 들어온다 ──
         if effect == "신규유입":
-            payout_month = int(cand.get("지급시점_개월", 0) or 0)  # 언제 들어오는지
-            if payout_month < horizon:
-                inflow[payout_month] += amount
+            payout_at = int(cand.get("지급시점_개월", 0) or 0)  # 언제 들어오는지
+            if payout_at < horizon:
+                inflow_during[payout_at] += amount
 
             if cand.is_loan:
                 # 융자는 갚아야 하므로 상환 스케줄을 만들어 더한다
-                sched_payment, sched_balance = loan_schedule(
+                sched_payment, sched_debt = loan_schedule(
                     principal=amount,
                     annual_rate=float(cand.get("금리_연", 0.0)),
                     grace_months=int(cand.get("거치_개월", 0)),
                     repay_months=int(cand.get("상환_개월", 0)),
                     method=str(cand.get("상환방식", "균등분할")),
-                    start_month=payout_month,
+                    start_at=payout_at,
                     horizon=horizon,
                 )
-                new_payment = [a + b for a, b in zip(new_payment, sched_payment)]
-                new_balance = [a + b for a, b in zip(new_balance, sched_balance)]
+                new_payment_during = [
+                    a + b for a, b in zip(new_payment_during, sched_payment)
+                ]
+                new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
                 notes.append(
                     f"융자 {cand} {amount:,}원 @ {float(cand.get('금리_연', 0)):.2%}"
                 )
@@ -448,22 +483,25 @@ def simulate(
 
             share = converted / remaining_existing  # 기존 부채 중 전환 비율
             # 전환된 만큼 기존 스케줄에서 덜어낸다
-            old_payment = [x * (1 - share) for x in old_payment]
-            old_balance = [x * (1 - share) for x in old_balance]
+            old_payment_during = [x * (1 - share) for x in old_payment_during]
+            old_debt_at = [x * (1 - share) for x in old_debt_at]
             remaining_existing -= converted
 
-            # 새 조건으로 스케줄을 만들어 붙인다 (빚이 옮겨간 것이지 돈이 들어온 게 아니다)
-            sched_payment, sched_balance = loan_schedule(
+            # 새 조건으로 스케줄을 만들어 붙인다
+            # (빚이 옮겨간 것이지 돈이 들어온 게 아니므로 inflow는 건드리지 않는다)
+            sched_payment, sched_debt = loan_schedule(
                 principal=converted,
                 annual_rate=float(cand.get("전환후_금리_연", 0.0)),
                 grace_months=int(cand.get("거치_개월", 0)),
                 repay_months=int(cand.get("상환_개월", 0)),
                 method=str(cand.get("상환방식", "균등분할")),
-                start_month=0,
+                start_at=0,
                 horizon=horizon,
             )
-            new_payment = [a + b for a, b in zip(new_payment, sched_payment)]
-            new_balance = [a + b for a, b in zip(new_balance, sched_balance)]
+            new_payment_during = [
+                a + b for a, b in zip(new_payment_during, sched_payment)
+            ]
+            new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
             notes.append(
                 f"대환 {cand} {converted:,.0f}원 "
                 f"-> {float(cand.get('전환후_금리_연', 0)):.2%}"
@@ -482,21 +520,23 @@ def simulate(
             forgiven += cut
 
             # 남아 있던 기존 부채 스케줄을 통째로 대체한다
-            old_payment = [0.0] * horizon
-            old_balance = [0.0] * (horizon + 1)
+            old_payment_during = [0.0] * horizon
+            old_debt_at = [0.0] * (horizon + 1)
             remaining_existing = 0.0
 
-            sched_payment, sched_balance = loan_schedule(
+            sched_payment, sched_debt = loan_schedule(
                 principal=after,
                 annual_rate=0.0,  # 채무조정은 이자 감면이 원칙
                 grace_months=int(cand.get("조정후_거치_개월", 0)),
                 repay_months=int(cand.get("조정후_상환_개월", 0)),
                 method="균등분할",
-                start_month=0,
+                start_at=0,
                 horizon=horizon,
             )
-            new_payment = [a + b for a, b in zip(new_payment, sched_payment)]
-            new_balance = [a + b for a, b in zip(new_balance, sched_balance)]
+            new_payment_during = [
+                a + b for a, b in zip(new_payment_during, sched_payment)
+            ]
+            new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
             notes.append(
                 f"채무조정 {cand} {before:,.0f} -> {after:,.0f}원 "
                 f"(감면 {cut:,.0f}원, 추정치)"
@@ -511,7 +551,7 @@ def simulate(
                 continue
 
             share = target / remaining_existing  # 기존 부채 중 유예 대상 비율
-            target_payment = profile.existing_debt_payment * share  # 대상분의 월 상환액
+            target_payment = profile.existing_debt_payment * share  # 대상분 월 상환액
             remaining_term = math.ceil(target / target_payment)  # 남은 상환 개월(역산)
             extension = int(cand.get("연장_개월_최대", 0))  # 연장 개월
             new_term = remaining_term + extension  # 연장 후 총 상환 개월
@@ -521,22 +561,24 @@ def simulate(
             new_rate = (profile.existing_debt_rate or 0.0) + surcharge
 
             # 대상분을 기존 스케줄에서 덜어내고
-            old_payment = [x * (1 - share) for x in old_payment]
-            old_balance = [x * (1 - share) for x in old_balance]
+            old_payment_during = [x * (1 - share) for x in old_payment_during]
+            old_debt_at = [x * (1 - share) for x in old_debt_at]
             remaining_existing -= target
 
             # 늘어난 기간으로 새 스케줄을 만든다 (거치 없이 바로 분할 상환)
-            sched_payment, sched_balance = loan_schedule(
+            sched_payment, sched_debt = loan_schedule(
                 principal=target,
                 annual_rate=new_rate,
                 grace_months=0,
                 repay_months=new_term,
                 method="균등분할",
-                start_month=0,
+                start_at=0,
                 horizon=horizon,
             )
-            new_payment = [a + b for a, b in zip(new_payment, sched_payment)]
-            new_balance = [a + b for a, b in zip(new_balance, sched_balance)]
+            new_payment_during = [
+                a + b for a, b in zip(new_payment_during, sched_payment)
+            ]
+            new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
             notes.append(
                 f"상환유예 {cand} 대상 {target:,.0f}원 · "
                 f"월 상환 {target_payment:,.0f} -> {sched_payment[0]:,.0f}원 "
@@ -545,9 +587,9 @@ def simulate(
 
         # ── 5) 비용감면 — 유입이 아니라 그 달의 고정비가 줄어든다 (가정 C1) ──
         elif effect == "비용감면":
-            payout_month = int(cand.get("지급시점_개월", 0) or 0)
-            if payout_month < horizon:
-                cost_relief[payout_month] += amount
+            payout_at = int(cand.get("지급시점_개월", 0) or 0)
+            if payout_at < horizon:
+                relief_during[payout_at] += amount
             notes.append(f"비용감면 {cand} {amount:,}원")
 
         # ── 6) 없음 — 순위 대상이 아니지만 방어적으로 처리 ──
@@ -558,38 +600,41 @@ def simulate(
             raise ValueError(f"알 수 없는 현금효과: {effect!r} ({cand.candidate_id})")
 
     # ══════════ 2단계: 월별 누적 차감 ══════════
-    balance = [float(profile.cash_on_hand)] + [0.0] * horizon
-    payment = [0.0] * horizon
-    debt = [float(profile.existing_debt)] + [0.0] * horizon
+    balance_at = [float(profile.cash_on_hand)] + [0.0] * horizon
+    debt_at = [float(profile.existing_debt)] + [0.0] * horizon
+    payment_during = [0.0] * horizon
 
     survival_months = horizon  # 끝까지 버티면 horizon
     survives = True  # 아직 잔고가 0 아래로 안 갔는지
 
     for month in range(1, horizon + 1):
         # 영업 현금흐름 + 비용감면 효과
-        operating = profile.operating_cashflow(month) + cost_relief[month - 1]
+        operating = profile.operating_cashflow(month) + relief_during[month - 1]
         # 이번 달 총 상환액
-        total_payment = old_payment[month - 1] + new_payment[month - 1]
+        total_payment = old_payment_during[month - 1] + new_payment_during[month - 1]
 
-        payment[month - 1] = total_payment
-        balance[month] = (
-            balance[month - 1] + operating - total_payment + inflow[month - 1]
+        payment_during[month - 1] = total_payment
+        balance_at[month] = (
+            balance_at[month - 1]
+            + operating
+            - total_payment
+            + inflow_during[month - 1]
         )
-        debt[month] = old_balance[month] + new_balance[month]
+        debt_at[month] = old_debt_at[month] + new_debt_at[month]
 
         # 잔고가 0 이하가 되는 '첫' 시점만 기록한다.
-        # month월에 0이 됐다면 (month-1)개월까지 버틴 것.
-        if survives and balance[month] <= 0:
+        # month개월차에 0이 됐다면 (month-1)개월까지 버틴 것.
+        if survives and balance_at[month] <= 0:
             survival_months = month - 1
             survives = False
 
     return SimResult(
-        balance=balance,
-        payment=payment,
-        debt=debt,
-        inflow=inflow,
+        balance_at=balance_at,
+        debt_at=debt_at,
+        payment_during=payment_during,
+        inflow_during=inflow_during,
         survival_months=survival_months,
-        net_debt_at_30=debt[NET_DEBT_MONTH],
+        net_debt_at_30=debt_at[NET_DEBT_AT],
         survives_full_term=survives,
         forgiven=forgiven,
         notes=notes,

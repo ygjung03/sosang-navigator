@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from core import loader
 from core.cashflow import (
-    NET_DEBT_MONTH,
+    NET_DEBT_AT,
     SIM_MONTHS,
     Applied,
     UserProfile,
@@ -42,7 +42,7 @@ def snack_shop_profile() -> UserProfile:
 
 def report(title: str, r) -> None:
     print(f"\n-- {title}")
-    print(f"   생존 {r.survival_label} · {NET_DEBT_MONTH}개월 순부채 {r.net_debt_at_30/MAN:,.0f}만원")
+    print(f"   생존 {r.survival_label} · {NET_DEBT_AT}개월 순부채 {r.net_debt_at_30/MAN:,.0f}만원")
     for line in r.notes:
         print(f"   · {line}")
 
@@ -53,7 +53,7 @@ def test_baseline():
     r = simulate(p)
     report("무지원 (현재 버퍼)", r)
     assert r.survival_months < SIM_MONTHS, "적자 상태인데 36개월을 버티면 안 됨"
-    assert len(r.balance) == SIM_MONTHS + 1
+    assert len(r.balance_at) == SIM_MONTHS + 1
     return r
 
 
@@ -64,8 +64,8 @@ def test_grace_cliff():
     r = simulate(p, [Applied(c, 7_000 * MAN)])
     report("일반경영안정 7,000만원 (2년거치 3년)", r)
 
-    during_grace = r.payment[23]  # 24개월차
-    after_grace = r.payment[24]  # 25개월차
+    during_grace = r.payment_during[23]  # 24개월차
+    after_grace = r.payment_during[24]  # 25개월차
     print(f"   24개월차 {during_grace/MAN:,.0f}만원 -> 25개월차 {after_grace/MAN:,.0f}만원")
     assert after_grace > during_grace * 1.5, "거치 종료 시점에 상환액이 급증해야 함(절벽)"
     return r
@@ -78,12 +78,12 @@ def test_bullet_repayment():
     r = simulate(p, [Applied(c, 5_000 * MAN)])
     report("서울시 성장기반 5,000만원 (2년만기 일시상환)", r)
 
-    before = r.payment[22]
-    at_maturity = r.payment[23]  # 24개월차에 원금 전액
+    before = r.payment_during[22]
+    at_maturity = r.payment_during[23]  # 24개월차에 원금 전액
     print(f"   23개월차 {before/MAN:,.0f}만원 -> 24개월차 {at_maturity/MAN:,.0f}만원")
     assert at_maturity > 4_000 * MAN, "만기에 원금 전액이 나가야 함"
-    drop = r.debt[23] - r.debt[24]
-    print(f"   부채잔액 {r.debt[23]/MAN:,.0f} -> {r.debt[24]/MAN:,.0f}만원")
+    drop = r.debt_at[23] - r.debt_at[24]
+    print(f"   부채잔액 {r.debt_at[23]/MAN:,.0f} -> {r.debt_at[24]/MAN:,.0f}만원")
     assert drop > 4_900 * MAN, "만기 상환으로 신규 융자 잔액이 사라져야 함"
     return r
 
@@ -96,9 +96,9 @@ def test_refinance():
     r = simulate(p, [Applied(c, 4_000 * MAN)])
     report("대환대출 4,000만원 (7% -> 4.5%, 2년거치 8년)", r)
 
-    assert sum(r.inflow) == 0, "대환은 현금 유입이 없어야 함"
-    print(f"   월 상환 {base.payment[0]/MAN:,.1f}만원 -> {r.payment[0]/MAN:,.1f}만원")
-    assert r.payment[0] < base.payment[0], "월 상환 부담이 줄어야 함"
+    assert sum(r.inflow_during) == 0, "대환은 현금 유입이 없어야 함"
+    print(f"   월 상환 {base.payment_during[0]/MAN:,.1f}만원 -> {r.payment_during[0]/MAN:,.1f}만원")
+    assert r.payment_during[0] < base.payment_during[0], "월 상환 부담이 줄어야 함"
     assert r.survival_months > base.survival_months, "생존 개월수가 늘어야 함"
     return r
 
@@ -123,7 +123,7 @@ def test_debt_forgiveness():
 
     assert r.net_debt_at_30 < base.net_debt_at_30, "순부채가 줄어야 함"
     assert r.forgiven > 0
-    assert sum(r.inflow) == 0, "채무조정은 현금 유입이 없어야 함"
+    assert sum(r.inflow_during) == 0, "채무조정은 현금 유입이 없어야 함"
     return r
 
 
@@ -136,8 +136,8 @@ def test_repayment_extension():
     r = simulate(p, [Applied(c)])
     report("상환연장제도 (대상 3,000만원, 최대 5년 연장)", r)
 
-    print(f"   월 상환 {base.payment[0]/MAN:,.1f}만원 -> {r.payment[0]/MAN:,.1f}만원")
-    assert r.payment[0] < base.payment[0], "월 상환액이 줄어야 함"
+    print(f"   월 상환 {base.payment_during[0]/MAN:,.1f}만원 -> {r.payment_during[0]/MAN:,.1f}만원")
+    assert r.payment_during[0] < base.payment_during[0], "월 상환액이 줄어야 함"
     assert r.forgiven == 0, "상환유예는 원금 감면이 없어야 함"
     return r
 
@@ -149,7 +149,7 @@ def test_cost_relief():
     c = db.find("voucher_mgmt__default")
     r = simulate(p, [Applied(c)])
     report("경영안정 바우처 25만원", r)
-    assert r.balance[1] > base.balance[1], "첫 달 잔고가 바우처만큼 늘어야 함"
+    assert r.balance_at[1] > base.balance_at[1], "첫 달 잔고가 바우처만큼 늘어야 함"
     return r
 
 
@@ -186,7 +186,7 @@ def test_refinance_then_forgiveness():
         f"채무조정이 기존 부채 전액(9,500만)에 적용되면 이중 계산이다. "
         f"실제 {r.forgiven:,.0f} / 기대 {expected:,.0f}"
     )
-    assert sum(r.inflow) == 0, "대환·채무조정 모두 현금 유입이 없어야 함"
+    assert sum(r.inflow_during) == 0, "대환·채무조정 모두 현금 유입이 없어야 함"
     return r
 
 
@@ -201,7 +201,7 @@ def test_combination():
         ],
     )
     report("대환 4,000만 + 긴급경영안정 3,000만", r)
-    assert sum(r.inflow) == 3_000 * MAN, "융자 유입만 잡혀야 함(대환은 0)"
+    assert sum(r.inflow_during) == 3_000 * MAN, "융자 유입만 잡혀야 함(대환은 0)"
     return r
 
 
