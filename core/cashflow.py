@@ -152,6 +152,15 @@ class UserProfile:
     existing_debt_rate: float | None = None
     """기존 부채의 연 금리(소수). 모르면 None -> 가정 B1 적용."""
 
+    high_rate_debt: int = 0
+    """기존 부채 중 **연 7% 이상 고금리** 부분(원). 대환대출의 대상이자 자격 요건.
+
+    기존 부채를 단일 금리로 뭉뚱그리면 "3,000만원 중 2,000만원만 7%"인 상황을
+    표현할 수 없다. 대환대출 자격이 '7% 이상 대출 보유'이고 전환 대상도
+    그 부분에 한정되므로, 얼마가 고금리인지를 따로 받는다.
+    0이면 대환 자격이 없다. existing_debt를 넘을 수 없다.
+    """
+
     overdue_months: int = 0
     """연체 개월 수. 채무조정 자격 판정에 쓰인다(엔진 계산에는 미사용)."""
 
@@ -169,6 +178,11 @@ class UserProfile:
         if not 0 <= self.variable_ratio < 1:
             raise ValueError(
                 f"variable_ratio는 0 이상 1 미만이어야 합니다: {self.variable_ratio}"
+            )
+        if self.high_rate_debt > self.existing_debt:
+            raise ValueError(
+                f"high_rate_debt({self.high_rate_debt:,})는 "
+                f"existing_debt({self.existing_debt:,})를 넘을 수 없습니다"
             )
 
     def operating_cashflow(self, month: int) -> float:
@@ -424,7 +438,7 @@ def simulate(
     inflow_during = [0.0] * horizon  # 정책에서 들어오는 현금
     new_payment_during = [0.0] * horizon  # 새로 생기는 상환액
     new_debt_at = [0.0] * (horizon + 1)  # 새로 생기는 부채 잔액
-    relief_during = [0.0] * horizon  # 비용감면으로 줄어드는 고정비
+    cost_saving_during = [0.0] * horizon  # 비용감면으로 '절약되는' 금액
 
     forgiven = 0.0  # 감면된 원금 누적
     notes: list[str] = []  # 사람이 읽는 적용 내역
@@ -476,9 +490,12 @@ def simulate(
 
         # ── 2) 대환전환 — 현금 유입 없이 기존 빚을 저금리로 옮긴다 ──
         elif effect == "대환전환":
-            converted = min(amount, remaining_existing)  # 실제로 전환되는 금액
+            # 전환 대상은 '고금리 부채'로 한정된다. 저금리 대출은 대환 대상이 아니다.
+            # high_rate_debt를 입력하지 않았으면(0) 기존 부채 전체를 대상으로 본다.
+            convertible = profile.high_rate_debt or remaining_existing
+            converted = min(amount, convertible, remaining_existing)
             if converted <= 0:
-                notes.append(f"대환 {cand}: 전환할 기존 부채 없음 -> 효과 0")
+                notes.append(f"대환 {cand}: 전환할 고금리 부채 없음 -> 효과 0")
                 continue
 
             share = converted / remaining_existing  # 기존 부채 중 전환 비율
@@ -589,7 +606,7 @@ def simulate(
         elif effect == "비용감면":
             payout_at = int(cand.get("지급시점_개월", 0) or 0)
             if payout_at < horizon:
-                relief_during[payout_at] += amount
+                cost_saving_during[payout_at] += amount
             notes.append(f"비용감면 {cand} {amount:,}원")
 
         # ── 6) 없음 — 순위 대상이 아니지만 방어적으로 처리 ──
@@ -608,8 +625,10 @@ def simulate(
     survives = True  # 아직 잔고가 0 아래로 안 갔는지
 
     for month in range(1, horizon + 1):
-        # 영업 현금흐름 + 비용감면 효과
-        operating = profile.operating_cashflow(month) + relief_during[month - 1]
+        # 영업 현금흐름 = 매출 - 고정비 - 변동비.
+        # 비용감면은 고정비를 깎으므로(빼기 앞의 항이 작아지므로) 결과에는 '더해진다'.
+        cost_saving = cost_saving_during[month - 1]  # 이번 달 절약액
+        operating = profile.operating_cashflow(month) + cost_saving
         # 이번 달 총 상환액
         total_payment = old_payment_during[month - 1] + new_payment_during[month - 1]
 

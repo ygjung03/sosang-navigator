@@ -68,6 +68,16 @@ class Candidate:
     def is_loan(self) -> bool:
         return self.method == "융자"
 
+    @property
+    def closure_requirement(self) -> str | None:
+        """자격요건의 '폐업여부' 문자열. 없으면 None.
+
+        값이 자유 서술이라(예: "영업중", "폐업 또는 폐업예정",
+        "영업중·폐업·휴업 모두 가능") 정확한 파싱 대신
+        combos.py에서 키워드로 판정한다.
+        """
+        return self.eligibility.get("폐업여부")
+
     def __str__(self) -> str:
         return f"{self.policy_name}({self.label})" if self.label else self.policy_name
 
@@ -148,7 +158,12 @@ def load(path: str | Path = DATA_PATH, include_excluded: bool = False) -> Policy
                     # (희망리턴처럼 한 정책 안에 보조금·컨설팅이 섞이는 경우)
                     method=cand.get("지원방법", policy["지원방법"]),
                     effect=cand["현금효과"],
-                    phases=tuple(policy["적용국면"]),
+                    # 적용국면도 후보가 우선한다.
+                    # 정책 레벨 태그는 제도 전체의 범위라 후보보다 넓을 수 있다.
+                    # (예: 희망리턴패키지는 폐업 트랙과 경영개선 트랙이 섞여
+                    #      정책 태그가 [회복불가, 개선여지]인데, 점포철거비는
+                    #      폐업 확정이 전제라 [회복불가]만 해당한다)
+                    phases=tuple(cand.get("적용국면") or policy["적용국면"]),
                     label=cand.get("라벨", ""),
                     raw=cand,
                     policy_raw=policy,
