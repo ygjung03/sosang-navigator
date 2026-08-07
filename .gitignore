@@ -1,0 +1,50 @@
+# ─── 비밀정보 (절대 커밋 금지) ───
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.key
+credentials.json
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ─── 가상환경 ───
+.venv/
+venv/
+env/
+ENV/
+
+# ─── 테스트·캐시 ───
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Streamlit ───
+.streamlit/cache/
+
+# ─── 에디터·OS ───
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ─── 작업 파일 ───
+# 기획서·문의목록·공고문 원본은 docs/에 커밋한다 (근거 추적용)
+scratch/
+notebooks/*.ipynb_checkpoints/
+
+# ─── 사용자 업로드 POS 원본 (개인정보) ───
+data/uploads/
+data/pos_raw/
