@@ -2,47 +2,55 @@
 월별 현금흐름 시뮬레이션 엔진.
 
 성격이 다른 지원(융자·보조금·채무조정)을 비교하기 위한 '공통 화폐'.
-모든 조합을 같은 기준점(t=0 = 현재)에서 36개월 시뮬레이션하고,
-두 축을 산출한다.
+모든 조합을 같은 기준점(t=0 = 현재)에서 36개월 시뮬레이션하고, 두 축을 산출한다.
 
-    축 1. 생존 개월수      — 잔고가 0 이하가 되는 첫 시점 (클수록 좋음)
-    축 2. 30개월 후 순부채 — 그 시점의 총 부채 잔액 (작을수록 좋음)
+    축 1. 생존 개월수      - 잔고가 0 이하가 되는 첫 시점 (클수록 좋음)
+    축 2. 30개월 후 순부채 - 그 시점의 총 부채 잔액 (작을수록 좋음)
 
 기본 계산식 (기획서 5.1):
 
-    잔고(0) = 보유 현금
-    잔고(N) = 잔고(N-1)
-              + [ 예상매출(N) − 고정비(N) − 예상매출(N) × 변동비율 ]   ← 영업 현금흐름
-              − 기존부채 상환(N)
-              + 정책 유입(N)
-              − 정책 상환(N)
+    balance(0) = 보유 현금
+    balance(N) = balance(N-1)
+                 + [ revenue(N) - fixed_cost - revenue(N) * variable_ratio ]  <- 영업 현금흐름
+                 - 기존부채 상환(N)
+                 + 정책 유입(N)
+                 - 정책 상환(N)
 
-나눗셈("보유현금 ÷ 월 순손실")을 쓰지 않는 이유는 매출 하락 추세에서
+나눗셈("보유현금 / 월 순손실")을 쓰지 않는 이유는 매출 하락 추세에서
 월 적자가 매달 커지기 때문이다. 흑자·적자를 같은 식으로 처리한다.
+
+명명 규칙: 코드 식별자는 영어, JSON 키는 한글 그대로 (loader.py 참조).
 
 
 ═══════════════════════════════════════════════════════════
-가정 (ASSUMPTIONS) — 임의 상수를 만들지 않기 위해 명시적으로 관리
+가정 (ASSUMPTIONS) - 임의 상수를 만들지 않기 위해 명시적으로 관리
 ═══════════════════════════════════════════════════════════
 
 A1. 상환 방식은 '원금균등분할'로 계산한다.
     공고문은 "균등분할상환"이라고만 하고 원리금균등인지 원금균등인지
     명시하지 않는다. 원금균등이 계산이 단순하고 초기 상환 부담을
-    보수적으로(크게) 잡으므로 채택했다. → 문의목록 확인 대상.
+    보수적으로(크게) 잡으므로 채택했다. -> 문의목록 A-7 확인 대상.
 
 B1. 기존 부채는 사용자가 '총 잔액'과 '월 상환액'만 입력한다.
     금리를 모르면 월 상환액 전액이 원금 상환이라고 가정한다.
     이자를 임의로 추정해 넣으면 근거 없는 상수가 되기 때문이다.
-    → 부채가 실제보다 빨리 줄어 순부채 축이 낙관적으로 나오지만,
-      모든 조합에 동일하게 적용되므로 조합 간 상대 비교는 유지된다.
-    사용자가 금리를 입력하면(기존부채_금리) 정확히 계산한다.
+    -> 부채가 실제보다 빨리 줄어 순부채 축이 낙관적으로 나오지만,
+       모든 조합에 동일하게 적용되므로 조합 간 상대 비교는 유지된다.
+    사용자가 금리를 입력하면(existing_debt_rate) 정확히 계산한다.
 
 C1. 비용감면(바우처)은 총액 1회성이므로 지급 시점 한 달의 고정비를
     그만큼 줄이는 것으로 처리한다. 실제로는 사용기한 내 분산 소진되나,
     금액이 작아 2축에 미치는 영향이 미미하다.
 
-D1. 상환유예는 '대상 부채 잔액 ÷ (잔여개월 + 연장개월)'로 월 상환액을
-    다시 계산한다. 잔여개월은 (대상 잔액 ÷ 현재 월 상환액)으로 역산한다.
+D1. 상환유예는 '대상 부채 잔액 / (잔여개월 + 연장개월)'로 월 상환액을
+    다시 계산한다. 잔여개월은 (대상 잔액 / 현재 월 상환액)으로 역산한다.
+
+E1. 변동비율은 매출과 무관하게 고정이다.
+    "매출이 절반이 되면 재료비도 절반"을 가정하는 것인데, 실제로는
+    최소 발주량·폐기율 때문에 그만큼 줄지 않는다.
+    -> 하락 국면에서 영업 현금흐름이 실제보다 낙관적으로 나온다.
+       모든 조합에 동일 적용되므로 상대 비교는 유지된다.
+    확장 시 매출 구간별 변동비율로 개선 가능(기획서 8장).
 """
 
 from __future__ import annotations
@@ -66,32 +74,33 @@ NET_DEBT_MONTH = 30  # 순부채 측정 시점 (기획서 확정값)
 class UserProfile:
     """시뮬레이션 입력. 정밀/간편 모드 공통."""
 
-    보유현금: int
-    월매출: Sequence[int]  # 길이 SIM_MONTHS. 정밀=POS 추세 예측, 간편=현 수준 유지
-    고정비: int  # 월
-    변동비율: float  # 0~1. 매출 대비
+    cash_on_hand: int  # 보유 현금
+    monthly_revenue: Sequence[int]  # 길이 SIM_MONTHS. 정밀=POS 추세 예측, 간편=현 수준 유지
+    fixed_cost: int  # 월 고정비
+    variable_ratio: float  # 0~1. 매출 대비 변동비 비율 (입력은 금액, 환산은 UI 계층)
 
     # 기존 부채 (MVP 필수, 없으면 0)
-    기존부채_잔액: int = 0
-    기존부채_월상환: int = 0
-    기존부채_금리: float | None = None  # 모르면 None → 가정 B1
-    연체개월: int = 0
+    existing_debt: int = 0
+    existing_debt_payment: int = 0  # 월 상환액
+    existing_debt_rate: float | None = None  # 모르면 None -> 가정 B1
+    overdue_months: int = 0  # 연체 개월
 
     # 정책자금 이력 (상환유예 대상 판정용)
-    정책자금_직접대출_잔액: int = 0
+    policy_loan_balance: int = 0  # 소진공 직접대출 잔액
 
     def __post_init__(self) -> None:
-        if len(self.월매출) < SIM_MONTHS:
+        if len(self.monthly_revenue) < SIM_MONTHS:
             raise ValueError(
-                f"월매출은 {SIM_MONTHS}개월치가 필요합니다 (현재 {len(self.월매출)})"
+                f"monthly_revenue는 {SIM_MONTHS}개월치가 필요합니다 "
+                f"(현재 {len(self.monthly_revenue)})"
             )
-        if not 0 <= self.변동비율 < 1:
-            raise ValueError(f"변동비율은 0 이상 1 미만이어야 합니다: {self.변동비율}")
+        if not 0 <= self.variable_ratio < 1:
+            raise ValueError(f"variable_ratio는 0 이상 1 미만이어야 합니다: {self.variable_ratio}")
 
-    def 영업현금흐름(self, month: int) -> float:
+    def operating_cashflow(self, month: int) -> float:
         """m월(1-based)의 영업 현금흐름. 흑자면 양수, 적자면 음수."""
-        매출 = self.월매출[month - 1]
-        return 매출 - self.고정비 - 매출 * self.변동비율
+        revenue = self.monthly_revenue[month - 1]
+        return revenue - self.fixed_cost - revenue * self.variable_ratio
 
 
 @dataclass
@@ -99,12 +108,12 @@ class Applied:
     """조합에 포함된 후보 + 실제 적용 금액."""
 
     candidate: Candidate
-    금액: int | None = None  # 융자 금액. None이면 정책 한도
+    amount: int | None = None  # 융자 금액. None이면 정책 한도
 
     @property
-    def 적용금액(self) -> int:
-        if self.금액 is not None:
-            return self.금액
+    def effective_amount(self) -> int:
+        if self.amount is not None:
+            return self.amount
         return int(
             self.candidate.get("금액_한도")
             or self.candidate.get("지급액")
@@ -118,93 +127,96 @@ class Applied:
 # ══════════════════════════════════════════════════════════
 
 
-def 상환스케줄(
-    원금: float,
-    연금리: float,
-    거치_개월: int,
-    상환_개월: int,
-    방식: str = "균등분할",
-    시작월: int = 0,
+def loan_schedule(
+    principal: float,
+    annual_rate: float,
+    grace_months: int,
+    repay_months: int,
+    method: str = "균등분할",
+    start_month: int = 0,
     months: int = SIM_MONTHS,
 ) -> tuple[list[float], list[float]]:
     """월별 상환액과 잔액 배열을 만든다.
 
     Args:
-        시작월: 대출이 실행되는 월(0 = t=0에 실행). 미래 후보는 N을 넣는다.
+        method: "균등분할"(원금균등, 가정 A1) 또는 "만기일시"
+        start_month: 대출이 실행되는 월(0 = t=0에 실행). 미래 후보는 N을 넣는다.
 
     Returns:
-        (상환액[1..months], 잔액[0..months])
-        상환액[i]는 (i+1)월에 나가는 돈, 잔액[i]는 i월 말 잔액.
+        (payments[0..months-1], balances[0..months])
+        payments[i]는 (i+1)월에 나가는 돈, balances[i]는 i월 말 잔액.
     """
-    상환액 = [0.0] * months
-    잔액 = [0.0] * (months + 1)
+    payments = [0.0] * months
+    balances = [0.0] * (months + 1)
 
-    월금리 = 연금리 / 12
-    거치종료 = 시작월 + 거치_개월  # 이 월까지는 이자만
+    monthly_rate = annual_rate / 12
+    grace_end = start_month + grace_months  # 이 월까지는 이자만
 
     for m in range(1, months + 1):
-        if m <= 시작월:
-            잔액[m] = 0.0  # 아직 실행 전
+        if m <= start_month:
+            balances[m] = 0.0  # 아직 실행 전
             continue
-        if m == 시작월 + 1:
-            잔액[m - 1] = 원금  # 실행 직후 잔액
+        if m == start_month + 1:
+            balances[m - 1] = principal  # 실행 직후 잔액
 
-        prev = 잔액[m - 1]
+        prev = balances[m - 1]
         if prev <= 0:
-            잔액[m] = 0.0
+            balances[m] = 0.0
             continue
 
-        이자 = prev * 월금리
+        interest = prev * monthly_rate
 
-        if 방식 == "만기일시":
+        if method == "만기일시":
             # '2년만기 일시상환' = 24개월차에 원금 전액 (낭떠러지)
-            # 거치_개월을 만기로 해석한다. 그 전까지는 이자만.
-            if m < 거치종료:
-                상환액[m - 1] = 이자
-                잔액[m] = prev
+            # grace_months를 만기로 해석한다. 그 전까지는 이자만.
+            if m < grace_end:
+                payments[m - 1] = interest
+                balances[m] = prev
             else:
-                상환액[m - 1] = 이자 + prev
-                잔액[m] = 0.0
-        elif m <= 거치종료:
+                payments[m - 1] = interest + prev
+                balances[m] = 0.0
+        elif m <= grace_end:
             # 거치기간: 이자만
-            상환액[m - 1] = 이자
-            잔액[m] = prev
+            payments[m - 1] = interest
+            balances[m] = prev
         else:
             # 원금균등분할 (가정 A1)
-            월원금 = 원금 / 상환_개월 if 상환_개월 else prev
-            월원금 = min(월원금, prev)
-            상환액[m - 1] = 이자 + 월원금
-            잔액[m] = prev - 월원금
+            principal_part = principal / repay_months if repay_months else prev
+            principal_part = min(principal_part, prev)
+            payments[m - 1] = interest + principal_part
+            balances[m] = prev - principal_part
 
-    return 상환액, 잔액
+    return payments, balances
 
 
-def 기존부채스케줄(p: UserProfile, months: int = SIM_MONTHS) -> tuple[list[float], list[float]]:
+def existing_debt_schedule(
+    p: UserProfile, months: int = SIM_MONTHS
+) -> tuple[list[float], list[float]]:
     """사용자의 기존 부채 상환 스케줄 (가정 B1)."""
-    상환액 = [0.0] * months
-    잔액 = [0.0] * (months + 1)
-    잔액[0] = p.기존부채_잔액
+    payments = [0.0] * months
+    balances = [0.0] * (months + 1)
+    balances[0] = p.existing_debt
 
-    if p.기존부채_잔액 <= 0 or p.기존부채_월상환 <= 0:
-        return 상환액, 잔액
+    if p.existing_debt <= 0 or p.existing_debt_payment <= 0:
+        return payments, balances
 
-    월금리 = (p.기존부채_금리 or 0.0) / 12
+    monthly_rate = (p.existing_debt_rate or 0.0) / 12
     for m in range(1, months + 1):
-        prev = 잔액[m - 1]
+        prev = balances[m - 1]
         if prev <= 0:
-            잔액[m] = 0.0
+            balances[m] = 0.0
             continue
-        이자 = prev * 월금리
-        월원금 = min(p.기존부채_월상환 - 이자, prev)
-        if 월원금 <= 0:
+        interest = prev * monthly_rate
+        principal_part = min(p.existing_debt_payment - interest, prev)
+        if principal_part <= 0:
             # 월 상환액이 이자에도 못 미치면 원금이 안 줄고 잔액이 는다
-            상환액[m - 1] = p.기존부채_월상환
-            잔액[m] = prev + (이자 - p.기존부채_월상환)
+            payments[m - 1] = p.existing_debt_payment
+            balances[m] = prev + (interest - p.existing_debt_payment)
             continue
-        상환액[m - 1] = 이자 + 월원금
-        잔액[m] = prev - 월원금
+        payments[m - 1] = interest + principal_part
+        balances[m] = prev - principal_part
 
-    return 상환액, 잔액
+    return payments, balances
 
 
 # ══════════════════════════════════════════════════════════
@@ -214,19 +226,19 @@ def 기존부채스케줄(p: UserProfile, months: int = SIM_MONTHS) -> tuple[lis
 
 @dataclass
 class SimResult:
-    잔고: list[float]  # [0..months] — 잔고[0]=보유현금
-    월상환: list[float]  # [1..months] 총 상환액 (기존 + 신규)
-    부채잔액: list[float]  # [0..months] 총 부채
-    유입: list[float]  # [1..months] 정책 유입
-    생존개월수: int  # 잔고가 0 이하가 되는 첫 시점. 끝까지 버티면 months
-    순부채_30: float
-    끝까지생존: bool
-    감면액: float = 0.0
-    적용내역: list[str] = field(default_factory=list)
+    balance: list[float]  # [0..months] - balance[0] = 보유현금
+    payment: list[float]  # [0..months-1] 총 상환액 (기존 + 신규)
+    debt: list[float]  # [0..months] 총 부채 잔액
+    inflow: list[float]  # [0..months-1] 정책 유입
+    survival_months: int  # 잔고가 0 이하가 되는 첫 시점. 끝까지 버티면 months
+    net_debt_at_30: float
+    survives_full_term: bool
+    forgiven: float = 0.0  # 채무조정 감면액
+    notes: list[str] = field(default_factory=list)  # 적용 내역 (사람이 읽는 설명)
 
     @property
-    def 생존표기(self) -> str:
-        return f"{SIM_MONTHS}개월+" if self.끝까지생존 else f"{self.생존개월수}개월"
+    def survival_label(self) -> str:
+        return f"{SIM_MONTHS}개월+" if self.survives_full_term else f"{self.survival_months}개월"
 
 
 def simulate(
@@ -238,173 +250,171 @@ def simulate(
 
     applied가 비어 있으면 '현재 버퍼'(무지원 베이스라인)가 나온다.
     """
-    유입 = [0.0] * months
-    신규상환 = [0.0] * months
-    신규잔액 = [0.0] * (months + 1)
-    고정비조정 = [0.0] * months  # 비용감면: 해당 월 고정비 감소분
-    감면액 = 0.0
-    적용내역: list[str] = []
+    inflow = [0.0] * months
+    new_payment = [0.0] * months
+    new_balance = [0.0] * (months + 1)
+    cost_relief = [0.0] * months  # 비용감면: 해당 월 고정비 감소분
+    forgiven = 0.0
+    notes: list[str] = []
 
-    기존상환, 기존잔액 = 기존부채스케줄(p, months)
-    기존상환 = list(기존상환)
-    기존잔액 = list(기존잔액)
+    old_payment, old_balance = existing_debt_schedule(p, months)
+    old_payment = list(old_payment)
+    old_balance = list(old_balance)
 
     for a in applied:
         c = a.candidate
-        effect = c.현금효과
-        금액 = a.적용금액
+        effect = c.effect
+        amount = a.effective_amount
 
         # ── 1) 신규유입: 융자 또는 보조금 ──
         if effect == "신규유입":
-            시점 = int(c.get("지급시점_개월", 0) or 0)
-            if 시점 < months:
-                유입[시점] += 금액
-            if c.지원방법 == "융자":
-                sch, bal = 상환스케줄(
-                    원금=금액,
-                    연금리=float(c.get("금리_연", 0.0)),
-                    거치_개월=int(c.get("거치_개월", 0)),
-                    상환_개월=int(c.get("상환_개월", 0)),
-                    방식=str(c.get("상환방식", "균등분할")),
-                    시작월=시점,
+            at = int(c.get("지급시점_개월", 0) or 0)
+            if at < months:
+                inflow[at] += amount
+            if c.is_loan:
+                sch, bal = loan_schedule(
+                    principal=amount,
+                    annual_rate=float(c.get("금리_연", 0.0)),
+                    grace_months=int(c.get("거치_개월", 0)),
+                    repay_months=int(c.get("상환_개월", 0)),
+                    method=str(c.get("상환방식", "균등분할")),
+                    start_month=at,
                     months=months,
                 )
-                신규상환 = [x + y for x, y in zip(신규상환, sch)]
-                신규잔액 = [x + y for x, y in zip(신규잔액, bal)]
-                적용내역.append(
-                    f"융자 {c.정책명}({c.라벨}) {금액:,}원 "
-                    f"@ {float(c.get('금리_연', 0)):.2%}"
+                new_payment = [x + y for x, y in zip(new_payment, sch)]
+                new_balance = [x + y for x, y in zip(new_balance, bal)]
+                notes.append(
+                    f"융자 {c} {amount:,}원 @ {float(c.get('금리_연', 0)):.2%}"
                 )
             else:
-                적용내역.append(f"보조금 {c.정책명}({c.라벨}) {금액:,}원")
+                notes.append(f"보조금 {c} {amount:,}원")
 
         # ── 2) 대환전환: 기존 고금리 부채를 저금리로 갈아탐 ──
         elif effect == "대환전환":
-            전환액 = min(금액, p.기존부채_잔액)
-            if 전환액 <= 0:
-                적용내역.append(f"대환 {c.정책명}: 전환할 기존 부채 없음 → 효과 0")
+            converted = min(amount, p.existing_debt)
+            if converted <= 0:
+                notes.append(f"대환 {c}: 전환할 기존 부채 없음 -> 효과 0")
                 continue
-            비율 = 전환액 / p.기존부채_잔액
+            share = converted / p.existing_debt
             # 기존 부채에서 전환분만큼 상환·잔액을 덜어낸다
-            기존상환 = [x * (1 - 비율) for x in 기존상환]
-            기존잔액 = [x * (1 - 비율) for x in 기존잔액]
-            # 새 조건으로 스케줄 생성 (현금 유입은 없음 — 부채가 옮겨갈 뿐)
-            sch, bal = 상환스케줄(
-                원금=전환액,
-                연금리=float(c.get("전환후_금리_연", 0.0)),
-                거치_개월=int(c.get("거치_개월", 0)),
-                상환_개월=int(c.get("상환_개월", 0)),
-                방식=str(c.get("상환방식", "균등분할")),
-                시작월=0,
+            old_payment = [x * (1 - share) for x in old_payment]
+            old_balance = [x * (1 - share) for x in old_balance]
+            # 새 조건으로 스케줄 생성 (현금 유입은 없음 - 부채가 옮겨갈 뿐)
+            sch, bal = loan_schedule(
+                principal=converted,
+                annual_rate=float(c.get("전환후_금리_연", 0.0)),
+                grace_months=int(c.get("거치_개월", 0)),
+                repay_months=int(c.get("상환_개월", 0)),
+                method=str(c.get("상환방식", "균등분할")),
+                start_month=0,
                 months=months,
             )
-            신규상환 = [x + y for x, y in zip(신규상환, sch)]
-            신규잔액 = [x + y for x, y in zip(신규잔액, bal)]
-            적용내역.append(
-                f"대환 {c.정책명}({c.라벨}) {전환액:,}원 "
-                f"→ {float(c.get('전환후_금리_연', 0)):.2%}"
+            new_payment = [x + y for x, y in zip(new_payment, sch)]
+            new_balance = [x + y for x, y in zip(new_balance, bal)]
+            notes.append(
+                f"대환 {c} {converted:,}원 -> {float(c.get('전환후_금리_연', 0)):.2%}"
             )
 
         # ── 3) 부채감면: 원금이 깎이고 새 조건으로 재조정 ──
         elif effect == "부채감면":
-            감면율 = float(c.get("원금감면율_추정", 0.0))
-            조정전 = p.기존부채_잔액
-            if 조정전 <= 0:
-                적용내역.append(f"채무조정 {c.정책명}: 조정할 부채 없음 → 효과 0")
+            rate = float(c.get("원금감면율_추정", 0.0))
+            before = p.existing_debt
+            if before <= 0:
+                notes.append(f"채무조정 {c}: 조정할 부채 없음 -> 효과 0")
                 continue
-            감면 = 조정전 * 감면율
-            감면액 += 감면
-            조정후 = 조정전 - 감면
+            cut = before * rate
+            forgiven += cut
+            after = before - cut
             # 기존 부채 스케줄을 통째로 대체
-            기존상환 = [0.0] * months
-            기존잔액 = [0.0] * (months + 1)
-            sch, bal = 상환스케줄(
-                원금=조정후,
-                연금리=0.0,  # 채무조정은 이자 감면이 원칙 → 0으로 처리
-                거치_개월=int(c.get("조정후_거치_개월", 0)),
-                상환_개월=int(c.get("조정후_상환_개월", 0)),
-                방식="균등분할",
-                시작월=0,
+            old_payment = [0.0] * months
+            old_balance = [0.0] * (months + 1)
+            sch, bal = loan_schedule(
+                principal=after,
+                annual_rate=0.0,  # 채무조정은 이자 감면이 원칙 -> 0으로 처리
+                grace_months=int(c.get("조정후_거치_개월", 0)),
+                repay_months=int(c.get("조정후_상환_개월", 0)),
+                method="균등분할",
+                start_month=0,
                 months=months,
             )
-            신규상환 = [x + y for x, y in zip(신규상환, sch)]
-            신규잔액 = [x + y for x, y in zip(신규잔액, bal)]
-            적용내역.append(
-                f"채무조정 {c.정책명}({c.라벨}) "
-                f"{조정전:,.0f} → {조정후:,.0f}원 (감면 {감면:,.0f}원, 추정치)"
+            new_payment = [x + y for x, y in zip(new_payment, sch)]
+            new_balance = [x + y for x, y in zip(new_balance, bal)]
+            notes.append(
+                f"채무조정 {c} {before:,.0f} -> {after:,.0f}원 "
+                f"(감면 {cut:,.0f}원, 추정치)"
             )
 
         # ── 4) 상환유예: 원금 감면 없이 기간만 연장 (가정 D1) ──
         elif effect == "상환유예":
-            대상 = p.정책자금_직접대출_잔액
-            if 대상 <= 0 or p.기존부채_월상환 <= 0:
-                적용내역.append(f"상환유예 {c.정책명}: 대상 정책자금 대출 없음 → 효과 0")
+            target = p.policy_loan_balance
+            if target <= 0 or p.existing_debt_payment <= 0:
+                notes.append(f"상환유예 {c}: 대상 정책자금 대출 없음 -> 효과 0")
                 continue
-            대상 = min(대상, p.기존부채_잔액)
-            비율 = 대상 / p.기존부채_잔액
-            대상월상환 = p.기존부채_월상환 * 비율
-            잔여개월 = math.ceil(대상 / 대상월상환) if 대상월상환 else 0
-            연장 = int(c.get("연장_개월_최대", 0))
-            새월상환 = 대상 / (잔여개월 + 연장) if (잔여개월 + 연장) else 0.0
+            target = min(target, p.existing_debt)
+            share = target / p.existing_debt
+            target_payment = p.existing_debt_payment * share
+            remaining = math.ceil(target / target_payment) if target_payment else 0
+            extension = int(c.get("연장_개월_최대", 0))
+            new_monthly = target / (remaining + extension) if (remaining + extension) else 0.0
 
-            기존상환 = [x * (1 - 비율) for x in 기존상환]
-            기존잔액 = [x * (1 - 비율) for x in 기존잔액]
+            old_payment = [x * (1 - share) for x in old_payment]
+            old_balance = [x * (1 - share) for x in old_balance]
 
-            잔 = 대상
+            left = target
             for m in range(1, months + 1):
-                if 잔 <= 0:
+                if left <= 0:
                     break
-                납 = min(새월상환, 잔)
-                신규상환[m - 1] += 납
-                잔 -= 납
-                신규잔액[m] += 잔
-            적용내역.append(
-                f"상환유예 {c.정책명} 대상 {대상:,.0f}원 · "
-                f"월 상환 {대상월상환:,.0f} → {새월상환:,.0f}원 "
-                f"({잔여개월}개월 → {잔여개월 + 연장}개월)"
+                pay = min(new_monthly, left)
+                new_payment[m - 1] += pay
+                left -= pay
+                new_balance[m] += left
+            notes.append(
+                f"상환유예 {c} 대상 {target:,.0f}원 · "
+                f"월 상환 {target_payment:,.0f} -> {new_monthly:,.0f}원 "
+                f"({remaining}개월 -> {remaining + extension}개월)"
             )
 
         # ── 5) 비용감면: 해당 월 고정비 감소 (가정 C1) ──
         elif effect == "비용감면":
-            시점 = int(c.get("지급시점_개월", 0) or 0)
-            if 시점 < months:
-                고정비조정[시점] += 금액
-            적용내역.append(f"비용감면 {c.정책명}({c.라벨}) {금액:,}원")
+            at = int(c.get("지급시점_개월", 0) or 0)
+            if at < months:
+                cost_relief[at] += amount
+            notes.append(f"비용감면 {c} {amount:,}원")
 
         # ── 6) 없음: 순위 대상이 아니지만 방어적으로 처리 ──
         elif effect == "없음":
-            적용내역.append(f"현금효과 없음: {c.정책명}({c.라벨})")
+            notes.append(f"현금효과 없음: {c}")
 
         else:
-            raise ValueError(f"알 수 없는 현금효과: {effect!r} ({c.후보id})")
+            raise ValueError(f"알 수 없는 현금효과: {effect!r} ({c.candidate_id})")
 
     # ── 월별 누적 차감 ──
-    잔고 = [float(p.보유현금)] + [0.0] * months
-    월상환 = [0.0] * months
-    부채잔액 = [float(p.기존부채_잔액)] + [0.0] * months
-    생존 = months
-    끝까지 = True
+    balance = [float(p.cash_on_hand)] + [0.0] * months
+    payment = [0.0] * months
+    debt = [float(p.existing_debt)] + [0.0] * months
+    survival = months
+    survives = True
 
     for m in range(1, months + 1):
-        영업 = p.영업현금흐름(m) + 고정비조정[m - 1]
-        상환 = 기존상환[m - 1] + 신규상환[m - 1]
-        월상환[m - 1] = 상환
-        잔고[m] = 잔고[m - 1] + 영업 - 상환 + 유입[m - 1]
-        부채잔액[m] = 기존잔액[m] + 신규잔액[m]
-        if 끝까지 and 잔고[m] <= 0:
-            생존 = m - 1
-            끝까지 = False
+        operating = p.operating_cashflow(m) + cost_relief[m - 1]
+        pay = old_payment[m - 1] + new_payment[m - 1]
+        payment[m - 1] = pay
+        balance[m] = balance[m - 1] + operating - pay + inflow[m - 1]
+        debt[m] = old_balance[m] + new_balance[m]
+        if survives and balance[m] <= 0:
+            survival = m - 1
+            survives = False
 
     return SimResult(
-        잔고=잔고,
-        월상환=월상환,
-        부채잔액=부채잔액,
-        유입=유입,
-        생존개월수=생존,
-        순부채_30=부채잔액[NET_DEBT_MONTH],
-        끝까지생존=끝까지,
-        감면액=감면액,
-        적용내역=적용내역,
+        balance=balance,
+        payment=payment,
+        debt=debt,
+        inflow=inflow,
+        survival_months=survival,
+        net_debt_at_30=debt[NET_DEBT_MONTH],
+        survives_full_term=survives,
+        forgiven=forgiven,
+        notes=notes,
     )
 
 
@@ -413,15 +423,15 @@ def simulate(
 # ══════════════════════════════════════════════════════════
 
 
-def 추세매출(현재매출: int, 월변화율: float, months: int = SIM_MONTHS) -> list[int]:
+def trend_revenue(current: int, monthly_change: float, months: int = SIM_MONTHS) -> list[int]:
     """단순 등비 추세. 정밀 모드의 POS 예측선을 대신하는 임시 헬퍼.
 
-    월변화율 -0.02 = 매달 2% 감소.
+    monthly_change -0.02 = 매달 2% 감소.
     실제 서비스에서는 POS 12개월 데이터로 추세를 뽑아 대체한다.
     """
-    return [int(현재매출 * (1 + 월변화율) ** m) for m in range(1, months + 1)]
+    return [int(current * (1 + monthly_change) ** m) for m in range(1, months + 1)]
 
 
-def 고정매출(현재매출: int, months: int = SIM_MONTHS) -> list[int]:
+def flat_revenue(current: int, months: int = SIM_MONTHS) -> list[int]:
     """간편 모드: 추세가 없으므로 현 수준 유지 가정."""
-    return [현재매출] * months
+    return [current] * months

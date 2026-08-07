@@ -147,6 +147,21 @@ gh repo create <레포명> --private --source=. --remote=origin --push
 
 ---
 
+## 코딩 컨벤션
+
+- **코드 식별자는 영어, JSON 키는 한글 그대로.** `policies_all.json`은 공고문 용어로 만든
+  데이터라 번역하면 기획서 ↔ JSON ↔ 코드 대응이 한 겹 깨진다. 데이터 경계에서만 한글을 쓰고
+  로직은 영어로 둔다.
+  ```python
+  def loan_schedule(principal, annual_rate, grace_months, ...)   # 식별자: 영어
+      rate = c.get("금리_연")                                     # JSON 키: 한글
+  ```
+- **주석·docstring·에러 메시지는 한글.** 도메인 설명에 유리하다.
+- **파일·디렉토리명은 ASCII.** 한글 파일명은 macOS(NFD)와 Windows·Linux(NFC)의
+  유니코드 정규화 방식이 달라 같은 파일이 다르게 인식될 수 있다.
+
+---
+
 ## 데이터 정확도에 대한 입장
 
 - 36개월 현금흐름은 **예측이 아니라 "현재 추세가 유지된다는 가정 하의 시나리오"**다. 절대값의 정확도는 주장하지 않는다
