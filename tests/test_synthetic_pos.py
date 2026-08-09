@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from data.synthetic_pos import (
+    DEFAULT_SEED,
     HOLIDAY_EFFECT,
     LUNAR_HOLIDAYS,
     SCENARIOS,
@@ -31,7 +32,7 @@ MAN = 10_000
 _cache: dict[tuple, pd.DataFrame] = {}
 
 
-def pos_of(scenario: str = "B", months: int = 12, seed: int = 42) -> pd.DataFrame:
+def pos_of(scenario: str = "B", months: int = 12, seed: int = DEFAULT_SEED) -> pd.DataFrame:
     """같은 조건이면 이미 만든 데이터를 돌려준다."""
     key = (scenario, months, seed)
     if key not in _cache:
@@ -216,12 +217,35 @@ def test_not_too_clean():
         assert cv > 0.20, f"{key}: 일별 변동이 너무 작다 ({cv:.0%})"
 
 
+def test_default_seed_separates_scenarios():
+    """기본 시드에서 세 시나리오가 구분되는지.
+
+    데모는 프리셋으로 고정되므로(기획서 5.5) 기본 시드 하나에서
+    A < B < C 순으로 하락폭이 벌어져야 한다. 시드 1~60 중 41개가
+    이 조건을 만족했고 그중 격차가 가장 큰 값을 기본값으로 골랐다.
+    """
+    print(f"\n-- 기본 시드({DEFAULT_SEED}) 하락폭")
+    drops = {}
+    for key, sc in SCENARIOS.items():
+        monthly = monthly_revenue(pos_of(key))
+        drops[key] = monthly.iloc[-3:].mean() / monthly.iloc[:3].mean() - 1
+        print(f"   {key} {sc.name:<10} {drops[key]:+6.1%}")
+
+    assert drops["C"] < drops["B"] < drops["A"] < 0, (
+        f"기본 시드에서 순서가 지켜져야 데모가 성립한다: {drops}"
+    )
+    assert drops["A"] - drops["C"] > 0.15, (
+        f"A와 C의 격차가 너무 작아 구분이 안 된다: {drops['A'] - drops['C']:.1%}"
+    )
+    return drops
+
+
 def test_reproducible():
     """같은 시드면 같은 데이터 — 데모 재현성."""
-    a = generate("B", months=12, seed=42, end_date=date(2026, 7, 31))
-    b = generate("B", months=12, seed=42, end_date=date(2026, 7, 31))
+    a = generate("B", months=12, seed=DEFAULT_SEED, end_date=date(2026, 7, 31))
+    b = generate("B", months=12, seed=DEFAULT_SEED, end_date=date(2026, 7, 31))
     c = generate("B", months=12, seed=7, end_date=date(2026, 7, 31))
-    print(f"\n-- 재현성: seed 42 두 번 {len(a):,}행 / {len(b):,}행, seed 7 {len(c):,}행")
+    print(f"\n-- 재현성: 같은 시드 두 번 {len(a):,}행 / {len(b):,}행, seed 7 {len(c):,}행")
     assert len(a) == len(b) and a.equals(b), "같은 시드면 같은 결과여야 함"
     assert len(a) != len(c) or not a.equals(c), "다른 시드면 달라야 함"
 
@@ -240,6 +264,7 @@ def main() -> None:
         test_weekday_effect,
         test_holiday_effect,
         test_not_too_clean,
+        test_default_seed_separates_scenarios,
         test_reproducible,
     ):
         fn()

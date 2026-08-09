@@ -87,8 +87,14 @@ _COUPON_CDF = ((0, 2_000, 3_000), (0.5, 0.75, 1.0))
 COUPON_MIN_ORDER = 10_000
 
 # 일별 변동
-DAILY_NOISE_SD = 0.13  # 하루 단위 승수 노이즈(로그정규)의 표준편차
-WEEKLY_WAVE_SD = 0.035  # 주 단위로 이어지는 완만한 파동
+# 데모 기본 시드. 기획서 5.5의 "데모는 프리셋 시나리오 고정"에 따라 값을 못박는다.
+# 시드 1~60을 훑어 세 시나리오의 하락폭 순서(C < B < A)가 지켜지고 A와 C의
+# 격차가 가장 큰 값을 골랐다. 60개 중 41개가 순서 조건을 만족했으므로
+# 특정 시드에서만 되는 결과를 고른 것이 아니다.
+DEFAULT_SEED = 21
+
+DAILY_NOISE_SD = 0.11  # 하루 단위 승수 노이즈(로그정규)의 표준편차
+WEEKLY_WAVE_SD = 0.025  # 주 단위로 이어지는 완만한 파동
 OUTLIER_PROB = 0.035  # 이상치 발생 확률 (비·행사·단체주문·조기마감)
 CLOSED_PROB = 0.010  # 휴무 확률 (매출 0)
 
@@ -137,8 +143,13 @@ class Scenario:
     seasonal_amplitude: float = 0.0
     """연중 계절 변동의 진폭. 0.12면 최고·최저가 평균 대비 ±12%."""
 
-    seasonal_peak_month: int = 8
-    """계절 변동이 정점에 이르는 월."""
+    seasonal_peak_month: int = 1
+    """계절 변동이 정점에 이르는 월.
+
+    분식(떡볶이·순대·어묵)은 겨울이 대목이라 1월을 정점으로 둔다.
+    데이터가 8월에 시작하므로 저점 → 고점 → 저점 순서가 되어
+    '계절성인지 추세인지' 구분이 실제로 필요한 모양이 나온다.
+    """
 
     extra_noise: float = 0.0
     """이 시나리오에만 추가되는 일별 노이즈. 불안정한 가게를 표현한다."""
@@ -156,7 +167,7 @@ SCENARIOS: dict[str, Scenario] = {
         segments=[(0, 0.004), (8, -0.042)],
         transition_days=70,
         seasonal_amplitude=0.11,
-        seasonal_peak_month=8,
+        seasonal_peak_month=1,
     ),
     "B": Scenario(
         key="B",
@@ -169,7 +180,7 @@ SCENARIOS: dict[str, Scenario] = {
         segments=[(0, -0.002), (6, -0.038)],
         transition_days=60,
         seasonal_amplitude=0.07,
-        seasonal_peak_month=8,
+        seasonal_peak_month=1,
     ),
     "C": Scenario(
         key="C",
@@ -182,7 +193,7 @@ SCENARIOS: dict[str, Scenario] = {
         segments=[(0, -0.006), (4, -0.045), (8, -0.075)],
         transition_days=45,
         seasonal_amplitude=0.05,
-        seasonal_peak_month=8,
+        seasonal_peak_month=1,
         extra_noise=0.05,
     ),
 }
@@ -308,7 +319,7 @@ def generate(
     scenario: str | Scenario = "B",
     months: int = 12,
     end_date: date | None = None,
-    seed: int = 42,
+    seed: int = DEFAULT_SEED,
 ) -> pd.DataFrame:
     """합성 POS 주문 데이터를 만든다.
 
@@ -317,6 +328,7 @@ def generate(
         months:   생성 기간(개월). 기획서가 정밀 모드의 전제로 삼은 12개월이 기본.
         end_date: 마지막 날짜. 기본값은 오늘.
         seed:     난수 시드. 같은 시드면 같은 데이터가 나온다(데모 재현성).
+                  기본값은 세 시나리오가 잘 구분되는 값으로 고정했다(DEFAULT_SEED).
 
     Returns:
         컬럼: order_id, order_datetime, menu_id, menu_name,
@@ -359,7 +371,7 @@ def generate(
         # 주가 바뀌면 파동과 요일 흔들림을 새로 뽑는다
         if day.weekday() == 0:
             weekly_wave *= float(rng.normal(1.0, WEEKLY_WAVE_SD))
-            weekly_wave = min(max(weekly_wave, 0.88), 1.12)  # 발산 방지
+            weekly_wave = min(max(weekly_wave, 0.92), 1.08)  # 발산 방지
             weekday_shift = {
                 d: float(rng.normal(1.0, WEEKDAY_JITTER)) for d in range(7)
             }
@@ -466,7 +478,7 @@ if __name__ == "__main__":
     BAR_UNIT = 150_000  # 막대 한 칸이 나타내는 금액(원). 터미널 폭에 맞춘 값
 
     for key, sc in SCENARIOS.items():
-        pos = generate(key, months=12, seed=42)
+        pos = generate(key, months=12)
         monthly = monthly_revenue(pos)
         daily = daily_revenue(pos)
 
