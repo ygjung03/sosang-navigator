@@ -25,16 +25,22 @@ MAN = 10_000
 
 
 def snack_shop_profile() -> UserProfile:
-    """기획서 예시 1 — 충무로 분식집. 매출 하락, 기존 대출 있음."""
+    """충무로 분식집 — 매출 하락, 기존 대출 있음 (개선여지 국면).
+
+    영세 소상공인 기준으로 잡았다. 경영안정 바우처 자격이
+    '연매출 1억 400만원 미만'이라 그보다 큰 매출로 프로필을 잡으면
+    보조금이 자격 필터에서 전부 빠져 조합이 융자뿐이 된다.
+    월 800만원(연 9,600만원)이면 바우처 자격 안에 든다.
+    """
     return UserProfile(
-        cash_on_hand=800 * MAN,
-        monthly_revenue=trend_revenue(1_440 * MAN, -0.015),
-        fixed_cost=1_064 * MAN,
+        cash_on_hand=500 * MAN,
+        monthly_revenue=trend_revenue(800 * MAN, -0.015),
+        fixed_cost=600 * MAN,
         variable_ratio=0.32,
-        existing_debt=4_000 * MAN,
-        existing_debt_payment=65 * MAN,
+        existing_debt=3_000 * MAN,
+        existing_debt_payment=50 * MAN,
         existing_debt_rate=0.07,
-        high_rate_debt=4_000 * MAN,  # 전액이 7% 이상 고금리
+        high_rate_debt=3_000 * MAN,  # 전액이 7% 이상 고금리
     )
 
 
@@ -45,7 +51,7 @@ def snack_shop_context() -> UserContext:
         credit_score=None,  # 모름 -> 점수 제한 정책도 통과
         restart_status="안함",
         revenue_drop_rate=0.22,  # 전년 대비 22% 감소
-        annual_revenue=1_440 * MAN * 12,
+        annual_revenue=800 * MAN * 12,  # 9,600만원 -> 바우처 자격 통과
     )
 
 
@@ -61,6 +67,10 @@ def test_eligibility():
 
     assert pool, "자격을 통과한 후보가 하나도 없으면 안 됨"
     assert all("개선여지" in c.phases for c in pool), "국면 필터가 안 걸림"
+    # 영세 사업자(연 9,600만원)라 경영안정 바우처 자격에 들어야 한다
+    assert any("바우처" in str(c) for c in pool), (
+        "연매출 1억 400만원 미만이면 경영안정 바우처가 통과해야 함"
+    )
     # 상환유예는 정책자금 직접대출 잔액이 0이므로 빠져야 한다
     assert not any(c.effect == "상환유예" for c in pool), (
         "정책자금 대출이 없는데 상환연장제도가 통과되면 안 됨"
@@ -190,7 +200,7 @@ def test_default_loan_amounts():
     # 5억 한도짜리가 5억으로 잡히면 안 된다
     growth = amounts.get("seoul_growth_base__2y3y")
     if growth:
-        assert growth < 100_000_000, (
+        assert growth < 50_000_000, (
             f"한도 5억을 그대로 쓰면 비현실적: {growth:,}원"
         )
     return amounts
