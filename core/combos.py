@@ -20,6 +20,8 @@
 
 설계 원칙 (기획서 5.5)
 ----------------------
+TODO(adr): 아래 원칙들의 채택 근거(왜 조기 종료를 버렸는지 등)는
+           docs/adr/ 로 옮길 대상.
 - **하드 제약은 코드가 배제한다.** 자격·중복·기한 위반 조합은 생성 단계에서 제외.
   LLM에게 "이건 자격이 안 돼요"를 판단시키지 않는다.
 - **정량으로 고를 수 없으면 고르지 않는다.** 상환조건은 후보로 전개되어 있으므로
@@ -461,6 +463,7 @@ def required_amount(
     `목표 개월수 × 월 적자폭` 곱셈을 쓰지 않는다. 그것은 5.1에서 버린
     나눗셈("보유현금 / 월 순손실")의 거울상이며, 매출 하락 추세에서
     적자가 매달 커지기 때문에 근사가 무너진다.
+    TODO(adr): 이 결정의 배경은 기획서 10장-26. ADR로 옮길 대상.
 
     대신 무지원 시뮬레이션의 **구간 최저점**을 쓴다. 보조금은 상환이 없어
     유입이 곡선을 그대로 평행이동시키므로, 최저점이 0이 되면 구간 내내
@@ -605,15 +608,39 @@ def filter_by_goal(
 # ══════════════════════════════════════════════════════════
 
 
-def summarize(evaluated: Sequence[Evaluated], top: int = 10) -> str:
-    """생존 개월수 기준 상위 몇 개를 표로. 순위 산정은 optimizer.py가 한다."""
+def summarize(evaluated: Sequence[Evaluated], top: int = 5) -> str:
+    """조합 목록을 **두 축 각각으로** 훑어본다. 디버깅용.
+
+    한 가지 정렬로 줄세우지 않는다. `sorted(key=(-생존, 순부채))`처럼 쓰면
+    생존을 1순위 축으로 삼는 것이 되어, "두 축은 동등하게 취급한다"는
+    설계 원칙(기획서 5.1)이 정렬 순서를 통해 깨진다.
+
+    실제 후보 선정은 optimizer.py가 축별 상위 N의 합집합으로 한다.
+    여기서는 두 축을 나란히 보여주기만 한다.
+    """
     MAN = 10_000
-    rows = sorted(
-        evaluated, key=lambda e: (-e.survival_months, e.net_debt_at_30)
-    )[:top]
-    lines = [f"{'생존':>6} {'순부채(만원)':>12}  조합"]
-    for ev in rows:
+    by_survival = sorted(evaluated, key=lambda e: -e.survival_months)[:top]
+    by_debt = sorted(evaluated, key=lambda e: e.net_debt_at_30)[:top]
+
+    lines = [f"전체 {len(evaluated)}개 조합 · 축별 상위 {top}개 (순위가 아니라 축별 관점)"]
+
+    lines.append(f"\n[축 1] 생존 개월수 — 클수록 좋음")
+    for ev in by_survival:
         lines.append(
-            f"{ev.result.survival_label:>6} {ev.net_debt_at_30 / MAN:>12,.0f}  {ev.label}"
+            f"  {ev.result.survival_label:>7} · 순부채 {ev.net_debt_at_30 / MAN:>7,.0f}만  {ev.label}"
         )
+
+    lines.append(f"\n[축 2] 30개월 후 순부채 — 작을수록 좋음")
+    for ev in by_debt:
+        lines.append(
+            f"  {ev.net_debt_at_30 / MAN:>7,.0f}만 · 생존 {ev.result.survival_label:>7}  {ev.label}"
+        )
+
+    # 두 축에 모두 든 조합은 어느 쪽으로 봐도 상위다
+    both = [e for e in by_survival if e in by_debt]
+    if both:
+        lines.append(f"\n[두 축 모두 상위] {len(both)}개")
+        for ev in both:
+            lines.append(f"  {ev.label}")
+
     return "\n".join(lines)
