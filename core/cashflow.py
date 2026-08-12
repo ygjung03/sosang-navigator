@@ -87,7 +87,7 @@ C1. 비용감면(바우처)은 총액 1회성이므로 지급 시점 한 달의 
     그만큼 줄이는 것으로 처리한다. 실제로는 사용기한 내 분산 소진되나,
     금액이 작아 2축에 미치는 영향이 미미하다.
 
-D1. 상환유예는 잔여 상환기간을 (대상 잔액 / 현재 월 상환액)으로 역산한 뒤,
+D1. 상환연장은 잔여 상환기간을 (대상 잔액 / 현재 월 상환액)으로 역산한 뒤,
     거기에 연장 개월을 더한 기간으로 다시 분할한다.
     금리는 (기존 금리 + 공고상 가산금리)를 적용한다.
 
@@ -96,6 +96,22 @@ E1. 변동비율은 매출과 무관하게 고정이다.
     최소 발주량·폐기율 때문에 그만큼 줄지 않는다.
     -> 하락 국면에서 영업 현금흐름이 실제보다 낙관적으로 나온다.
        모든 조합에 동일 적용되므로 상대 비교는 유지된다.
+
+F1. 생존이 끝나면 그 시점 상태에서 계산을 멈춘다 (terminal state).
+    잔고가 0 이하가 되는 첫 달에 생존을 확정하고, 그 이후로는
+      balance_at      0으로 고정 (파산 후 현금은 없다)
+      debt_at         종료 시점 값 유지 (못 갚았으므로 빚이 그대로 남는다)
+      payment_during  0 (안 냈으므로 나간 돈이 0원이다)
+    -> 이전에는 죽은 뒤에도 36개월을 계속 계산해, 잔고 3.6억인 달에 5억을
+       갚은 것으로 처리하는 일이 있었다. 그 결과 일찍 죽는 조합일수록
+       부채가 작게 나와 파레토 앞줄로 밀려 올라가는 편향이 있었다.
+    -> **이것은 실제 부채 예측값이 아니다.** 현실에서는 연체이자·기한이익
+       상실·지연배상금으로 부채가 증가한다. 그러나 연체이자율과
+       지연배상금률에 근거가 없어(소진공 운영규정 제14조도 "따로 정하는
+       지연배상금률"이라고만 한다) 반영하지 않는다.
+       따라서 조기 파산 조합의 부채는 실제보다 **과소평가**된다.
+       파산 조합끼리는 동일하게 과소평가되므로 그들 사이의 상대 비교는 유지된다.
+       TODO(inquiry): 연체이자율 근거를 확보하면 재검토할 것.
 """
 
 from __future__ import annotations
@@ -106,8 +122,25 @@ from typing import Sequence
 
 from .loader import Candidate
 
+# 기존 부채 금리를 모를 때 쓰는 값 (가정 B1). 0%로 두면 월 상환액 전액이
+# 원금 상환이 되어 부채가 가장 빨리 줄어드는 낙관적 가정이 된다.
+UNKNOWN_RATE = 0.0
+
+# 상환연장에서만 쓰는 별도 기준. 0%를 쓰면 가산금리만 남아 연 0.2%가 되므로
+# 그대로 쓸 수 없다. 소진공 정책자금 평균 금리대를 잠정 적용한다.
+# TODO(inquiry): 확정 근거 없음. 문의목록에 추가 필요.
+UNKNOWN_RATE_FOR_EXTENSION = 0.045
+
 SIM_MONTHS = 36  # 시뮬레이션·그래프 기간 (기획서 확정값)
-NET_DEBT_AT = 30  # 순부채를 측정하는 시점 (기획서 확정값)
+# 부채 축의 측정 시점은 상수가 아니라 **각 조합의 운영 종료 시점**이다.
+# 종료 = min(파산 시점, SIM_MONTHS). 아래 동결 로직 덕분에 debt_at[SIM_MONTHS]를
+# 그대로 읽으면 자동으로 종료 시점 값이 나온다 (죽은 뒤로는 변하지 않으므로).
+#
+# TODO(adr): 이전에는 NET_DEBT_AT = 30 이었다. 근거는 "대부분 2년 거치이므로
+#   거치 종료 후 6개월을 본다"였는데, 6이 임의값이고 거치 구조가 다른 상품
+#   (대환 거치 0, 만기일시 24개월)에는 같은 30개월이 전혀 다른 국면을 보는
+#   문제가 있었다. 평균 부채잔액·누적 원리금 상환액·순부채를 모두 실측 비교한
+#   끝에 "종료 시점 부채잔액"으로 정했다. 상세는 문제해결 기록 참조.
 
 
 # ══════════════════════════════════════════════════════════
@@ -153,8 +186,14 @@ class UserProfile:
     existing_debt_rate: float | None = None
     """기존 부채의 연 금리(소수). 모르면 None -> 가정 B1 적용."""
 
-    high_rate_debt: int = 0
+    high_rate_debt: int | None = None
     """기존 부채 중 **연 7% 이상 고금리** 부분(원). 대환대출의 대상이자 자격 요건.
+
+    **None(모름)과 0(없음)은 다르다.**
+      None -> 사용자가 입력하지 않았다. 기존 부채 전액을 대환 대상으로 본다.
+      0    -> 고금리 부채가 없다고 확인했다. 대환 자격이 없다.
+    `or`로 두 값을 뭉치면 0이 falsy라 "없음"이 "모름"으로 둔갑해,
+    6% 부채밖에 없는 사람에게 대환대출이 추천된다.
 
     기존 부채를 단일 금리로 뭉뚱그리면 "3,000만원 중 2,000만원만 7%"인 상황을
     표현할 수 없다. 대환대출 자격이 '7% 이상 대출 보유'이고 전환 대상도
@@ -180,7 +219,7 @@ class UserProfile:
             raise ValueError(
                 f"variable_ratio는 0 이상 1 미만이어야 합니다: {self.variable_ratio}"
             )
-        if self.high_rate_debt > self.existing_debt:
+        if self.high_rate_debt is not None and self.high_rate_debt > self.existing_debt:
             raise ValueError(
                 f"high_rate_debt({self.high_rate_debt:,})는 "
                 f"existing_debt({self.existing_debt:,})를 넘을 수 없습니다"
@@ -345,8 +384,11 @@ def existing_debt_schedule(
     if profile.existing_debt <= 0 or profile.existing_debt_payment <= 0:
         return payment_during, debt_at
 
-    # 금리를 모르면 0 -> 월 상환액 전액이 원금 상환이 된다 (가정 B1)
-    monthly_rate = (profile.existing_debt_rate or 0.0) / 12
+    # 금리를 모르면 0으로 가정한다 -> 월 상환액 전액이 원금 상환이 된다 (가정 B1).
+    # `or`를 쓰지 않는 이유: 0.0(무이자라고 확인한 경우)도 falsy라 "모름"과
+    # 구분되지 않는다. 여기서는 두 경우의 결과가 같지만, 의도를 코드에 남긴다.
+    rate = profile.existing_debt_rate
+    monthly_rate = (rate if rate is not None else UNKNOWN_RATE) / 12
 
     for month in range(1, horizon + 1):
         opening_debt = debt_at[month - 1]
@@ -380,13 +422,32 @@ class SimResult:
     """36개월 시뮬레이션 결과."""
 
     balance_at: list[float]
-    """저량 — 시점별 **현금 잔고**. 길이 horizon+1. balance_at[0] = 보유 현금."""
+    """저량 — 시점별 **현금 잔고**. 길이 horizon+1. balance_at[0] = 보유 현금.
+
+    **0 밑으로 내려가지 않는다.** 생존이 끝난 뒤로는 0으로 고정된다.
+    "얼마나 모자랐는가"는 `shortfall_at`을 보라.
+    """
 
     debt_at: list[float]
-    """저량 — 시점별 **총 부채 잔액**(기존 + 신규). 길이 horizon+1."""
+    """저량 — 시점별 **총 부채 잔액**(기존 + 신규). 길이 horizon+1.
+
+    생존이 끝난 뒤로는 종료 시점 값으로 고정된다 (가정 F1).
+    """
+
+    shortfall_at: list[float]
+    """저량 — 시점별 **부족분**. 잔고가 음수가 될 값을 그대로 담는다. 길이 horizon+1.
+
+    `balance_at`은 0에서 잘리므로 "얼마가 모자랐는가"를 알 수 없다.
+    필요액 역산(`combos.required_amount`)이 이 배열의 최저점을 쓴다.
+    양수 구간에서는 `balance_at`과 같다.
+    """
 
     payment_during: list[float]
-    """유량 — 월별 총 상환액. 길이 horizon. [23]이 24개월차."""
+    """유량 — 월별 **실제로 나간** 총 상환액. 길이 horizon. [23]이 24개월차.
+
+    생존이 끝난 뒤로는 0이다. 못 갚았으므로 나간 돈이 0원이라는 뜻이다.
+    (상환 '스케줄'이 아니라 실제 현금흐름이다)
+    """
 
     inflow_during: list[float]
     """유량 — 월별 현금 유입(융자 실행금·보조금). 길이 horizon."""
@@ -394,14 +455,41 @@ class SimResult:
     survival_months: int
     """축 1 — 잔고가 0 이하가 되는 첫 시점. 끝까지 버티면 horizon."""
 
-    net_debt_at_30: float
-    """축 2 — 30시점의 총 부채 잔액."""
+    debt_at_exit: float
+    """축 2 — **운영 종료 시점의 부채 잔액**.
 
-    survives_full_term: bool
+    종료 = min(파산 시점, horizon).
+    36개월까지 살아남은 조합은 36개월 시점 부채,
+    그 전에 파산한 조합은 파산 시점 부채를 뜻한다.
+
+    ※ "36개월 후 부채"가 아니다. 파산한 사업의 36개월 후를 예측한 값이 아니라,
+      각 조합의 시뮬레이션이 끝나는 시점에 남아 있던 부채다 (terminal state).
+    """
+
+    total_payment: float = 0.0
+    """유량 합계 — 생존 기간 동안 **실제로 나간** 원리금 총액(기존 부채 + 신규 융자).
+
+    **축이 아니라 정보다.** 최소화 목표로 쓸 수 없다 — 일찍 죽을수록 낼 것이
+    없어 작아지므로, 무지원이나 조기 파산 조합이 최소값을 차지한다.
+    (실측: 대환대출 5개월 생존 시 56만원, 무지원 3개월 생존 시 150만원)
+
+    두 축이 못 잡는 것을 잡는다. 금리가 다른 두 융자라도 **거치 기간에 죽으면
+    신규 융자 원금이 한 푼도 줄지 않아 종료 시점 부채가 동일**하게 나온다.
+    이자 부담 차이는 현금으로 빠져나가는데, 종료 시점 잔고는 어차피 0이라
+    소멸한다. 그 차이가 남는 곳이 여기다.
+    (실측: 일반경영안정 4.45% -> 1,100만 / 신용취약 5.45% -> 1,145만.
+     두 축은 생존 18개월 · 종료부채 5,385만으로 완전히 동점)
+
+    LLM 프롬프트에 생존 개월수와 **함께** 넘겨야 한다. 단독으로 보면
+    "적게 냈다"가 좋아 보이지만, 일찍 죽어서일 수도 있고 만기일시라
+    원금을 미뤄둔 것일 수도 있다.
+    """
+
+    survives_full_term: bool = False
     """36개월 내내 잔고가 0 아래로 안 내려갔는지."""
 
     forgiven: float = 0.0
-    """채무조정으로 감면된 원금 총액(원). 상환유예는 감면이 없으므로 0."""
+    """채무조정으로 감면된 원금 총액(원). 상환연장은 감면이 없으므로 0."""
 
     notes: list[str] = field(default_factory=list)
     """적용 내역을 사람이 읽을 수 있게 정리한 문장들."""
@@ -444,7 +532,7 @@ def simulate(
     forgiven = 0.0  # 감면된 원금 누적
     notes: list[str] = []  # 사람이 읽는 적용 내역
 
-    # 기존 부채 스케줄. 대환·채무조정·상환유예가 이 배열을 변형한다.
+    # 기존 부채 스케줄. 대환·채무조정·상환연장이 이 배열을 변형한다.
     old_payment_during, old_debt_at = existing_debt_schedule(profile, horizon)
     old_payment_during = list(old_payment_during)
     old_debt_at = list(old_debt_at)
@@ -560,12 +648,16 @@ def simulate(
                 f"(감면 {cut:,.0f}원, 추정치)"
             )
 
-        # ── 4) 상환유예 — 원금 감면 없이 기간만 늘려 월 상환액을 낮춘다 (가정 D1) ──
-        elif effect == "상환유예":
+        # ── 4) 상환연장 — 원금 감면 없이 기간만 늘려 월 상환액을 낮춘다 (가정 D1) ──
+        #
+        # 이름 주의: 소진공 「2026 상환연장 신청 안내」가 "이자납부 기간을 '상환유예'하는
+        # 제도가 아니라 원금 상환기간을 연장하는 '상환연장' 제도"라고 명시하고 있다.
+        # 제도 안내와 용어를 맞추기 위해 현금효과 이름을 상환유예 -> 상환연장으로 바꿨다.
+        elif effect == "상환연장":
             # 대상은 소진공 정책자금 직접대출 잔액. 기존 부채를 넘을 수 없다.
             target = min(profile.policy_loan_balance, remaining_existing)
             if target <= 0 or profile.existing_debt_payment <= 0:
-                notes.append(f"상환유예 {cand}: 대상 정책자금 대출 없음 -> 효과 0")
+                notes.append(f"상환연장 {cand}: 대상 정책자금 대출 없음 -> 효과 0")
                 continue
 
             share = target / remaining_existing  # 기존 부채 중 유예 대상 비율
@@ -576,7 +668,17 @@ def simulate(
 
             # 연장하면 금리가 가산된다 (공고: 약정금리 + 0.2%p, 단기연체 시 +0.4%p)
             surcharge = float(cand.get("금리_가산_연", 0.0))
-            new_rate = (profile.existing_debt_rate or 0.0) + surcharge
+            # ⚠ 여기서는 "모름"을 0%로 두면 안 된다. 가산금리만 남아 연 0.2%가
+            #   되어, 존재하지 않는 초저금리 상품처럼 보인다. 금리를 모르면
+            #   가정 B1의 0%가 아니라 별도 기준을 써야 한다. TODO(inquiry): B-20
+            base_rate = profile.existing_debt_rate
+            if base_rate is None:
+                base_rate = UNKNOWN_RATE_FOR_EXTENSION
+                notes.append(
+                    f"상환연장 {cand}: 기존 금리를 몰라 연 "
+                    f"{UNKNOWN_RATE_FOR_EXTENSION:.2%}로 가정했다 (확인 필요)"
+                )
+            new_rate = base_rate + surcharge
 
             # 대상분을 기존 스케줄에서 덜어내고
             old_payment_during = [x * (1 - share) for x in old_payment_during]
@@ -598,7 +700,7 @@ def simulate(
             ]
             new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
             notes.append(
-                f"상환유예 {cand} 대상 {target:,.0f}원 · "
+                f"상환연장 {cand} 대상 {target:,.0f}원 · "
                 f"월 상환 {target_payment:,.0f} -> {sched_payment[0]:,.0f}원 "
                 f"({remaining_term}개월 -> {new_term}개월, 금리 +{surcharge:.1%})"
             )
@@ -619,6 +721,7 @@ def simulate(
 
     # ══════════ 2단계: 월별 누적 차감 ══════════
     balance_at = [float(profile.cash_on_hand)] + [0.0] * horizon
+    shortfall_at = [float(profile.cash_on_hand)] + [0.0] * horizon
     debt_at = [float(profile.existing_debt)] + [0.0] * horizon
     payment_during = [0.0] * horizon
 
@@ -633,28 +736,54 @@ def simulate(
         # 이번 달 총 상환액
         total_payment = old_payment_during[month - 1] + new_payment_during[month - 1]
 
-        payment_during[month - 1] = total_payment
-        balance_at[month] = (
+        # ── 생존이 이미 끝났으면 아무 일도 일어나지 않는다 (가정 F1) ──
+        if not survives:
+            payment_during[month - 1] = 0.0      # 못 갚았으므로 나간 돈 0
+            balance_at[month] = 0.0              # 잔고는 0에서 멈춘다
+            debt_at[month] = debt_at[month - 1]  # 부채는 종료 시점 값 유지
+            shortfall_at[month] = shortfall_at[month - 1]
+            continue
+
+        raw = (
             balance_at[month - 1]
             + operating
             - total_payment
             + inflow_during[month - 1]
         )
-        debt_at[month] = old_debt_at[month] + new_debt_at[month]
+        # shortfall은 자르지 않는다. 역산이 "얼마가 모자랐는가"를 알아야 한다.
+        shortfall_at[month] = raw
+
+        if raw <= 0:
+            # 이 달에 파산한다. 상환액을 낼 돈이 없으므로 **이 달은 갚지 못한다.**
+            # 잔고 42만원인 달에 122만원을 갚은 것으로 처리하면 안 된다.
+            payment_during[month - 1] = 0.0
+            balance_at[month] = 0.0
+            debt_at[month] = debt_at[month - 1]
+        else:
+            payment_during[month - 1] = total_payment
+            balance_at[month] = raw
+            debt_at[month] = old_debt_at[month] + new_debt_at[month]
 
         # 잔고가 0 이하가 되는 '첫' 시점만 기록한다.
         # month개월차에 0이 됐다면 (month-1)개월까지 버틴 것.
-        if survives and balance_at[month] <= 0:
+        #
+        # TODO(forecast): 계절성이 들어오면 "0을 찍었다가 다음 달 매출로 회복"하는
+        #   경우가 생길 수 있다. 현재 178개 조합 실측에서는 0건이었다(매출 추세가
+        #   단조 감소이고 상환액은 거치 종료로 오히려 늘어나므로 구조적으로 회복이
+        #   어렵다). forecast.py가 계절성을 반영하면 이 판정을 재검토할 것.
+        if raw <= 0:
             survival_months = month - 1
             survives = False
 
     return SimResult(
         balance_at=balance_at,
+        shortfall_at=shortfall_at,
         debt_at=debt_at,
         payment_during=payment_during,
         inflow_during=inflow_during,
         survival_months=survival_months,
-        net_debt_at_30=debt_at[NET_DEBT_AT],
+        debt_at_exit=debt_at[horizon],  # 동결 덕분에 종료 시점 값과 같다
+        total_payment=sum(payment_during),
         survives_full_term=survives,
         forgiven=forgiven,
         notes=notes,

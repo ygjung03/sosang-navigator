@@ -61,7 +61,7 @@ from .metrics import TrapReport
 # 후보를 이만큼 모을 때까지 층을 벗긴다. 기획서 5.2의 확정값(5~10개)에서 왔다.
 MIN_CANDIDATES = 5
 
-# 순부채를 그룹핑할 때 쓰는 단위(원). 만원 단위로 같으면 같은 좌표로 본다.
+# 부채를 그룹핑할 때 쓰는 단위(원). 만원 단위로 같으면 같은 좌표로 본다.
 # 1원 차이로 그룹이 갈리는 것을 막기 위한 반올림이며, 판정 결과를 좌우하지 않는다.
 DEBT_BUCKET = 10_000
 
@@ -77,7 +77,7 @@ MAN = 10_000  # 만원. 출력 포맷용
 class CandidateGroup:
     """2축 성능이 동일한 조합들의 묶음.
 
-    좌표(생존 개월수, 순부채)가 같으면 2축으로는 구별할 수 없으므로
+    좌표(생존 개월수, 종료 시점 부채)가 같으면 2축으로는 구별할 수 없으므로
     코드가 대표를 고르지 않는다. 그룹째로 LLM에 넘기고 그 안에서
     고르게 한다 — 신청 부담, 개인 사정 등 코드가 모르는 정보가 판단 재료다.
     """
@@ -85,8 +85,11 @@ class CandidateGroup:
     survival_months: int
     """축 1 — 이 그룹의 생존 개월수. 클수록 좋음."""
 
-    net_debt_at_30: float
-    """축 2 — 이 그룹의 30개월 후 순부채. 작을수록 좋음."""
+    debt_at_exit: float
+    """축 2 — 이 그룹의 **운영 종료 시점 부채 잔액**. 작을수록 좋음.
+
+    종료 = min(파산 시점, 36개월). "36개월 후 부채"가 아니다.
+    """
 
     members: list[Evaluated] = field(default_factory=list)
     """이 성능을 내는 조합들. prune 후에는 명백한 열등이 빠진 상태."""
@@ -128,12 +131,12 @@ def group_by_outcome(evaluated: Sequence[Evaluated]) -> list[CandidateGroup]:
     """
     buckets: dict[tuple[int, int], CandidateGroup] = {}
     for ev in evaluated:
-        key = (ev.survival_months, round(ev.net_debt_at_30 / DEBT_BUCKET))
+        key = (ev.survival_months, round(ev.debt_at_exit / DEBT_BUCKET))
         group = buckets.get(key)
         if group is None:
             group = CandidateGroup(
                 survival_months=ev.survival_months,
-                net_debt_at_30=key[1] * DEBT_BUCKET,
+                debt_at_exit=key[1] * DEBT_BUCKET,
             )
             buckets[key] = group
         group.members.append(ev)
@@ -153,11 +156,11 @@ def _dominates(a: CandidateGroup, b: CandidateGroup) -> bool:
     """
     not_worse = (
         a.survival_months >= b.survival_months
-        and a.net_debt_at_30 <= b.net_debt_at_30
+        and a.debt_at_exit <= b.debt_at_exit
     )
     strictly_better = (
         a.survival_months > b.survival_months
-        or a.net_debt_at_30 < b.net_debt_at_30
+        or a.debt_at_exit < b.debt_at_exit
     )
     return not_worse and strictly_better
 
@@ -247,7 +250,7 @@ def _assign_ranks(groups: Sequence[CandidateGroup]) -> None:
     """축별 순위를 매긴다. 동점 그룹은 같은 순위(경쟁 순위)."""
     for attr, key, reverse in (
         ("survival_rank", lambda g: g.survival_months, True),
-        ("debt_rank", lambda g: g.net_debt_at_30, False),
+        ("debt_rank", lambda g: g.debt_at_exit, False),
     ):
         ordered = sorted(groups, key=key, reverse=reverse)
         rank, prev = 0, object()
@@ -287,7 +290,7 @@ def select(
     _assign_ranks(selected)
 
     return sorted(
-        selected, key=lambda g: (g.layer, -g.survival_months, g.net_debt_at_30)
+        selected, key=lambda g: (g.layer, -g.survival_months, g.debt_at_exit)
     )
 
 
@@ -321,12 +324,19 @@ def to_prompt_text(
         lines.append(
             f"[레이어 {group.layer}] 생존 {group.survival_months}개월"
             f"(생존 축 {group.survival_rank}위) · "
-            f"30개월 순부채 {group.net_debt_at_30 / MAN:,.0f}만원"
-            f"(순부채 축 {group.debt_rank}위)"
+            f"종료 시점 부채 {group.debt_at_exit / MAN:,.0f}만원"
+            f"(부채 축 {group.debt_rank}위)"
         )
         for member in group.members:
             report = reports[member.label]
             lines.append(f"  - {member.label}")
+            # 총 상환액은 축이 아니라 정보다. 두 축이 동점인 조합들의 이자 부담
+            # 차이가 여기서만 드러난다(거치 중 파산하면 종료 시점 부채가 같아짐).
+            # 생존 개월수와 함께 읽어야 한다 — 일찍 죽으면 낼 것이 없어 작아진다.
+            lines.append(
+                f"      36개월간 낸 원리금 총액 "
+                f"{member.result.total_payment / MAN:,.0f}만원"
+            )
             for trap in report.traps:
                 lines.append(f"      [경고] {trap.message}")
             if report.burden_ratio_now is not None:
@@ -363,7 +373,7 @@ def summarize(groups: Sequence[CandidateGroup]) -> str:
     ]
     for g in groups:
         lines.append(
-            f"{g.layer:>3} {g.survival_months:>5}개월 {g.net_debt_at_30 / MAN:>12,.0f} "
+            f"{g.layer:>3} {g.survival_months:>5}개월 {g.debt_at_exit / MAN:>12,.0f} "
             f"{g.survival_rank:>3}/{g.debt_rank:<3} {g.size:>4}  {g.label()[:44]}"
         )
     return "\n".join(lines)

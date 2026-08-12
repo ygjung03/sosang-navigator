@@ -48,8 +48,14 @@ DEFAULT_MAX_RESTRUCTURE = 1  # 채무조정도 1개
 DEFAULT_MAX_GRANT = 2  # 보조금은 2개까지
 
 # 필요액 역산 설정
-NEED_ITERATIONS = 6  # 고정점 반복 횟수 (보통 2~3회에 수렴)
-NEED_TOLERANCE = 10_000  # 1만원 이내면 수렴으로 본다
+# 1차식 외삽이라 보통 0~1회면 끝난다. 부동소수점 오차로 한 걸음 더 필요한
+# 경우를 대비한 상한이며, 수렴 판정이 아니라 무한루프 방어용이다.
+NEED_ITERATIONS = 4
+
+# 목표 시점의 잔고를 이만큼 양수로 만든다. 생존 판정이 `balance <= 0`이라
+# 정확히 0으로 맞추면 그 달에 생존이 끝나 목표를 1개월 못 채운다.
+# 1원은 부동소수점 오차에 묻힐 수 있어 1,000원으로 둔다.
+NEED_MARGIN = 1_000
 
 
 # ══════════════════════════════════════════════════════════
@@ -222,18 +228,32 @@ def _passes_debt_requirement(cand: Candidate, profile: UserProfile) -> bool:
 
     - 채무조정: 조정할 빚이 있어야 한다
     - 대환대출: 고금리(7% 이상) 부채가 있어야 한다
-    - 상환유예: 정책자금 직접대출 잔액이 있어야 한다
+    - 상환연장: 정책자금 직접대출 잔액이 있어야 한다
     """
     if cand.method == "채무조정" and profile.existing_debt <= 0:
         return False
 
     if cand.effect == "대환전환":
-        # 고금리 부채를 입력했으면 그 값으로, 안 했으면 기존 부채로 판정
-        convertible = profile.high_rate_debt or profile.existing_debt
-        if convertible <= 0:
+        # high_rate_debt는 None(모름)과 0(없음)이 다르다.
+        #   None -> 입력하지 않았다. 기존 부채 전액을 대상으로 보고 통과시킨다.
+        #   0    -> 고금리 부채가 없다고 확인했다. 자격 없음.
+        # `or`로 뭉치면 0이 falsy라 "없음"이 "모름"으로 바뀌어,
+        # 6% 부채밖에 없는 사람에게 대환대출이 추천된다.
+        if profile.high_rate_debt is not None:
+            if profile.high_rate_debt <= 0:
+                return False
+        elif profile.existing_debt <= 0:
             return False
 
-    if cand.effect == "상환유예" and profile.policy_loan_balance <= 0:
+        # 정책이 요구하는 기존 금리 하한을 검사한다. 금리를 모르면 통과시킨다
+        # (자격이 있는데 안 보여주는 것보다 보여주고 "확인 필요"를 붙이는 편이 낫다).
+        floor = cand.get("대상_기존금리_하한")
+        if floor is not None and profile.high_rate_debt is None:
+            rate = profile.existing_debt_rate
+            if rate is not None and rate < float(floor):
+                return False
+
+    if cand.effect == "상환연장" and profile.policy_loan_balance <= 0:
         return False
 
     return True
@@ -311,7 +331,7 @@ class Combo:
         """조합 전체의 현금 유입 합계(원).
 
         기획서 5.2.1 — 희망 금액 판정은 개별 정책이 아니라 조합 전체로 한다.
-        대환·채무조정·상환유예는 유입이 없으므로 제외된다.
+        대환·채무조정·상환연장은 유입이 없으므로 제외된다.
         """
         return sum(
             item.effective_amount
@@ -323,6 +343,34 @@ class Combo:
         return any(c.is_loan for c in self.candidates)
 
 
+# TODO(measure): 융자 한도 초과 빈도를 재측정하고 "융자 최대 1개"를 확장할지 판단할 것.
+#
+#   왜 미뤘나
+#     JSON `_조합문법.융자._MVP제약` 참조. 실제 규칙은 '융자방식별 1개'(대리 1 + 직접 1,
+#     A-2 확인)이지만 MVP는 1개만 만든다. 확장하려면 B-9(서울시 자금끼리 중복) 답변과
+#     융자방식 판정(loader가 후보에 `융자방식`을 넘겨야 함)이 선행되어야 한다.
+#
+#   시점
+#     국면별 목표 개월수를 확정한 뒤, app.py 배포 전.
+#     목표 개월수가 길어지면 한도 미달이 급증해 융자 구조가 바뀔 수 있고,
+#     그러면 조합 수 -> 그룹 수 -> 레이어 구조까지 연쇄로 다시 재야 한다.
+#     배포 후에 터지면 화면까지 되돌아가야 하므로 그 전에 끝낸다.
+#
+#   방법 (2026-08-12 1차 실측이 세 가지를 틀렸다. 반복하지 말 것)
+#     1. 조합 단위로 잴 것. 융자 단독으로 재면 보조금·채무조정이 필요액을 줄여주는
+#        효과가 빠져 미달이 과대평가된다.
+#     2. 국면별 목표를 짝지을 것. 전 케이스에 12~36개월을 다 돌리면, 회복불가 국면에
+#        36개월 목표를 걸고 "한도로도 못 채운다"고 세는 무의미한 결과가 나온다.
+#     3. 두 축을 다 볼 것. 생존 개월수만으로 성패를 가르면 5억을 빌려 36개월을 버티는
+#        조합이 '성공'으로 잡힌다. 순부채 축에서는 최악이다.
+#
+#   판단 기준
+#     "융자 2개로 해결 가능한 미달"이 20%를 넘으면 확장한다.
+#     한도가 남는데도 상환구조(만기일시·거치 종료) 때문에 무너지는 경우는 제외하고 셀 것.
+#     융자를 둘로 나눠도 그 절벽은 사라지지 않는다(오히려 절벽이 둘이 된다).
+#
+#   1차 실측(2026-08-12) 참고값: 융자후보×목표 135건 중 미달 43건(31.9%).
+#   다만 위 세 결함 때문에 위로 부풀려진 숫자이며, 그대로 인용하지 말 것.
 def _grammar_limits(db: PolicyDB) -> dict[str, int]:
     """JSON의 _조합문법에서 지원방법별 최대 개수를 읽는다."""
     rules = db.combo_rules
@@ -344,14 +392,25 @@ def _cross_source_allowed(db: PolicyDB, method: str) -> bool:
     return bool(db.combo_rules.get(method, {}).get("재원간_중복허용", False))
 
 
-def _restructure_loan_exclusive(db: PolicyDB) -> bool:
-    """채무조정 이행 중 신규 융자가 배타인지 (문의목록 A-3 / C-14).
+def _restructure_loan_exclusive(db: PolicyDB) -> tuple[bool, frozenset[str]]:
+    """채무조정 이행 중 신규 융자가 배타인지, 그리고 **어느 재원에** 적용되는지.
+
+    Returns:
+        (배타 여부, 적용 재원 집합)
+        적용 재원이 비어 있으면 모든 재원에 적용한다.
 
     "확인필요" 문자열이면 아직 모르는 상태 -> 배타로 보지 않고 조합을 만든다.
-    확정되면 True/False 불리언으로 바뀐다.
+
+    재원을 함께 돌려주는 이유: A-3 답변("채무조정 중 신규 정책자금 불가")은
+    **소진공 기준**이다. 서울시 재기지원자금은 지원대상에 "새출발기금 채권매각기업"을
+    명시하고 있어(서울시 공고 2026-3호 붙임3) 재원별로 다를 수 있다.
+    배타를 모든 융자에 걸면 서울시 자금까지 잘못 배제한다.
+    확정 전까지 JSON의 `_적용범위`에 적힌 재원에만 적용한다 (문의목록 B-10 / C-14).
     """
-    value = db.combo_rules.get("교차제약", {}).get("채무조정_융자_배타")
-    return value is True
+    rules = db.combo_rules.get("교차제약", {})
+    enabled = rules.get("채무조정_융자_배타") is True
+    scope = frozenset(rules.get("_적용범위") or ())
+    return enabled, scope
 
 
 def _pick_by_method(
@@ -430,13 +489,19 @@ def build_combos(
         pool, "보조금", limits["보조금"], _cross_source_allowed(db, "보조금")
     )
 
-    exclusive = _restructure_loan_exclusive(db)
+    exclusive, exclusive_sources = _restructure_loan_exclusive(db)
 
     combos: list[Combo] = []
     for loans in loan_options:
+        # 배타 규칙이 걸리는 재원의 융자가 이 조합에 있는지
+        blocked_loan = exclusive and any(
+            not exclusive_sources or c.source in exclusive_sources for c in loans
+        )
         for restructures in restructure_options:
-            # 채무조정 ↔ 신규 융자가 배타면 둘이 함께 있는 조합은 만들지 않는다
-            if exclusive and loans and restructures:
+            # 채무조정 ↔ 신규 융자가 배타면 둘이 함께 있는 조합은 만들지 않는다.
+            # 단 배타는 `_적용범위`에 적힌 재원에만 걸린다(현재 소진공). 서울시 융자는
+            # 재기지원자금 지원대상에 채무조정 이력자가 명시되어 있어 배제하지 않는다.
+            if blocked_loan and restructures:
                 continue
             for grants in grant_options:
                 picked = loans + restructures + grants
@@ -474,7 +539,9 @@ def required_amount(
     필요액은 1,000만원이다. 300만만 넣으면 3개월차에서 멈춘다.
     """
     baseline = simulate(profile, [], horizon=horizon)
-    window = baseline.balance_at[: min(target_months, horizon) + 1]
+    # balance_at은 0에서 잘리므로 "얼마가 모자랐는가"를 알 수 없다.
+    # shortfall_at은 음수를 그대로 담는다.
+    window = baseline.shortfall_at[: min(target_months, horizon) + 1]
     lowest = min(window)
     # 생존 판정이 `balance <= 0`이므로 최저점을 정확히 0으로 맞추면
     # 그 달에 생존이 끝나 목표를 1개월 못 채운다. 여유 1원을 더한다.
@@ -487,18 +554,25 @@ def required_loan_amount(
     target_months: int,
     horizon: int = SIM_MONTHS,
 ) -> int:
-    """융자로 목표 개월수를 채우려면 얼마를 빌려야 하는지 (고정점 반복).
+    """융자로 목표 개월수를 채우려면 얼마를 빌려야 하는지 (1차식 외삽).
 
-    대출은 거치기간에도 이자가 나가 곡선이 평행이동하지 않고 조금 더
-    내려간다. 그래서 최저점만큼 빌려도 이자 때문에 목표에 미달한다.
-    부족분을 더해 다시 시뮬레이션하는 것을 몇 번 반복하면 수렴한다.
+    목표 시점까지의 잔고 최저점은 대출 원금의 **1차 함수**다. 원금은 t=0에
+    한 번 들어오고, 이자와 원금 상환은 원금에 비례해 나가기 때문이다.
+    그래서 점 두 개로 기울기를 구하면 해가 바로 나온다.
 
-        1차: 최저점 -1,000만  -> 1,000만원 대출 -> 거치 이자로 -19만원 미달
-        2차: 1,019만원        -> 다시 -0.4만원 미달
-        3차: 1,024만원        -> 통과
+        A0 = 무지원 최저점만큼           -> 최저점 L0 (아직 음수)
+        A1 = A0 + 부족분                 -> 최저점 L1 (여전히 조금 음수)
+        기울기 = (L1 - L0) / (A1 - A0)   -> 원금 1원당 잔고 상승분 (예: 0.84)
+        A  = A1 + (MARGIN - L1) / 기울기 -> 잔고를 MARGIN으로 만드는 원금
 
-    정책 한도를 넘으면 한도에서 멈춘다. 한도로도 목표에 미달하면
-    그 사실이 호출한 쪽에 그대로 드러난다(생존 개월수가 목표보다 작음).
+    TODO(adr): 이전 구현(부족분을 더해 반복)을 버린 이유. 두 가지 결함이 있었다.
+      1) NEED_TOLERANCE(1만원) 이내면 수렴으로 보고 검증 없이 종료했다.
+         부족분을 더해도 이자가 같이 늘어 여전히 미달인 채로 빠져나갔다.
+      2) 부족분이 매 회차 약 1/6로 줄어드는 기하급수 수렴이라 0에 점근할 뿐
+         양수가 되지 않는데, 종료 조건이 `lowest > 0`이었다. 반복을 아무리
+         돌려도 목표 달성 판정이 나지 않았다.
+      경계에서 생존 개월수가 1개월씩 깎여, 목표 충족 조합 비율이 실측에서
+      35% vs 71%로 갈릴 만큼 영향이 컸다.
 
     ※ 대환전환은 예외다. 유입이 없어 '필요액'이 정의되지 않으므로
       전환 가능한 고금리 부채 금액을 그대로 쓴다.
@@ -507,29 +581,46 @@ def required_loan_amount(
     if ceiling <= 0:
         return 0
 
-    # 대환전환은 '필요액'이라는 개념이 성립하지 않는다.
-    # 현금 유입이 0이라 금액을 아무리 올려도 목표 개월수에 도달하지 못하고,
-    # 아래 반복문이 매번 한도까지 올라가 멈춘다. 결과는 같지만 의도가 안 보인다.
-    # 대환의 기준은 "얼마가 필요한가"가 아니라 "얼마를 갈아탈 수 있는가"이므로
-    # 보유한 고금리 부채와 정책 한도 중 작은 값을 바로 돌려준다.
+    # 대환전환은 '얼마가 필요한가'가 아니라 '얼마를 갈아탈 수 있는가'가 기준이다.
     if cand.effect == "대환전환":
-        convertible = profile.high_rate_debt or profile.existing_debt
+        # None(모름)이면 기존 부채 전액, 0(없음)이면 0. `or`로 뭉치지 않는다.
+        convertible = (
+            profile.high_rate_debt
+            if profile.high_rate_debt is not None
+            else profile.existing_debt
+        )
         return min(ceiling, int(convertible))
 
-    amount = min(required_amount(profile, target_months, horizon), ceiling)
-
-    for _ in range(NEED_ITERATIONS):
+    def lowest_with(amount: int) -> float:
+        """그 금액을 빌렸을 때 목표 구간의 잔고 최저점."""
         result = simulate(profile, [Applied(cand, amount)], horizon=horizon)
-        window = result.balance_at[: min(target_months, horizon) + 1]
-        lowest = min(window)
-        if lowest > 0:  # 목표 달성 (0은 생존 종료이므로 미달)
+        # balance_at이 아니라 shortfall_at을 본다 (위와 같은 이유)
+        return min(result.shortfall_at[: min(target_months, horizon) + 1])
+
+    a0 = min(required_amount(profile, target_months, horizon), ceiling)
+    if a0 <= 0:
+        return 0  # 무지원으로도 목표를 채운다
+    l0 = lowest_with(a0)
+    if l0 >= NEED_MARGIN:
+        return a0
+
+    a1 = min(a0 + int(NEED_MARGIN - l0), ceiling)
+    if a1 >= ceiling:
+        return ceiling  # 한도로도 모자란다. 미달 사실이 생존 개월수에 그대로 드러난다.
+    l1 = lowest_with(a1)
+
+    slope = (l1 - l0) / (a1 - a0)
+    if slope <= 0:
+        # 원금을 늘려도 잔고가 안 오른다(이자가 유입을 상쇄). 한도까지 가도 소용없다.
+        return ceiling
+
+    amount = a1
+    for _ in range(NEED_ITERATIONS):
+        low = lowest_with(amount)
+        if low >= NEED_MARGIN:
             break
-        shortfall = int(-lowest) + 1
-        if shortfall < NEED_TOLERANCE:  # 1만원 이내면 수렴으로 본다
-            amount = min(amount + shortfall, ceiling)
-            break
-        amount = min(amount + shortfall, ceiling)
-        if amount >= ceiling:  # 한도에 걸리면 더 올릴 수 없다
+        amount = min(amount + int((NEED_MARGIN - low) / slope) + 1, ceiling)
+        if amount >= ceiling:
             break
 
     return amount
@@ -553,9 +644,9 @@ class Evaluated:
         return self.result.survival_months
 
     @property
-    def net_debt_at_30(self) -> float:
+    def debt_at_exit(self) -> float:
         """축 2 — 작을수록 좋음."""
-        return self.result.net_debt_at_30
+        return self.result.debt_at_exit
 
     @property
     def label(self) -> str:
@@ -620,20 +711,20 @@ def summarize(evaluated: Sequence[Evaluated], top: int = 5) -> str:
     """
     MAN = 10_000
     by_survival = sorted(evaluated, key=lambda e: -e.survival_months)[:top]
-    by_debt = sorted(evaluated, key=lambda e: e.net_debt_at_30)[:top]
+    by_debt = sorted(evaluated, key=lambda e: e.debt_at_exit)[:top]
 
     lines = [f"전체 {len(evaluated)}개 조합 · 축별 상위 {top}개 (순위가 아니라 축별 관점)"]
 
     lines.append(f"\n[축 1] 생존 개월수 — 클수록 좋음")
     for ev in by_survival:
         lines.append(
-            f"  {ev.result.survival_label:>7} · 순부채 {ev.net_debt_at_30 / MAN:>7,.0f}만  {ev.label}"
+            f"  {ev.result.survival_label:>7} · 부채 {ev.debt_at_exit / MAN:>7,.0f}만  {ev.label}"
         )
 
     lines.append(f"\n[축 2] 30개월 후 순부채 — 작을수록 좋음")
     for ev in by_debt:
         lines.append(
-            f"  {ev.net_debt_at_30 / MAN:>7,.0f}만 · 생존 {ev.result.survival_label:>7}  {ev.label}"
+            f"  {ev.debt_at_exit / MAN:>7,.0f}만 · 생존 {ev.result.survival_label:>7}  {ev.label}"
         )
 
     # 두 축에 모두 든 조합은 어느 쪽으로 봐도 상위다

@@ -400,12 +400,12 @@ def summarize(
     실제 후보 선정은 optimizer.py가 한다.
     """
     by_survival = sorted(evaluated, key=lambda e: -e.survival_months)[:top]
-    by_debt = sorted(evaluated, key=lambda e: e.net_debt_at_30)[:top]
+    by_debt = sorted(evaluated, key=lambda e: e.debt_at_exit)[:top]
 
     def row(ev: Evaluated) -> str:
         rep = reports.get(ev.label, TrapReport())
         return (
-            f"  {ev.result.survival_label:>7} · {ev.net_debt_at_30 / MAN:>7,.0f}만 "
+            f"  {ev.result.survival_label:>7} · {ev.debt_at_exit / MAN:>7,.0f}만 "
             f"{rep.icon:>2}  {ev.label}"
         )
 
