@@ -71,8 +71,8 @@ def test_eligibility():
     assert any("바우처" in str(c) for c in pool), (
         "연매출 1억 400만원 미만이면 경영안정 바우처가 통과해야 함"
     )
-    # 상환유예는 정책자금 직접대출 잔액이 0이므로 빠져야 한다
-    assert not any(c.effect == "상환유예" for c in pool), (
+    # 상환연장은 정책자금 직접대출 잔액이 0이므로 빠져야 한다
+    assert not any(c.effect == "상환연장" for c in pool), (
         "정책자금 대출이 없는데 상환연장제도가 통과되면 안 됨"
     )
     return pool

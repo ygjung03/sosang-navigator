@@ -126,6 +126,14 @@ from .loader import Candidate
 # 원금 상환이 되어 부채가 가장 빨리 줄어드는 낙관적 가정이 된다.
 UNKNOWN_RATE = 0.0
 
+# 소진공 대리대출의 상환 구조 (FAQ '약정, 실행 및 상환' 65번)
+#   "대리대출은 거치기간 종료 후 상환기간 동안 대출금액의 70%는 3개월마다
+#    원금균등분할상환하고, 30%는 상환기간 만료 시 일시상환을 원칙으로 합니다."
+# 직접대출은 거치 종료 후 매월 원금균등분할이라 기존 '균등분할'을 그대로 쓴다.
+AGENCY_INSTALLMENT_RATIO = 0.7  # 분할상환 비중
+AGENCY_BALLOON_RATIO = 0.3      # 만기 일시상환 비중
+AGENCY_PAYMENT_CYCLE = 3        # 상환 주기(개월)
+
 # 상환연장에서만 쓰는 별도 기준. 0%를 쓰면 가산금리만 남아 연 0.2%가 되므로
 # 그대로 쓸 수 없다. 소진공 정책자금 평균 금리대를 잠정 적용한다.
 # TODO(inquiry): 확정 근거 없음. 문의목록에 추가 필요.
@@ -201,8 +209,18 @@ class UserProfile:
     0이면 대환 자격이 없다. existing_debt를 넘을 수 없다.
     """
 
-    overdue_months: int = 0
-    """연체 개월 수. 채무조정 자격 판정에 쓰인다(엔진 계산에는 미사용)."""
+    overdue_days: int = 0
+    """연체 **일수**. 채무조정·상환연장 자격 판정에 쓰인다(엔진 계산에는 미사용).
+
+    **일 단위인 이유**: 제도의 경계값이 전부 일 단위이고, 그중 10일은
+    월 단위로 근사할 수 없다.
+        90일 이상        부실차주
+        10~89일         부실우려차주 (조건 없음)
+        10일 미만        부실우려차주 (폐업·6개월 이상 휴업·세금체납 공공기록 등이 있어야)
+        30일 전후        부실우려차주 이자조정 금리가 갈림 (9% / 3.9~4.7%)
+        30일 이하        상환연장 자격 (초과하면 배제, 가산금리도 0.2 -> 0.4%p)
+    연체 5일과 20일은 개월로 보면 둘 다 0개월이지만 부실우려차주 자격이 정반대다.
+    """
 
     # ── 정책자금 이력 ──
     policy_loan_balance: int = 0
@@ -302,7 +320,11 @@ def loan_schedule(
         grace_months: 거치 개월. 원금을 안 갚고 이자만 내는 기간.
                       만기일시 방식에서는 '만기'로 해석한다.
         repay_months: 상환 개월. 거치가 끝난 뒤 원금을 나눠 갚는 기간.
-        method:       "균등분할"(원금균등, 가정 A1) 또는 "만기일시".
+        method:       "균등분할"  원금균등, 매월 (가정 A1). 소진공 직접대출·서울시.
+                      "만기일시"  거치 종료 시점에 원금 전액.
+                      "대리분기"  소진공 대리대출. 원금의 70%를 3개월마다
+                                 원금균등분할하고 30%는 상환기간 만료 시 일시상환.
+                                 (소진공 FAQ 65번)
         start_at:     대출이 실행되는 **시점**(0-based). 0 = 지금.
                       미래 자격 후보는 N개월 뒤이므로 N을 넣는다.
         horizon:      시뮬레이션 총 개월수.
@@ -355,6 +377,34 @@ def loan_schedule(
             payment_during[month - 1] = interest
             debt_at[month] = opening_debt
 
+        elif method == "대리분기":
+            # 소진공 대리대출 (FAQ 65번).
+            #   원금의 70%  -> 거치 종료 후 3개월마다 원금균등분할
+            #   원금의 30%  -> 상환기간 만료 시 일시상환
+            #
+            # 분기 상환이므로 상환 달에는 3개월치가 한 번에 나간다.
+            # 매월 균등으로 계산하면 그 달의 잔고 하락 폭을 과소평가한다.
+            elapsed = month - grace_end_at        # 거치 종료 후 몇 번째 달인가 (1-based)
+            repay_end_at = grace_end_at + repay_months
+
+            if month >= repay_end_at:
+                # 상환기간 만료: 남은 것을 전부 갚는다.
+                # 30% 일시상환분과 분할분의 반올림 잔여가 여기 모인다.
+                payment_during[month - 1] = interest + opening_debt
+                debt_at[month] = 0.0
+            elif elapsed % AGENCY_PAYMENT_CYCLE == 0:
+                # 3개월마다 돌아오는 상환 달.
+                # 분할 대상은 원금의 70%이고, 상환기간 동안 몇 번 갚는지로 나눈다.
+                installments = max(1, repay_months // AGENCY_PAYMENT_CYCLE)
+                principal_part = principal * AGENCY_INSTALLMENT_RATIO / installments
+                principal_part = min(principal_part, opening_debt)
+                payment_during[month - 1] = interest + principal_part
+                debt_at[month] = opening_debt - principal_part
+            else:
+                # 상환 달이 아니면 이자만 낸다.
+                payment_during[month - 1] = interest
+                debt_at[month] = opening_debt
+
         else:
             # 상환기간: 원금을 균등하게 나눠 갚는다 (가정 A1).
             # 나누는 기준은 '남은 빚'이 아니라 '처음 빌린 원금'이다.
@@ -366,6 +416,40 @@ def loan_schedule(
             debt_at[month] = opening_debt - principal_part
 
     return payment_during, debt_at
+
+
+def balloon_after(
+    principal: float,
+    grace_months: int,
+    repay_months: int,
+    method: str,
+    start_at: int = 0,
+    horizon: int = SIM_MONTHS,
+) -> tuple[float, int]:
+    """**시뮬레이션 창 밖**에서 한 번에 갚아야 하는 원금과 그 시점.
+
+    36개월 안에서는 보이지 않지만 사용자가 반드시 알아야 하는 금액이다.
+    예를 들어 일반경영안정자금 7,000만원(대리분기)은 60개월차에 원금의 30%인
+    2,100만원이 일시상환으로 돌아온다. 36개월 시뮬레이션에는 흔적조차 없다.
+
+    랭킹 축이 아니라 **정보**다. 두 축은 창 안의 현금흐름만 보므로
+    창 밖의 목돈을 잡지 못한다. LLM 프롬프트로 넘겨 경고에 쓴다.
+
+    Returns:
+        (금액, 개월차). 창 안에서 다 갚으면 (0.0, 0).
+    """
+    if method == "만기일시":
+        due_at = start_at + grace_months
+        amount = principal
+    elif method == "대리분기":
+        due_at = start_at + grace_months + repay_months
+        amount = principal * AGENCY_BALLOON_RATIO
+    else:
+        return 0.0, 0  # 균등분할은 만기에 몰리는 금액이 없다
+
+    if due_at <= horizon:
+        return 0.0, 0  # 창 안에서 이미 반영됐다
+    return amount, due_at
 
 
 def existing_debt_schedule(
@@ -440,6 +524,12 @@ class SimResult:
     `balance_at`은 0에서 잘리므로 "얼마가 모자랐는가"를 알 수 없다.
     필요액 역산(`combos.required_amount`)이 이 배열의 최저점을 쓴다.
     양수 구간에서는 `balance_at`과 같다.
+
+    **파산 이후에도 얼리지 않는다.** 다른 배열과 다른 점이다.
+    이 배열의 목적이 "목표를 채우려면 얼마가 모자라는가"이므로, 죽은 뒤로
+    고정하면 목표를 늘려도 부족분이 그대로여서 역산이 무너진다.
+    (실측: 동결했을 때 6개월 목표와 12개월 목표의 필요액이 43,853원으로 동일)
+    실제로 일어난 일이 아니라 **역산용 가상 궤적**이다.
     """
 
     payment_during: list[float]
@@ -465,6 +555,21 @@ class SimResult:
     ※ "36개월 후 부채"가 아니다. 파산한 사업의 36개월 후를 예측한 값이 아니라,
       각 조합의 시뮬레이션이 끝나는 시점에 남아 있던 부채다 (terminal state).
     """
+
+    balloon_after_horizon: float = 0.0
+    """유량 — **시뮬레이션 창(36개월) 이후** 한 번에 갚아야 하는 원금 합계.
+
+    축이 아니라 정보다. 두 축은 창 안의 현금흐름만 보므로 창 밖의 목돈을
+    잡지 못한다. 조합에 든 융자들의 만기 일시상환분을 합산한다.
+
+    - 대리분기: 원금의 30%가 상환기간 만료 시
+      (일반경영안정 7,000만 -> 60개월차에 2,100만원)
+    - 만기일시: 원금 전액이 만기에. 만기가 36개월 안이면 이미 반영되므로 0.
+    - 균등분할: 만기에 몰리는 금액이 없으므로 0.
+    """
+
+    balloon_due_at: int = 0
+    """balloon_after_horizon 이 발생하는 개월차. 없으면 0."""
 
     total_payment: float = 0.0
     """유량 합계 — 생존 기간 동안 **실제로 나간** 원리금 총액(기존 부채 + 신규 융자).
@@ -529,7 +634,9 @@ def simulate(
     new_debt_at = [0.0] * (horizon + 1)  # 새로 생기는 부채 잔액
     cost_saving_during = [0.0] * horizon  # 비용감면으로 '절약되는' 금액
 
-    forgiven = 0.0  # 감면된 원금 누적
+    forgiven = 0.0
+    balloon_total = 0.0   # 창 밖 만기 일시상환 합계
+    balloon_due_at = 0  # 감면된 원금 누적
     notes: list[str] = []  # 사람이 읽는 적용 내역
 
     # 기존 부채 스케줄. 대환·채무조정·상환연장이 이 배열을 변형한다.
@@ -570,6 +677,23 @@ def simulate(
                     a + b for a, b in zip(new_payment_during, sched_payment)
                 ]
                 new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
+
+                # 창 밖에서 한 번에 갚아야 하는 원금 (36개월 안에는 안 보인다)
+                bal_amount, bal_at = balloon_after(
+                    principal=amount,
+                    grace_months=int(cand.get("거치_개월", 0)),
+                    repay_months=int(cand.get("상환_개월", 0)),
+                    method=str(cand.get("상환방식", "균등분할")),
+                    start_at=payout_at,
+                    horizon=horizon,
+                )
+                if bal_amount > 0:
+                    balloon_total += bal_amount
+                    balloon_due_at = max(balloon_due_at, bal_at)
+                    notes.append(
+                        f"⚠ {cand}: {bal_at}개월차에 원금 {bal_amount:,.0f}원이 "
+                        f"일시상환으로 남는다 (시뮬레이션 {horizon}개월 밖)"
+                    )
                 notes.append(
                     f"융자 {cand} {amount:,}원 @ {float(cand.get('금리_연', 0)):.2%}"
                 )
@@ -616,7 +740,16 @@ def simulate(
         # ── 3) 부채감면 — 원금이 깎이고 새 조건으로 재조정된다 ──
         elif effect == "부채감면":
             forgive_rate = float(cand.get("원금감면율_추정", 0.0))
-            before = remaining_existing  # 조정 전 잔액
+            # 채무조정은 신청 즉시 효과가 나지 않는다. 확정까지 몇 달이 걸리고,
+            # 그동안은 기존 조건대로 계속 갚아야 한다.
+            start_at = int(cand.get("적용시점_개월", 0) or 0)
+            if start_at >= horizon:
+                notes.append(f"채무조정 {cand}: 적용 시점이 시뮬레이션 밖 -> 효과 0")
+                continue
+
+            # 감면 대상은 '지금' 잔액이 아니라 '확정 시점' 잔액이다.
+            # 그때까지 갚은 만큼은 이미 줄어 있다.
+            before = old_debt_at[start_at]
             if before <= 0:
                 notes.append(f"채무조정 {cand}: 조정할 부채 없음 -> 효과 0")
                 continue
@@ -625,9 +758,12 @@ def simulate(
             after = before - cut  # 조정 후 잔액
             forgiven += cut
 
-            # 남아 있던 기존 부채 스케줄을 통째로 대체한다
-            old_payment_during = [0.0] * horizon
-            old_debt_at = [0.0] * (horizon + 1)
+            # 확정 시점 **이후**의 기존 스케줄만 대체한다.
+            # 그 이전은 원래 조건대로 갚은 것이므로 남겨둔다.
+            for i in range(start_at, horizon):
+                old_payment_during[i] = 0.0
+            for i in range(start_at, horizon + 1):
+                old_debt_at[i] = 0.0
             remaining_existing = 0.0
 
             sched_payment, sched_debt = loan_schedule(
@@ -636,7 +772,7 @@ def simulate(
                 grace_months=int(cand.get("조정후_거치_개월", 0)),
                 repay_months=int(cand.get("조정후_상환_개월", 0)),
                 method="균등분할",
-                start_at=0,
+                start_at=start_at,
                 horizon=horizon,
             )
             new_payment_during = [
@@ -646,6 +782,60 @@ def simulate(
             notes.append(
                 f"채무조정 {cand} {before:,.0f} -> {after:,.0f}원 "
                 f"(감면 {cut:,.0f}원, 추정치)"
+            )
+
+        # ── 이자조정 — 원금과 대상 채무는 그대로 두고 금리만 낮춘다 ──
+        #
+        # 대환전환과 다르다: 대환은 빚이 새 대출로 옮겨가지만(고금리 부채로 한정,
+        # 새 거치·상환기간 적용) 이자조정은 **같은 빚의 금리만** 바뀐다.
+        # 부채감면과도 다르다: 원금이 줄지 않는다.
+        # 새출발기금 부실우려차주가 유일한 사례다.
+        elif effect == "이자조정":
+            if remaining_existing <= 0:
+                notes.append(f"이자조정 {cand}: 조정할 기존 부채 없음 -> 효과 0")
+                continue
+
+            # 연체 30일 전후로 금리 상한이 갈린다 (새출발기금 FAQ Q27).
+            if (profile.overdue_days or 0) <= 30:
+                cap = float(cand.get("조정후_금리_상한_연체30일이전", 0.09))
+            else:
+                cap = float(cand.get("조정후_금리_상한_연체30일이후", 0.047))
+
+            # min(채무조정 전 금리, 상한). 기존 금리를 모르면 상한을 그대로 쓴다.
+            before = profile.existing_debt_rate
+            new_rate = cap if before is None else min(before, cap)
+
+            start_at = int(cand.get("적용시점_개월", 0) or 0)
+            if start_at >= horizon:
+                notes.append(f"이자조정 {cand}: 적용 시점이 시뮬레이션 밖 -> 효과 0")
+                continue
+
+            # 조정 시점 이전은 기존 스케줄을 그대로 두고, 이후를 새 금리로 다시 만든다.
+            target = remaining_existing
+            sched_payment, sched_debt = loan_schedule(
+                principal=old_debt_at[start_at],
+                annual_rate=new_rate,
+                grace_months=int(cand.get("조정후_거치_개월", 0)),
+                repay_months=int(cand.get("조정후_상환_개월", 0)),
+                method="균등분할",
+                start_at=start_at,
+                horizon=horizon,
+            )
+            # 조정 시점 이후의 기존 스케줄을 덜어내고 새 것으로 갈아끼운다
+            for i in range(start_at, horizon):
+                old_payment_during[i] = 0.0
+            for i in range(start_at, horizon + 1):
+                old_debt_at[i] = 0.0
+            new_payment_during = [
+                a + b for a, b in zip(new_payment_during, sched_payment)
+            ]
+            new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
+            remaining_existing = 0.0
+
+            notes.append(
+                f"이자조정 {cand}: 대상 {target:,.0f}원 · "
+                f"금리 {(before if before is not None else cap):.2%} -> {new_rate:.2%} "
+                f"({start_at}개월 뒤 적용)"
             )
 
         # ── 4) 상환연장 — 원금 감면 없이 기간만 늘려 월 상환액을 낮춘다 (가정 D1) ──
@@ -660,6 +850,12 @@ def simulate(
                 notes.append(f"상환연장 {cand}: 대상 정책자금 대출 없음 -> 효과 0")
                 continue
 
+            # 상환연장도 신청 즉시가 아니라 약정 체결 후에 효과가 난다.
+            start_at = int(cand.get("적용시점_개월", 0) or 0)
+            if start_at >= horizon:
+                notes.append(f"상환연장 {cand}: 적용 시점이 시뮬레이션 밖 -> 효과 0")
+                continue
+
             share = target / remaining_existing  # 기존 부채 중 유예 대상 비율
             target_payment = profile.existing_debt_payment * share  # 대상분 월 상환액
             remaining_term = math.ceil(target / target_payment)  # 남은 상환 개월(역산)
@@ -667,7 +863,12 @@ def simulate(
             new_term = remaining_term + extension  # 연장 후 총 상환 개월
 
             # 연장하면 금리가 가산된다 (공고: 약정금리 + 0.2%p, 단기연체 시 +0.4%p)
-            surcharge = float(cand.get("금리_가산_연", 0.0))
+            # 연체가 있으면 가산금리가 두 배로 붙는다 (0.2%p -> 0.4%p).
+            # 자격 필터가 30일 초과를 이미 걸러내므로 여기 오는 연체는 단기연체다.
+            if (profile.overdue_days or 0) > 0:
+                surcharge = float(cand.get("금리_가산_연_단기연체", 0.0))
+            else:
+                surcharge = float(cand.get("금리_가산_연", 0.0))
             # ⚠ 여기서는 "모름"을 0%로 두면 안 된다. 가산금리만 남아 연 0.2%가
             #   되어, 존재하지 않는 초저금리 상품처럼 보인다. 금리를 모르면
             #   가정 B1의 0%가 아니라 별도 기준을 써야 한다. TODO(inquiry): B-20
@@ -680,9 +881,13 @@ def simulate(
                 )
             new_rate = base_rate + surcharge
 
-            # 대상분을 기존 스케줄에서 덜어내고
-            old_payment_during = [x * (1 - share) for x in old_payment_during]
-            old_debt_at = [x * (1 - share) for x in old_debt_at]
+            # 약정 시점 **이후**의 대상분만 기존 스케줄에서 덜어낸다.
+            # 그 이전은 원래 금액대로 갚은 것이다
+            # (소진공 안내: "약정 전까지 기존 대출에서 발생한 이자는 약정직전 수납 필요").
+            for i in range(start_at, horizon):
+                old_payment_during[i] *= 1 - share
+            for i in range(start_at, horizon + 1):
+                old_debt_at[i] *= 1 - share
             remaining_existing -= target
 
             # 늘어난 기간으로 새 스케줄을 만든다 (거치 없이 바로 분할 상환)
@@ -692,7 +897,7 @@ def simulate(
                 grace_months=0,
                 repay_months=new_term,
                 method="균등분할",
-                start_at=0,
+                start_at=start_at,
                 horizon=horizon,
             )
             new_payment_during = [
@@ -741,7 +946,16 @@ def simulate(
             payment_during[month - 1] = 0.0      # 못 갚았으므로 나간 돈 0
             balance_at[month] = 0.0              # 잔고는 0에서 멈춘다
             debt_at[month] = debt_at[month - 1]  # 부채는 종료 시점 값 유지
-            shortfall_at[month] = shortfall_at[month - 1]
+            # shortfall_at은 **얼리지 않는다.** 이 배열의 목적이 "이 목표를 채우려면
+            # 얼마가 모자라는가"를 재는 것이라, 죽은 뒤로 고정하면 목표를 늘려도
+            # 부족분이 그대로여서 역산이 무너진다(6개월 목표와 12개월 목표의
+            # 필요액이 같아진다). 파산 이후에도 원래 조건대로 계속 계산한다.
+            shortfall_at[month] = (
+                shortfall_at[month - 1]
+                + operating
+                - total_payment
+                + inflow_during[month - 1]
+            )
             continue
 
         raw = (
@@ -783,6 +997,8 @@ def simulate(
         inflow_during=inflow_during,
         survival_months=survival_months,
         debt_at_exit=debt_at[horizon],  # 동결 덕분에 종료 시점 값과 같다
+        balloon_after_horizon=balloon_total,
+        balloon_due_at=balloon_due_at,
         total_payment=sum(payment_during),
         survives_full_term=survives,
         forgiven=forgiven,

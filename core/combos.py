@@ -95,6 +95,7 @@ class UserContext:
     is_closed: bool = False
     """폐업했거나 폐업 예정인지. 재기 계열 정책의 자격."""
 
+
     revenue_drop_rate: float = 0.0
     """최근 매출 감소율(소수). 0.15 = 15% 감소. 매출 요건 판정에 쓴다."""
 
@@ -259,6 +260,78 @@ def _passes_debt_requirement(cand: Candidate, profile: UserProfile) -> bool:
     return True
 
 
+def _passes_extension_requirement(
+    cand: Candidate, profile: UserProfile, ctx: UserContext
+) -> bool:
+    """상환연장제도의 배제 요건 (소진공 FAQ 80번).
+
+        정상상환 중이거나 단기연체(30일 이하)  -> 가능
+        연체 30일 초과                       -> 불가
+        휴·폐업                              -> 불가 (자격요건.폐업여부로 이미 걸림)
+        채무조정 이용 중                      -> 불가 (조합문법 채무조정.최대=1로 이미 걸림)
+
+    ※ "타 금융기관의 연체사실이 있는 경우 연체 해소 후 이용 가능"도 원문에 있으나,
+      우리 모델의 overdue_days는 대출을 구분하지 않으므로 함께 걸린다.
+
+    ※ 원문의 "세금체납"은 판정하지 않는다. 입력을 받지 않기 때문이다.
+      JSON `_미구현_세금체납` 참조.
+    """
+    if cand.effect != "상환연장":
+        return True
+
+    ceiling = cand.get("연체일수_상한")
+    if ceiling is not None and (profile.overdue_days or 0) > int(ceiling):
+        return False
+
+    return True
+
+
+def _passes_overdue_requirement(
+    cand: Candidate, profile: UserProfile, ctx: UserContext
+) -> bool:
+    """연체 상태 요건 (새출발기금 부실차주 / 부실우려차주).
+
+    두 후보는 **연체 일수로 갈린다. 겹치지 않는다.**
+        부실차주      90일 이상
+        부실우려차주   10~89일
+                     또는 10일 미만이면서 폐업·6개월 이상 휴업·
+                          세금 체납 공공기록 등재 등에 해당
+                     (우리가 판정하는 대체 조건은 **폐업**뿐이다)
+
+    ※ 대체 조건은 **10일 미만일 때만** 적용된다. 90일 이상 연체 + 폐업이면
+      부실차주에만 해당하고 부실우려차주가 아니다.
+      (이전 구현은 폐업을 무조건 OR로 붙여 둘 다 통과시켰다)
+
+    ※ "6개월 이상 휴업"은 UserContext에 휴업 개월 필드가 없어 판정하지 못한다.
+      원문에 '등'이 붙어 열거가 완결적이지 않은 점도 감안해 MVP에서는 생략한다.
+
+    TODO(adr): 이 판정이 없던 동안 부실차주가 **연체 0일인 사람에게도**
+      추천되고 있었다. JSON에 `연체일수_하한` 필드가 있었는데 읽는 코드가
+      없었다. 부실우려차주를 제거한 기간에는 후보가 하나뿐이라 드러나지 않았고,
+      복원하면서 둘이 동시에 나와 발견됐다.
+    """
+    days = profile.overdue_days or 0
+
+    # ① 상한 초과는 대체 조건으로도 구제되지 않는다.
+    #    90일 이상 연체 + 폐업이면 부실차주에만 해당하고 부실우려차주가 아니다.
+    ceiling = cand.get("연체일수_상한")
+    if ceiling is not None and days > int(ceiling):
+        return False
+
+    # ② 하한 미만이면 대체 조건을 본다.
+    #    부실우려차주는 10일 미만이라도 폐업·세금체납 등이면 자격이 있다.
+    floor = cand.get("연체일수_하한")
+    if floor is not None and days < int(floor):
+        alt_below = cand.get("대체조건_적용_연체일수_미만")
+        if alt_below is None or days >= int(alt_below):
+            return False  # 대체 조건이 적용되는 구간이 아니다
+        alts = cand.get("자격_대체조건") or []
+        if "폐업" not in alts or not ctx.is_closed:
+            return False
+
+    return True
+
+
 def _passes_loan_limit(cand: Candidate, ctx: UserContext, db: PolicyDB) -> bool:
     """융자 횟수 제한. 최근 5년 3회 이상이면 제한(공고 융자제한 ⑦).
 
@@ -299,6 +372,10 @@ def eligible_candidates(
         if not _passes_closure(cand, ctx):
             continue
         if not _passes_debt_requirement(cand, profile):
+            continue
+        if not _passes_overdue_requirement(cand, profile, ctx):
+            continue
+        if not _passes_extension_requirement(cand, profile, ctx):
             continue
         if not _passes_loan_limit(cand, ctx, db):
             continue

@@ -27,7 +27,9 @@ from typing import Any, Literal
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "policies_all.json"
 
 # 현금효과 6종. 시뮬레이터의 계산 분기와 1:1로 대응한다.
-CashEffect = Literal["신규유입", "대환전환", "부채감면", "상환연장", "비용감면", "없음"]
+CashEffect = Literal[
+    "신규유입", "대환전환", "이자조정", "부채감면", "상환연장", "비용감면", "없음"
+]
 
 # 지원방법 4종. 조합 문법 제약의 기준.
 SupportMethod = Literal["융자", "보조금", "채무조정", "컨설팅"]

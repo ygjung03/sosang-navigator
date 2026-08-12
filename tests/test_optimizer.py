@@ -81,7 +81,7 @@ def test_grouping():
         for m in g.members:
             assert m.survival_months == g.survival_months
     # 그룹 간 좌표는 서로 달라야 한다
-    coords = [(g.survival_months, round(g.net_debt_at_30 / MAN)) for g in groups]
+    coords = [(g.survival_months, round(g.debt_at_exit / MAN)) for g in groups]
     assert len(coords) == len(set(coords)), "그룹 좌표가 중복되면 안 됨"
     return groups
 
@@ -105,9 +105,9 @@ def test_layering():
         for b in groups:
             dominated = (
                 b.survival_months >= a.survival_months
-                and b.net_debt_at_30 <= a.net_debt_at_30
+                and b.debt_at_exit <= a.debt_at_exit
                 and (b.survival_months > a.survival_months
-                     or b.net_debt_at_30 < a.net_debt_at_30)
+                     or b.debt_at_exit < a.debt_at_exit)
             )
             assert not dominated, f"1층인데 지배당함: {a.label()}"
     return selected
@@ -121,7 +121,7 @@ def test_pruning():
     print(f"\n-- 그룹 내 정리 (회복불가)")
     pruned = [g for g in groups if g.dropped]
     for g in pruned[:3]:
-        print(f"   생존 {g.survival_months}개월 · 순부채 {g.net_debt_at_30/MAN:,.0f}만")
+        print(f"   생존 {g.survival_months}개월 · 부채 {g.debt_at_exit/MAN:,.0f}만")
         print(f"     남김 {g.size}개 / 제외 {len(g.dropped)}개")
 
     for g in groups:
@@ -163,7 +163,7 @@ def test_edge_cases():
     from core.optimizer import CandidateGroup, non_dominated_sort
 
     def G(survival, debt):
-        return CandidateGroup(survival_months=survival, net_debt_at_30=debt)
+        return CandidateGroup(survival_months=survival, debt_at_exit=debt)
 
     print("\n-- 경계 케이스")
 
@@ -227,7 +227,7 @@ def test_prompt_text():
     print(f"\n-- LLM 프롬프트 ({len(text)}자)")
     print(text[:1400])
 
-    assert "레이어" in text and "생존" in text and "순부채" in text
+    assert "레이어" in text and "생존" in text and "부채" in text
     assert len(text) < 8000, "프롬프트가 너무 길면 LLM 판단이 산만해진다"
     return text
 

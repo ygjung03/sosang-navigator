@@ -59,7 +59,7 @@ def show(title: str, ev: Evaluated, rep) -> None:
     print(f"\n-- {title}")
     print(
         f"   생존 {ev.result.survival_label} (무지원 {rep.baseline_survival_months}개월) · "
-        f"순부채 {ev.net_debt_at_30/MAN:,.0f}만원 · 절벽 {rep.cliff_at or '없음'}"
+        f"부채 {ev.debt_at_exit/MAN:,.0f}만원 · 절벽 {rep.cliff_at or '없음'}"
     )
     for t in rep.traps:
         print(f"   ⚠ [{t.kind.value}] {t.message}")

@@ -337,6 +337,13 @@ def to_prompt_text(
                 f"      36개월간 낸 원리금 총액 "
                 f"{member.result.total_payment / MAN:,.0f}만원"
             )
+            # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
+            if member.result.balloon_after_horizon > 0:
+                lines.append(
+                    f"      ⚠ {member.result.balloon_due_at}개월차에 원금 "
+                    f"{member.result.balloon_after_horizon / MAN:,.0f}만원이 "
+                    f"일시상환으로 남는다 (36개월 시뮬레이션 밖)"
+                )
             for trap in report.traps:
                 lines.append(f"      [경고] {trap.message}")
             if report.burden_ratio_now is not None:
