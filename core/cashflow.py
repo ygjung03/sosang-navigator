@@ -769,8 +769,8 @@ def simulate(
             sched_payment, sched_debt = loan_schedule(
                 principal=after,
                 annual_rate=0.0,  # 채무조정은 이자 감면이 원칙
-                grace_months=int(cand.get("조정후_거치_개월", 0)),
-                repay_months=int(cand.get("조정후_상환_개월", 0)),
+                grace_months=int(cand.get("조정후_거치_개월_기본값", 0)),
+                repay_months=int(cand.get("조정후_상환_개월_기본값", 0)),
                 method="균등분할",
                 start_at=start_at,
                 horizon=horizon,
@@ -815,8 +815,8 @@ def simulate(
             sched_payment, sched_debt = loan_schedule(
                 principal=old_debt_at[start_at],
                 annual_rate=new_rate,
-                grace_months=int(cand.get("조정후_거치_개월", 0)),
-                repay_months=int(cand.get("조정후_상환_개월", 0)),
+                grace_months=int(cand.get("조정후_거치_개월_기본값", 0)),
+                repay_months=int(cand.get("조정후_상환_개월_기본값", 0)),
                 method="균등분할",
                 start_at=start_at,
                 horizon=horizon,

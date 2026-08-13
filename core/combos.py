@@ -95,6 +95,14 @@ class UserContext:
     is_closed: bool = False
     """폐업했거나 폐업 예정인지. 재기 계열 정책의 자격."""
 
+    store_area_pyeong: float | None = None
+    """점포 전용면적(평). 희망리턴패키지 점포철거비 금액 계산에 쓰인다.
+
+    지급액이 정액이 아니라 **1평(3.3㎡)당 20만원 × 전용면적, 최대 600만원**이다
+    (공고문 확인). 30평 미만이면 600만원보다 적게 나온다.
+    모르면 금액을 계산할 수 없으므로 후보에서 제외한다.
+    """
+
 
     revenue_drop_rate: float = 0.0
     """최근 매출 감소율(소수). 0.15 = 15% 감소. 매출 요건 판정에 쓴다."""
@@ -224,7 +232,9 @@ def _passes_closure(cand: Candidate, ctx: UserContext) -> bool:
     return True
 
 
-def _passes_debt_requirement(cand: Candidate, profile: UserProfile) -> bool:
+def _passes_debt_requirement(
+    cand: Candidate, profile: UserProfile, ctx: UserContext
+) -> bool:
     """부채 관련 요건.
 
     - 채무조정: 조정할 빚이 있어야 한다
@@ -255,6 +265,13 @@ def _passes_debt_requirement(cand: Candidate, profile: UserProfile) -> bool:
                 return False
 
     if cand.effect == "상환연장" and profile.policy_loan_balance <= 0:
+        return False
+
+    # 면적에 비례하는 보조금(점포철거비)은 면적을 모르면 금액을 계산할 수 없다.
+    # 근거 없는 금액을 넣느니 후보에서 뺀다.
+    if cand.get("단가_평당") is not None and (
+        ctx.store_area_pyeong is None or ctx.store_area_pyeong <= 0
+    ):
         return False
 
     return True
@@ -371,7 +388,7 @@ def eligible_candidates(
             continue
         if not _passes_closure(cand, ctx):
             continue
-        if not _passes_debt_requirement(cand, profile):
+        if not _passes_debt_requirement(cand, profile, ctx):
             continue
         if not _passes_overdue_requirement(cand, profile, ctx):
             continue
@@ -511,6 +528,39 @@ def _pick_by_method(
     return options
 
 
+def grant_amounts(
+    db: PolicyDB,
+    pool: Sequence[Candidate],
+    ctx: UserContext,
+) -> dict[str, int]:
+    """보조금 중 **금액이 사용자 입력에 따라 달라지는** 후보의 금액을 계산한다.
+
+    대부분의 보조금은 `지급액`이 정액이라 이 함수가 필요 없다.
+    점포철거비만 면적에 비례한다.
+
+        점포철거비 = min(단가_평당 x 전용면적, 지급액_상한)
+                  = min(200,000 x 평수, 6,000,000)
+
+    30평 이상이면 상한 600만원, 그 미만이면 그보다 적다.
+    면적을 모르면 이 dict에 넣지 않는다(자격 필터가 후보를 제외한다).
+
+    반환값은 `build_combos(amounts=...)`에 융자 금액과 함께 합쳐서 넘긴다.
+    """
+    result: dict[str, int] = {}
+    for cand in pool:
+        unit = cand.get("단가_평당")
+        if unit is None:
+            continue  # 정액 보조금은 effective_amount가 `지급액`을 읽는다
+        if ctx.store_area_pyeong is None or ctx.store_area_pyeong <= 0:
+            continue  # 면적을 모르면 계산 불가. 자격 필터가 제외한다
+        ceiling = cand.get("지급액_상한")
+        amount = int(unit) * float(ctx.store_area_pyeong)
+        if ceiling is not None:
+            amount = min(amount, float(ceiling))
+        result[cand.candidate_id] = int(amount)
+    return result
+
+
 def default_loan_amounts(
     db: PolicyDB,
     pool: Sequence[Candidate],
@@ -533,8 +583,9 @@ def default_loan_amounts(
     for cand in pool:
         if not cand.is_loan:
             continue  # 보조금·채무조정은 금액이 정책에 고정
-        result[cand.candidate_id] = required_loan_amount(
-            profile, cand, target_months, horizon
+        # 실제 신청 가능한 금액으로 맞춘다(100만원 단위 올림 · 최소 금액 적용)
+        result[cand.candidate_id] = snap_amount(
+            cand, required_loan_amount(profile, cand, target_months, horizon)
         )
     return result
 
@@ -623,6 +674,39 @@ def required_amount(
     # 생존 판정이 `balance <= 0`이므로 최저점을 정확히 0으로 맞추면
     # 그 달에 생존이 끝나 목표를 1개월 못 채운다. 여유 1원을 더한다.
     return max(0, int(-lowest) + 1) if lowest <= 0 else 0
+
+
+def snap_amount(cand: Candidate, amount: int, unit: int = 1_000_000) -> int:
+    """계산된 금액을 **실제로 신청할 수 있는 값**으로 맞춘다.
+
+    역산은 `28,841,810원` 같은 값을 낸다. 소진공 융자는 모두 100만원 단위로
+    신청하므로(A-42 확인) 그대로 보여줄 수 없다.
+
+        올림      2,884만 -> 2,900만.
+                 **내림하면 목표 개월수에 미달한다.** 반드시 올린다.
+        최소      필요액이 `금액_하한`보다 작으면 하한으로 올려 빌린다.
+                 (제외가 아니다. 신용취약자금은 최소 1,000만원이므로
+                  300만이 필요해도 1,000만을 빌린다)
+        한도      한도를 넘으면 한도까지만. 미달 사실은 생존 개월수에 드러난다.
+        불가      하한이 한도를 넘으면 0을 돌려준다. 신청 자체가 불가능하다.
+
+    ⚠ 서울시 자금은 단위·최소 금액이 미확인이다(B-25).
+      후보에 `신청금액_단위`가 없으면 소진공 값(100만원)을 잠정 적용한다.
+    """
+    if amount <= 0:
+        return 0
+    step = int(cand.get("신청금액_단위") or unit)
+    ceiling = int(cand.get("금액_한도", 0) or 0)
+    floor = cand.get("금액_하한")
+
+    amount = -(-amount // step) * step  # 올림
+    if floor is not None and amount < int(floor):
+        amount = int(floor)
+    if ceiling:
+        if floor is not None and int(floor) > ceiling:
+            return 0  # 최소 금액이 한도를 넘는다
+        amount = min(amount, ceiling)
+    return amount
 
 
 def required_loan_amount(
@@ -741,6 +825,140 @@ def evaluate(
         Evaluated(combo=combo, result=simulate(profile, combo.items, horizon=horizon))
         for combo in combos
     ]
+
+
+def rebalance_to_inflow(
+    combos: Sequence[Combo],
+    target_inflow: int,
+    unit: int = 1_000_000,
+) -> list[Combo]:
+    """**금액 입력 경로** — 목표 금액에 맞춰 조합별 융자액을 다시 정한다.
+
+    사용자가 "3,000만원이 필요하다"고 하면 그 3,000만원을 **어떻게 조달할지**가
+    문제다. 보조금은 공짜 돈이므로 받을 수 있는 만큼 먼저 받고, 부족분만 빌린다.
+
+        보조금 200만 + 융자 2,800만 = 3,000만
+        보조금 없음  + 융자 3,000만 = 3,000만
+
+    → **모든 조합의 총유입이 목표 금액으로 같아진다.**
+      그러면 조합 간 차이가 순수하게 '상환 구조'(금리·거치·분할)에서만 나온다.
+      목표 개월수 경로에서는 후보마다 필요액이 달라(2,818~3,440만) 그 편차가
+      부채 축에 섞이는데, 금액 경로에서는 그 문제가 없다.
+
+    Args:
+        target_inflow: 사용자가 입력한 목표 금액(원)
+        unit: 신청 금액 단위. 소진공은 100만원(A-42 확인).
+            부족분을 이 단위로 **올림**한다 — 내림하면 목표에 미달한다.
+
+    Returns:
+        융자 금액이 조정된 새 Combo 목록. 융자가 없는 조합은 그대로 둔다.
+
+    제약 처리
+        - 부족분이 후보의 `금액_하한`보다 작으면 하한으로 **올려** 빌린다.
+          (제외가 아니다. 최소 1,000만원인 자금에 300만이 필요하면 1,000만을 빌린다)
+        - 하한이 한도를 넘으면 그 조합을 버린다.
+        - 부족분이 한도를 넘으면 한도까지만 빌린다(목표 미달로 남는다).
+        - 보조금만으로 목표를 채우면 융자는 0원이 되는데, 그 조합은 융자를
+          빼는 것이 맞으므로 버린다(같은 조합이 보조금 단독으로 이미 존재한다).
+    """
+    result: list[Combo] = []
+    for combo in combos:
+        loans = [it for it in combo.items if it.candidate.is_loan]
+        if not loans:
+            result.append(combo)
+            continue
+        if len(loans) > 1:
+            # 융자 2개는 배분 최적해가 없다(JSON `_MVP제약` 참조).
+            # 현재 조합 문법이 융자 1개로 제한하므로 여기 오지 않는다.
+            raise NotImplementedError("융자 2개 이상의 금액 배분은 미구현")
+
+        loan = loans[0]
+        # 융자를 뺀 나머지 유입(보조금)을 먼저 센다
+        granted = sum(
+            it.effective_amount
+            for it in combo.items
+            if it is not loan and it.candidate.effect == "신규유입"
+        )
+        short = target_inflow - granted
+        if short <= 0:
+            continue  # 보조금만으로 충분하다. 융자 없는 조합이 따로 있다
+
+        amount = snap_amount(loan.candidate, short, unit)
+        if amount <= 0:
+            continue  # 최소 금액이 한도를 넘는다. 신청 자체가 불가능
+
+        items = tuple(
+            Applied(it.candidate, amount) if it is loan else it
+            for it in combo.items
+        )
+        result.append(Combo(items=items))
+    return result
+
+
+def resolve_by_both(
+    db: PolicyDB,
+    pool: Sequence[Candidate],
+    profile: UserProfile,
+    ctx: UserContext,
+    target_inflow: int,
+    target_months: int,
+    unit: int = 1_000_000,
+    horizon: int = SIM_MONTHS,
+) -> tuple[list[Combo], bool, int | None]:
+    """**금액과 목표 개월수를 둘 다 입력했을 때.**
+
+    사용자가 정한 금액을 존중하되, 그 금액으로 목표를 못 채우면 알려준다.
+
+        1단계  금액 기준으로 조합을 만든다 (`rebalance_to_inflow`)
+        2단계  그중 목표 개월수를 채우는 조합이 있으면 -> 그대로 쓴다
+        3단계  하나도 없으면 -> 목표 개월수 기준으로 다시 만들고,
+               "목표를 채우려면 얼마가 필요한지"를 함께 돌려준다
+
+    3단계에서 금액을 올려버리는 것이 아니라 **두 가지를 다 보여주기 위한 정보**다.
+    사용자가 금액을 정한 데는 이유가 있다(신용 한도, 상환 부담 등).
+    화면과 LLM 프롬프트에서 이렇게 쓴다.
+
+        "3,000만원으로는 12개월까지입니다.
+         18개월을 채우려면 3,800만원이 필요합니다."
+
+    Returns:
+        (조합 목록, 금액으로 목표 충족 여부, 목표를 채우는 데 필요한 금액)
+
+        충족이면 (금액 기준 조합, True, target_inflow)
+        미달이면 (목표 개월수 기준 조합, False, 필요 금액 또는 None)
+        None은 목표 개월수 기준으로도 못 채운다는 뜻이다(한도 초과 등).
+    """
+    grants = grant_amounts(db, pool, ctx)
+    zero = {c.candidate_id: 0 for c in pool if c.is_loan}
+    base = build_combos(db, pool, {**zero, **grants})
+
+    # ── 1~2단계: 사용자가 정한 금액으로 ──
+    by_inflow = rebalance_to_inflow(base, target_inflow, unit)
+    if any(
+        simulate(profile, c.items, horizon=horizon).survival_months >= target_months
+        for c in by_inflow
+    ):
+        return by_inflow, True, target_inflow
+
+    # ── 3단계: 목표 개월수 기준으로 다시. 필요 금액을 함께 구한다 ──
+    amounts = {
+        c.candidate_id: required_loan_amount(profile, c, target_months, horizon)
+        for c in pool
+        if c.is_loan
+    }
+    amounts.update(grants)
+    by_months = build_combos(db, pool, amounts)
+
+    need = min(
+        (
+            c.total_inflow
+            for c in by_months
+            if simulate(profile, c.items, horizon=horizon).survival_months
+            >= target_months
+        ),
+        default=None,
+    )
+    return by_months, False, need
 
 
 def filter_by_goal(

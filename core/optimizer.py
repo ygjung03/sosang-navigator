@@ -303,14 +303,37 @@ def to_prompt_text(
     groups: Sequence[CandidateGroup],
     reports: dict[str, TrapReport],
     baseline_survival: int | None = None,
+    goal_months: int | None = None,
+    goal_satisfied: bool = True,
 ) -> str:
     """후보 그룹을 LLM 프롬프트에 넣을 텍스트로 만든다.
 
     순위(서수)만 주면 간격을 알 수 없으므로 실제 수치를 함께 준다(기획서 5.5).
+
+    Args:
+        goal_months:    사용자가 입력한 목표 생존 개월수. 없으면 표시하지 않는다.
+        goal_satisfied: `combos.filter_by_goal()`의 두 번째 반환값.
+            False면 **목표를 채우는 조합이 하나도 없어** 필터가 무력화되고
+            전체가 넘어온 상태다. 아래 후보들은 모두 목표 미달이며,
+            LLM이 이 사실을 사용자에게 반드시 알려야 한다.
+            (회복불가 국면에서 흔하다)
     """
     lines: list[str] = []
     if baseline_survival is not None:
         lines.append(f"지원을 받지 않으면 생존 {baseline_survival}개월.")
+        lines.append("")
+
+    if goal_months is not None:
+        if goal_satisfied:
+            lines.append(f"목표 {goal_months}개월. 아래 후보는 모두 목표를 채운다.")
+        else:
+            # 이 문구를 빠뜨리면 "24개월 버틸 수 있습니다"라고 잘못 안내하게 된다.
+            lines.append(
+                f"⚠ 목표 {goal_months}개월을 채우는 조합이 **하나도 없다.** "
+                f"아래는 그중 나은 차선이며 모두 목표에 미달한다. "
+                f"사용자에게 이 사실을 반드시 알리고, 목표를 낮추거나 "
+                f"고정비 절감 같은 다른 방법을 함께 제안할 것."
+            )
         lines.append("")
 
     lines.append(
