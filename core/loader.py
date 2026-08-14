@@ -50,6 +50,17 @@ class Candidate:
     effect: str  # 현금효과
     phases: tuple[str, ...]  # 적용국면
     label: str = ""
+
+    is_extra: bool = False
+    """**부가 추천 대상**인지 (`_순위제외`).
+
+    현금효과가 0이라 2축에 반영되지 않는 후보다(사업정리 컨설팅, 법률자문 등).
+    조합에 넣으면 좌표가 바뀌지 않으면서 조합 수만 배로 늘어나므로 제외한다.
+
+    다만 **자격 필터는 통과시킨다.** 국면·자격에 맞는 것만 골라 LLM 프롬프트에
+    별도 목록으로 넘겨 최종 추천과 함께 안내한다.
+    (이전에는 로더가 아예 넘기지 않아 자격 필터에 도달조차 못 했다)
+    """
     # 원본 후보 dict. 금액·금리·거치 등 지원방법별 필드는 여기서 꺼내 쓴다.
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
     # 정책 레벨 원본 (자격요건 등)
@@ -134,12 +145,14 @@ def _is_excluded(policy: dict, cand: dict) -> bool:
     return bool(policy.get("_순위제외") or cand.get("_순위제외"))
 
 
-def load(path: str | Path = DATA_PATH, include_excluded: bool = False) -> PolicyDB:
+def load(path: str | Path = DATA_PATH, include_excluded: bool = True) -> PolicyDB:
     """정책 JSON을 읽어 후보 단위로 펼친다.
 
     Args:
         path: policies_all.json 경로
-        include_excluded: True면 _순위제외 후보(부가 추천 대상)도 포함
+        include_excluded: `_순위제외` 후보(부가 추천 대상)를 포함할지.
+            **기본값이 True다.** 이들도 자격 필터를 통과해야 LLM에 안내할 수 있다.
+            조합에서 빼는 것은 `combos.build_combos()`가 `is_extra`를 보고 한다.
     """
     path = Path(path)
     with path.open(encoding="utf-8") as f:
@@ -148,10 +161,12 @@ def load(path: str | Path = DATA_PATH, include_excluded: bool = False) -> Policy
     candidates: list[Candidate] = []
     for policy in raw["policies"]:
         for cand in policy["후보"]:
-            if not include_excluded and _is_excluded(policy, cand):
+            excluded = _is_excluded(policy, cand)
+            if not include_excluded and excluded:
                 continue
             candidates.append(
                 Candidate(
+                    is_extra=excluded,
                     candidate_id=cand["후보id"],
                     policy_id=policy["id"],
                     policy_name=policy["name"],

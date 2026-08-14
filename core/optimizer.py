@@ -53,7 +53,7 @@ TODO(adr): 아래 "왜 축별 상위 5 합집합을 쓰지 않는가"는 결정�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Any, Sequence
 
 from .combos import Evaluated
 from .metrics import TrapReport
@@ -305,6 +305,7 @@ def to_prompt_text(
     baseline_survival: int | None = None,
     goal_months: int | None = None,
     goal_satisfied: bool = True,
+    extras: Sequence[Any] = (),
 ) -> str:
     """후보 그룹을 LLM 프롬프트에 넣을 텍스트로 만든다.
 
@@ -317,6 +318,10 @@ def to_prompt_text(
             전체가 넘어온 상태다. 아래 후보들은 모두 목표 미달이며,
             LLM이 이 사실을 사용자에게 반드시 알려야 한다.
             (회복불가 국면에서 흔하다)
+        extras: `combos.extra_candidates()`가 돌려준 **부가 추천 후보**.
+            현금효과가 0이라 순위에 들어가지 않지만 자격은 통과한 것들이다
+            (사업정리 컨설팅, 법률자문 등). 최종 3개를 고른 뒤
+            "이런 것도 함께 신청해 보세요"로 덧붙이게 한다.
     """
     lines: list[str] = []
     if baseline_survival is not None:
@@ -358,7 +363,8 @@ def to_prompt_text(
             # 생존 개월수와 함께 읽어야 한다 — 일찍 죽으면 낼 것이 없어 작아진다.
             lines.append(
                 f"      36개월간 낸 원리금 총액 "
-                f"{member.result.total_payment / MAN:,.0f}만원"
+                f"{member.result.total_payment / MAN:,.0f}만원 "
+                f"(월평균 {member.result.monthly_payment_avg / MAN:,.0f}만원)"
             )
             # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
             if member.result.balloon_after_horizon > 0:
@@ -387,6 +393,17 @@ def to_prompt_text(
             )
         lines.append("")
 
+    if extras:
+        lines.append("")
+        lines.append("[함께 안내할 것] 순위에는 들어가지 않지만 자격이 되는 지원")
+        for cand in extras:
+            note = cand.get("_순위제외근거") or cand.get("조건") or ""
+            lines.append(f"  - {cand}" + (f" — {note[:60]}" if note else ""))
+        lines.append(
+            "  ※ 현금 효과가 없거나 금액을 특정할 수 없어 순위 계산에서 뺐다. "
+            "최종 추천과 함께 부가로 안내할 것."
+        )
+
     return "\n".join(lines)
 
 
@@ -406,4 +423,5 @@ def summarize(groups: Sequence[CandidateGroup]) -> str:
             f"{g.layer:>3} {g.survival_months:>5}개월 {g.debt_at_exit / MAN:>12,.0f} "
             f"{g.survival_rank:>3}/{g.debt_rank:<3} {g.size:>4}  {g.label()[:44]}"
         )
+
     return "\n".join(lines)

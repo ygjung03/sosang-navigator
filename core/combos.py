@@ -95,6 +95,30 @@ class UserContext:
     is_closed: bool = False
     """폐업했거나 폐업 예정인지. 재기 계열 정책의 자격."""
 
+    tax_delinquent: bool = False
+    """국세·지방세를 **체납 중**인지.
+
+    같은 사실이 제도에 따라 반대로 작용하므로 필드 하나로 세 곳을 판정한다.
+
+        소진공 융자 6종   자격을 뺏는다 — 공고 제2026-478호 4쪽 융자제한 ①
+                        "세금을 체납중인 소상공인"
+        상환연장         자격을 뺏는다 — 소진공 FAQ 80번 "세금체납... 지원이 불가"
+        새출발기금
+        부실우려차주      자격을 **준다** — 연체 10일 미만이어도 체납이면 대상.
+                        체납 등재 자체가 상환 곤란의 신호로 취급된다
+
+    **금액 기준은 없다.** 세 곳 모두 "체납 중인지" 여부만 본다.
+
+    ※ 새출발기금만 원문이 "체납으로 **공공기록정보가 등재된 자**"인데, 등재 여부는
+      한국신용정보원 내부 상태라 소상공인이 알기 어렵다. 입력은 "체납 중인지"로 받고
+      그쪽은 느슨하게 판정한다 — 체납했으나 등재되지 않은 경우 자격을 과대 인정할 수
+      있으나, 자격을 잘못 뺏는 것보다 낫다.
+
+    ※ 소진공 융자제한 ①의 예외("압류·매각 유예 등을 받으면 직접대출에 한해 포함")는
+      구현하지 않았다. 유예 여부를 받으려면 필드가 하나 더 필요한데 드문 경우다.
+      LLM이 대화로 안내한다.
+    """
+
     store_area_pyeong: float | None = None
     """점포 전용면적(평). 희망리턴패키지 점포철거비 금액 계산에 쓰인다.
 
@@ -267,6 +291,12 @@ def _passes_debt_requirement(
     if cand.effect == "상환연장" and profile.policy_loan_balance <= 0:
         return False
 
+    # 세금 체납 중이면 소진공 융자를 받을 수 없다
+    # (공고 제2026-478호 4쪽 융자제한 소상공인 ① "세금을 체납중인 소상공인").
+    # 예외("압류·매각 유예 시 직접대출에 한해 포함")는 미구현이다.
+    if cand.is_loan and cand.get("배제_세금체납") and ctx.tax_delinquent:
+        return False
+
     # 면적에 비례하는 보조금(점포철거비)은 면적을 모르면 금액을 계산할 수 없다.
     # 근거 없는 금액을 넣느니 후보에서 뺀다.
     if cand.get("단가_평당") is not None and (
@@ -284,20 +314,22 @@ def _passes_extension_requirement(
 
         정상상환 중이거나 단기연체(30일 이하)  -> 가능
         연체 30일 초과                       -> 불가
+        세금 체납                            -> 불가
         휴·폐업                              -> 불가 (자격요건.폐업여부로 이미 걸림)
         채무조정 이용 중                      -> 불가 (조합문법 채무조정.최대=1로 이미 걸림)
 
     ※ "타 금융기관의 연체사실이 있는 경우 연체 해소 후 이용 가능"도 원문에 있으나,
       우리 모델의 overdue_days는 대출을 구분하지 않으므로 함께 걸린다.
 
-    ※ 원문의 "세금체납"은 판정하지 않는다. 입력을 받지 않기 때문이다.
-      JSON `_미구현_세금체납` 참조.
     """
     if cand.effect != "상환연장":
         return True
 
     ceiling = cand.get("연체일수_상한")
     if ceiling is not None and (profile.overdue_days or 0) > int(ceiling):
+        return False
+
+    if cand.get("배제_세금체납") and ctx.tax_delinquent:
         return False
 
     return True
@@ -313,7 +345,8 @@ def _passes_overdue_requirement(
         부실우려차주   10~89일
                      또는 10일 미만이면서 폐업·6개월 이상 휴업·
                           세금 체납 공공기록 등재 등에 해당
-                     (우리가 판정하는 대체 조건은 **폐업**뿐이다)
+                     (우리가 판정하는 대체 조건은 **폐업·세금체납** 둘이다.
+                      "6개월 이상 휴업"은 휴업 개월 필드가 없어 판정하지 못한다)
 
     ※ 대체 조건은 **10일 미만일 때만** 적용된다. 90일 이상 연체 + 폐업이면
       부실차주에만 해당하고 부실우려차주가 아니다.
@@ -343,7 +376,10 @@ def _passes_overdue_requirement(
         if alt_below is None or days >= int(alt_below):
             return False  # 대체 조건이 적용되는 구간이 아니다
         alts = cand.get("자격_대체조건") or []
-        if "폐업" not in alts or not ctx.is_closed:
+        ok = ("폐업" in alts and ctx.is_closed) or (
+            "세금체납" in alts and ctx.tax_delinquent
+        )
+        if not ok:
             return False
 
     return True
@@ -516,7 +552,9 @@ def _pick_by_method(
         빈 튜플(선택 안 함)을 포함한 모든 조합.
         예: 융자 3개 중 최대 1개 -> [(), (A,), (B,), (C,)]
     """
-    items = [c for c in pool if c.method == method]
+    # is_extra(부가 추천 대상)는 조합에 넣지 않는다. 현금효과가 0이라 좌표가
+    # 바뀌지 않으면서 조합 수만 배로 늘어난다. extra_candidates()가 따로 다룬다.
+    items = [c for c in pool if c.method == method and not c.is_extra]
     options: list[tuple[Candidate, ...]] = [()]  # 아무것도 안 고르는 경우
 
     for size in range(1, limit + 1):
@@ -570,6 +608,11 @@ def default_loan_amounts(
 ) -> dict[str, int]:
     """융자 후보별 디폴트 금액을 필요액으로 역산한다 (기획서 5.4).
 
+    ⚠ 이 함수는 융자 후보를 **하나씩** 역산한다. 같은 조합에 보조금이나 채무조정이
+      함께 들어가는 것을 모르므로 융자 금액이 과다하게 나온다.
+      조합을 만든 뒤 반드시 `rebalance_to_months()`로 다시 조정할 것.
+      (금액 입력 경로의 `rebalance_to_inflow()`와 대칭이다)
+
     지정하지 않으면 Applied.effective_amount가 **정책 한도**를 쓰는데,
     서울시 성장기반자금처럼 한도가 5억인 자금이 있어 소상공인에게
     비현실적인 조합이 상위를 차지한다.
@@ -603,6 +646,11 @@ def build_combos(
 
     조합 폭발은 알고리즘이 아니라 도메인 문법으로 막는다 (기획서 10장-10).
     융자1·채무조정1·보조금2 제약만으로 수십 개 수준에 머문다.
+    
+    ※ `is_extra` 후보(사업정리 컨설팅·법률자문 등 `_순위제외`)는 조합에 넣지 않는다.
+      현금효과가 0이라 좌표가 바뀌지 않으면서 조합 수만 배로 늘어난다.
+      이들은 자격 필터를 통과한 채로 남아 있다가 LLM 프롬프트에 **부가 추천**으로
+      따로 전달된다(`extra_candidates()` 참조).
     """
     amounts = amounts or {}
     limits = _grammar_limits(db)
@@ -714,6 +762,7 @@ def required_loan_amount(
     cand: Candidate,
     target_months: int,
     horizon: int = SIM_MONTHS,
+    base: Sequence[Applied] = (),
 ) -> int:
     """융자로 목표 개월수를 채우려면 얼마를 빌려야 하는지 (1차식 외삽).
 
@@ -737,6 +786,13 @@ def required_loan_amount(
 
     ※ 대환전환은 예외다. 유입이 없어 '필요액'이 정의되지 않으므로
       전환 가능한 고금리 부채 금액을 그대로 쓴다.
+
+    Args:
+        base: **이 융자와 함께 적용될 다른 항목들**(보조금·채무조정).
+            비워두면 융자 단독으로 역산한다.
+            채우면 그 효과를 먼저 반영한 뒤 부족분만 융자로 채운다 — 보조금이
+            200만원 들어오거나 채무조정으로 원금이 감면되면 그만큼 덜 빌린다.
+            `combos.rebalance_to_months()`가 조합마다 이 인자를 채워 호출한다.
     """
     ceiling = int(cand.get("금액_한도", 0) or 0)
     if ceiling <= 0:
@@ -754,11 +810,23 @@ def required_loan_amount(
 
     def lowest_with(amount: int) -> float:
         """그 금액을 빌렸을 때 목표 구간의 잔고 최저점."""
-        result = simulate(profile, [Applied(cand, amount)], horizon=horizon)
+        result = simulate(
+            profile, [*base, Applied(cand, amount)], horizon=horizon
+        )
         # balance_at이 아니라 shortfall_at을 본다 (위와 같은 이유)
         return min(result.shortfall_at[: min(target_months, horizon) + 1])
 
-    a0 = min(required_amount(profile, target_months, horizon), ceiling)
+    # 융자 없이 base(보조금·채무조정)만 적용했을 때 이미 목표를 채우면 빌릴 필요가 없다
+    if base:
+        without = simulate(profile, list(base), horizon=horizon)
+        if min(without.shortfall_at[: min(target_months, horizon) + 1]) >= NEED_MARGIN:
+            return 0
+        a0 = min(
+            int(NEED_MARGIN - min(without.shortfall_at[: min(target_months, horizon) + 1])),
+            ceiling,
+        )
+    else:
+        a0 = min(required_amount(profile, target_months, horizon), ceiling)
     if a0 <= 0:
         return 0  # 무지원으로도 목표를 채운다
     l0 = lowest_with(a0)
@@ -827,6 +895,31 @@ def evaluate(
     ]
 
 
+def fixed_amounts(
+    profile: UserProfile,
+    pool: Sequence[Candidate],
+    horizon: int = SIM_MONTHS,
+) -> dict[str, int]:
+    """**금액을 제도가 정하는** 후보들의 금액.
+
+    사용자가 목표 금액이나 목표 개월수를 무엇으로 주든 이 값은 달라지지 않는다.
+
+        대환전환   갈아탈 수 있는 고금리 부채 잔액 (한도 이내)
+        그 외      `Applied.effective_amount`가 JSON에서 읽는다
+                   (보조금 정액 · 채무조정은 금액 개념 없음)
+
+    금액 입력 경로에서 `build_combos(amounts=...)`에 융자 금액을 0으로 넘길 때,
+    대환대출까지 0이 되면 갈아탈 것이 없어져 효과가 사라진다. 이 함수가 채운다.
+    """
+    result: dict[str, int] = {}
+    for cand in pool:
+        if cand.effect == "대환전환":
+            result[cand.candidate_id] = required_loan_amount(
+                profile, cand, target_months=horizon, horizon=horizon
+            )
+    return result
+
+
 def rebalance_to_inflow(
     combos: Sequence[Combo],
     target_inflow: int,
@@ -863,8 +956,15 @@ def rebalance_to_inflow(
     """
     result: list[Combo] = []
     for combo in combos:
-        loans = [it for it in combo.items if it.candidate.is_loan]
+        # **`is_loan`이 아니라 `신규유입`으로 고른다.** 대환대출은 융자지만 새 돈이
+        # 들어오지 않는다(기존 고금리 부채를 갈아타는 것이다). 여기에 목표 금액을
+        # 꽂으면 "3,000만원을 빌렸는데 유입은 0원"인 조합이 만들어진다.
+        # 목표 금액을 채우는 데 쓸 수 있는 것은 신규유입뿐이다.
+        funds = [it for it in combo.items if it.candidate.effect == "신규유입"]
+        loans = [it for it in funds if it.candidate.is_loan]
         if not loans:
+            # 융자가 없으면 조정할 것이 없다. 보조금 정액과 대환·채무조정처럼
+            # 제도가 금액을 정하는 항목만 남은 조합이다.
             result.append(combo)
             continue
         if len(loans) > 1:
@@ -875,9 +975,7 @@ def rebalance_to_inflow(
         loan = loans[0]
         # 융자를 뺀 나머지 유입(보조금)을 먼저 센다
         granted = sum(
-            it.effective_amount
-            for it in combo.items
-            if it is not loan and it.candidate.effect == "신규유입"
+            it.effective_amount for it in funds if it is not loan
         )
         short = target_inflow - granted
         if short <= 0:
@@ -930,7 +1028,10 @@ def resolve_by_both(
     """
     grants = grant_amounts(db, pool, ctx)
     zero = {c.candidate_id: 0 for c in pool if c.is_loan}
-    base = build_combos(db, pool, {**zero, **grants})
+    # 대환전환은 갈아탈 금액이 따로 정해진다. 0으로 두면 효과가 사라진다.
+    base = build_combos(
+        db, pool, {**zero, **fixed_amounts(profile, pool, horizon), **grants}
+    )
 
     # ── 1~2단계: 사용자가 정한 금액으로 ──
     by_inflow = rebalance_to_inflow(base, target_inflow, unit)
@@ -959,6 +1060,78 @@ def resolve_by_both(
         default=None,
     )
     return by_months, False, need
+
+
+def rebalance_to_months(
+    combos: Sequence[Combo],
+    profile: UserProfile,
+    target_months: int,
+    horizon: int = SIM_MONTHS,
+) -> list[Combo]:
+    """**목표 개월수 경로** — 조합별로 융자액을 다시 역산한다.
+
+    `default_loan_amounts()`는 융자 후보를 **하나씩** 역산한다. 조합은 그 뒤에
+    만들어지므로, 같은 조합에 보조금이나 채무조정이 함께 들어가도 융자 금액이
+    줄지 않는다.
+
+        후보 단위   "이 융자 단독으로 18개월 버티려면 2,884만원"
+        조합        "이 융자 + 새출발기금(원금 60% 감면)"
+                   -> 훨씬 적게 빌려도 되는데 2,884만원을 그대로 쓴다
+
+    과다 차입이 부채 축에 그대로 반영된다. 보조금은 200~600만원이라 영향이 작지만
+    채무조정은 원금 감면이 수천만원이라 크다.
+
+    이 함수가 조합마다 **융자 외 항목을 먼저 적용한 상태에서** 필요액을 다시 구한다.
+    금액 입력 경로의 `rebalance_to_inflow()`와 대칭이다.
+
+    Returns:
+        융자 금액이 조정된 새 Combo 목록. 융자가 없는 조합은 그대로 둔다.
+        보조금·채무조정만으로 목표를 채워 융자가 0원이 되면 그 조합은 버린다
+        (융자 없는 같은 조합이 이미 따로 존재한다).
+    """
+    result: list[Combo] = []
+    for combo in combos:
+        # 역산 대상은 **신규유입 융자**뿐이다. 대환전환은 갈아탈 금액이 기존 부채로
+        # 정해져 있고, 채무조정·비용감면도 제도가 금액을 정한다.
+        loans = [
+            it for it in combo.items
+            if it.candidate.is_loan and it.candidate.effect == "신규유입"
+        ]
+        if not loans:
+            result.append(combo)
+            continue
+        if len(loans) > 1:
+            raise NotImplementedError("융자 2개 이상의 금액 배분은 미구현")
+
+        loan = loans[0]
+        others = tuple(it for it in combo.items if it is not loan)
+        amount = snap_amount(
+            loan.candidate,
+            required_loan_amount(
+                profile, loan.candidate, target_months, horizon, base=others
+            ),
+        )
+        if amount <= 0:
+            continue  # 나머지만으로 목표를 채운다. 융자 없는 조합이 따로 있다
+
+        result.append(Combo(items=tuple(
+            Applied(it.candidate, amount) if it is loan else it
+            for it in combo.items
+        )))
+    return result
+
+
+def extra_candidates(pool: Sequence[Candidate]) -> list[Candidate]:
+    """조합에는 넣지 않지만 **LLM에 안내할** 후보들.
+
+    현금효과가 0이라 2축에 반영되지 않는 것들이다(사업정리 컨설팅, 법률자문,
+    재기사업화 등 `_순위제외`). 조합에 넣으면 좌표는 그대로인데 조합 수만
+    배로 늘어나므로 계산에서 빼되, **자격 필터는 이미 통과한 상태**이므로
+    국면과 자격에 맞는 것만 남아 있다.
+
+    LLM이 최종 3개를 고른 뒤 "이런 것도 함께 신청해 보세요"로 덧붙이게 한다.
+    """
+    return [c for c in pool if c.is_extra]
 
 
 def filter_by_goal(

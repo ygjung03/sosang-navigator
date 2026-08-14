@@ -322,6 +322,8 @@ def loan_schedule(
         repay_months: 상환 개월. 거치가 끝난 뒤 원금을 나눠 갚는 기간.
         method:       "균등분할"  원금균등, 매월 (가정 A1). 소진공 직접대출·서울시.
                       "만기일시"  거치 종료 시점에 원금 전액.
+                      "분기균등"  원금 전액을 3개월마다 원금균등분할. 서울시 분기 선택.
+                                 만기 일시상환분이 없다는 점이 "대리분기"와 다르다.
                       "대리분기"  소진공 대리대출. 원금의 70%를 3개월마다
                                  원금균등분할하고 30%는 상환기간 만료 시 일시상환.
                                  (소진공 FAQ 65번)
@@ -376,6 +378,26 @@ def loan_schedule(
             #    만기일시의 24개월차는 '갚는 달', 균등분할의 24개월차는 '마지막 거치 달'.
             payment_during[month - 1] = interest
             debt_at[month] = opening_debt
+
+        elif method == "분기균등":
+            # 서울시 직접융자금의 분기 선택 (서울신보 FAQ: "매월 또는 3개월 단위").
+            # 대리분기와 달리 만기 일시상환분이 없다. 원금 전액을 3개월마다 나눈다.
+            # 원금 총액은 매월 방식과 같지만, 상환 달에 3개월치가 한 번에 나가
+            # 그 달 잔고가 깊게 파인다.
+            elapsed = month - grace_end_at  # 거치 종료 후 몇 번째 달인가 (1-based)
+            repay_end_at = grace_end_at + repay_months
+
+            if month >= repay_end_at:
+                payment_during[month - 1] = interest + opening_debt
+                debt_at[month] = 0.0
+            elif elapsed % AGENCY_PAYMENT_CYCLE == 0:
+                installments = max(1, repay_months // AGENCY_PAYMENT_CYCLE)
+                principal_part = min(principal / installments, opening_debt)
+                payment_during[month - 1] = interest + principal_part
+                debt_at[month] = opening_debt - principal_part
+            else:
+                payment_during[month - 1] = interest
+                debt_at[month] = opening_debt
 
         elif method == "대리분기":
             # 소진공 대리대출 (FAQ 65번).
@@ -590,6 +612,20 @@ class SimResult:
     원금을 미뤄둔 것일 수도 있다.
     """
 
+    monthly_payment_avg: float = 0.0
+    """유량 — 생존 기간의 **월평균 상환액**. `total_payment / 생존개월수`.
+
+    축이 아니라 정보다. "매달 얼마씩 나가는가"는 사용자가 체감하는 부담이고,
+    `total_payment`(총액)나 `debt_at_exit`(잔액)이 답하지 못하는 질문이다.
+
+    **축으로 쓰지 않는 이유**: 채무조정의 원금 감면이 이 값에 나타나지 않는다.
+    감면은 "앞으로 낼 돈"을 줄이는데, 파산하면 앞으로가 없다.
+    (실측: 부채가 5,117만 -> 2,047만으로 줄어든 조합과 그렇지 않은 조합의
+     월평균 상환액이 둘 다 95만원으로 동일했다)
+    또한 융자 후보가 없는 사용자에게는 모든 조합에서 같은 값이 되어
+    부채 축이 상수가 된다(12개 케이스 중 1개).
+    """
+
     survives_full_term: bool = False
     """36개월 내내 잔고가 0 아래로 안 내려갔는지."""
 
@@ -651,6 +687,22 @@ def simulate(
     remaining_existing = float(profile.existing_debt)
 
     # ══════════ 1단계: 현금효과별로 배열 채우기 ══════════
+    #
+    # **적용 시점 순으로 처리한다.** 여러 항목이 같은 기존 부채를 대상으로 하면
+    # (대환전환·이자조정·부채감면·상환연장) 먼저 처리된 쪽이 remaining_existing을
+    # 소진해 뒤쪽 효과가 줄어든다. 순서가 결과를 바꾸므로 기준이 필요하다.
+    #
+    #     대환 -> 부채감면   생존 10개월 · 종료부채 5,363만 (대환이 5,000만을 가져감)
+    #     부채감면 -> 대환   생존  7개월 · 종료부채 2,179만 (감면이 전액에 적용)
+    #
+    # 현실에서는 시점이 순서를 정한다. 대환대출을 받고 나서 몇 달 뒤에 채무조정이
+    # 확정되는 것이지 그 반대가 아니다. 그래서 `적용시점_개월` 오름차순으로 정렬한다.
+    #     대환전환 t=0 · 상환연장 t=1 · 이자조정 t=3 · 부채감면 t=6
+    # 시점이 같으면 입력 순서를 유지한다(파이썬 sort는 안정 정렬).
+    applied = sorted(
+        applied, key=lambda it: int(it.candidate.get("적용시점_개월", 0) or 0)
+    )
+
     for item in applied:
         cand = item.candidate  # 정책 후보
         effect = cand.effect  # 현금효과 6종 중 하나
@@ -904,10 +956,15 @@ def simulate(
                 a + b for a, b in zip(new_payment_during, sched_payment)
             ]
             new_debt_at = [a + b for a, b in zip(new_debt_at, sched_debt)]
+
+            # 적용 시점 이전은 0이므로 sched_payment[0]을 읽으면 "0원"으로 오해된다.
+            # 실제로 낮아진 금액은 적용 시점 이후 첫 값이다.
+            after_payment = sched_payment[min(start_at, horizon - 1)]
             notes.append(
                 f"상환연장 {cand} 대상 {target:,.0f}원 · "
-                f"월 상환 {target_payment:,.0f} -> {sched_payment[0]:,.0f}원 "
-                f"({remaining_term}개월 -> {new_term}개월, 금리 +{surcharge:.1%})"
+                f"월 상환 {target_payment:,.0f} -> {after_payment:,.0f}원 "
+                f"({remaining_term}개월 -> {new_term}개월, 금리 +{surcharge:.1%}"
+                + (f", {start_at}개월 뒤 적용)" if start_at else ")")
             )
 
         # ── 5) 비용감면 — 유입이 아니라 그 달의 고정비가 줄어든다 (가정 C1) ──
@@ -1000,6 +1057,7 @@ def simulate(
         balloon_after_horizon=balloon_total,
         balloon_due_at=balloon_due_at,
         total_payment=sum(payment_during),
+        monthly_payment_avg=sum(payment_during) / max(1, survival_months),
         survives_full_term=survives,
         forgiven=forgiven,
         notes=notes,
