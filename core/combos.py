@@ -127,6 +127,19 @@ class UserContext:
     모르면 금액을 계산할 수 없으므로 후보에서 제외한다.
     """
 
+    business_years: float | None = None
+    """업력(년). 사업을 시작한 뒤 지난 햇수.
+
+    긴급경영안정자금의 **융자방식 판정**에만 쓰인다. 연매출 1억 400만원 미만
+    **AND** 업력 7년 미만이면 직접대출(매월 원금균등), 아니면 대리대출
+    (70%를 3개월마다 + 30%를 만기에 일시상환)이다. 현금흐름이 달라진다.
+
+    **연매출 조건이 걸릴 때만 묻는다.** 연매출이 1억 400만원 이상이면 업력과
+    무관하게 대리대출이므로 물을 이유가 없다(app.py 조건부 질문).
+    모르면 직접대출 후보를 제외하고 대리대출로 보낸다 — 분기 상환이 매월보다
+    잔고를 깊게 파므로 보수적이다.
+    """
+
 
     revenue_drop_rate: float = 0.0
     """최근 매출 감소율(소수). 0.15 = 15% 감소. 매출 요건 판정에 쓴다."""
@@ -290,6 +303,27 @@ def _passes_debt_requirement(
 
     if cand.effect == "상환연장" and profile.policy_loan_balance <= 0:
         return False
+
+    # 채무 총액 상한 (새출발기금). 총채무 15억원을 넘으면 지원 대상이 아니다.
+    #   FAQ Q26 — "지원 한도(총채무 15억원, 담보 10억원, 무담보 5억원) 이상 대출을
+    #   보유하였거나 ... 지원 대상에 해당하지 않으며"
+    # ⚠ 담보 10억 / 무담보 5억은 판정하지 않는다. 담보·무담보를 나눠 받지 않으므로
+    #   구분할 수 없다. 총액만 걸어도 명백한 오추천은 막힌다.
+    ceiling = cand.policy_raw.get("자격요건", {}).get("대상채무_총액상한")
+    if ceiling is not None and profile.existing_debt > int(ceiling):
+        return False
+
+    # 긴급경영안정자금의 융자방식 판정.
+    # 연매출 1억 400만원 미만 AND 업력 7년 미만이면 직접대출, 아니면 대리대출이다.
+    # 후보를 둘로 나눠 두었으므로 자격 필터가 하나만 통과시킨다.
+    rev_cap = cand.get("자격_연매출_상한")
+    if rev_cap is not None:
+        if ctx.annual_revenue is None or ctx.annual_revenue >= int(rev_cap):
+            return False  # 연매출이 기준 이상 -> 대리대출 후보로 간다
+        yr_cap = cand.get("자격_업력_상한_년")
+        if yr_cap is not None:
+            if ctx.business_years is None or ctx.business_years >= float(yr_cap):
+                return False  # 업력을 모르거나 기준 이상 -> 대리대출로 (보수적)
 
     # 세금 체납 중이면 소진공 융자를 받을 수 없다
     # (공고 제2026-478호 4쪽 융자제한 소상공인 ① "세금을 체납중인 소상공인").

@@ -911,7 +911,12 @@ def simulate(
             share = target / remaining_existing  # 기존 부채 중 유예 대상 비율
             target_payment = profile.existing_debt_payment * share  # 대상분 월 상환액
             remaining_term = math.ceil(target / target_payment)  # 남은 상환 개월(역산)
-            extension = int(cand.get("연장_개월_최대", 0))  # 연장 개월
+            # 계산은 기본값을 쓴다. `연장_개월_최대`는 화면 슬라이더의 상한이고,
+            # 사용자가 1개월 단위로 줄일 수 있다(`연장_선택단위_개월`).
+            # 지금은 둘 다 84라 결과가 같지만, 기본값을 낮추면 계산이 따라와야 한다.
+            extension = int(
+                cand.get("연장_개월_기본값") or cand.get("연장_개월_최대", 0) or 0
+            )
             new_term = remaining_term + extension  # 연장 후 총 상환 개월
 
             # 연장하면 금리가 가산된다 (공고: 약정금리 + 0.2%p, 단기연체 시 +0.4%p)

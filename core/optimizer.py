@@ -366,6 +366,13 @@ def to_prompt_text(
                 f"{member.result.total_payment / MAN:,.0f}만원 "
                 f"(월평균 {member.result.monthly_payment_avg / MAN:,.0f}만원)"
             )
+            # 계산 전제가 실제와 다를 수 있는 후보는 그 사실을 함께 넘긴다.
+            # (예: 새출발기금 부실차주의 감면 대상 — 순부채·신용대출만 조건 미반영)
+            for it in member.combo.items:
+                caveat = it.candidate.get("_계산전제")
+                if caveat:
+                    lines.append(f"      ※ {caveat}")
+
             # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
             if member.result.balloon_after_horizon > 0:
                 lines.append(
