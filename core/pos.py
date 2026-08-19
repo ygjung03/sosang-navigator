@@ -54,6 +54,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -118,6 +119,13 @@ ENCODINGS = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
 # 3개월은 분기와 맞고 계절 변동을 어느 정도 상쇄한다.
 TREND_WINDOW_MONTHS = 3
 
+# 매출 감소율을 재는 비교 단위(개월). 정책마다 허용 단위가 달라 넷을 다 만든다.
+#   소진공 긴급경영안정자금  "직전 매출과 직전전 매출(연도/반기/분기/월별) 비교"
+#   서울시 긴급자영업자금    "직전 분기·반기 대비"
+#   국면 판정              분기·반기만 (월은 계절성으로 튄다)
+# 각 단위는 "직전 N개월 합계 vs 그 전 N개월 합계"로 계산하므로 2N개월이 필요하다.
+COMPARE_WINDOWS: dict[str, int] = {"월": 1, "분기": 3, "반기": 6, "연도": 12}
+
 # 롤링 연매출을 계산하는 기간(개월). 정책 자격이 '연매출' 기준이라 12로 고정.
 ANNUAL_WINDOW_MONTHS = 12
 
@@ -157,6 +165,23 @@ class PosSummary:
     revenue_change_yoy: float | None
     """전년 동기 대비 증감률. 12개월 미만이면 None."""
 
+    revenue_change_by_window: dict[str, float | None]
+    """비교 단위별 매출 증감률. -0.15 = 15% 감소.
+
+    키는 '월'·'분기'·'반기'·'연도'. 각각 "직전 N개월 합계 vs 그 전 N개월 합계"다.
+    데이터가 2N개월에 못 미치면 None.
+
+    **정책마다 허용하는 비교 단위가 다르기 때문에 넷을 다 만든다.**
+        소진공 긴급경영안정자금  "직전 매출과 직전전 매출(연도/반기/분기/월별) 비교"
+                              — 신청자가 유리한 단위를 고를 수 있다
+        서울시 긴급자영업자금    "직전 분기·반기 대비 20% 이상 급감"
+                              — 분기 또는 반기 중 하나만 충족하면 된다(B-21)
+        국면 판정              분기·반기만 쓴다. 월 단위는 계절성으로 30%씩 튀어
+                              계절 사업체를 전부 위험하다고 판정하게 된다
+
+    `drop_rate(windows)` 로 원하는 단위 중 최대 감소율을 꺼낸다.
+    """
+
     declining_months: int
     """현재 몇 개월째 연속 하락 중인지. 이번 달부터 거슬러 센다."""
 
@@ -184,6 +209,27 @@ class PosSummary:
     """정확도에 영향을 주는 사항. 화면에 그대로 노출한다."""
 
     # ── 파생 ──
+    def drop_rate(self, windows: Sequence[str]) -> float:
+        """주어진 비교 단위 중 **가장 큰 감소율**. 0.22면 22% 감소.
+
+        제도가 "여러 단위 중 하나만 충족하면 된다"고 하므로 최대를 쓴다.
+        매출이 늘었으면 음수가 나온다.
+
+        Args:
+            windows: '월'·'분기'·'반기'·'연도' 중 쓸 것들.
+                자격 판정은 정책의 `매출_비교단위`를, 국면 판정은
+                ('분기', '반기')를 넘긴다.
+
+        Returns:
+            해당 단위가 하나도 계산되지 않았으면 0.0(감소 없음으로 본다).
+        """
+        rates = [
+            -change
+            for name in windows
+            if (change := self.revenue_change_by_window.get(name)) is not None
+        ]
+        return max(rates) if rates else 0.0
+
     @property
     def count_contribution(self) -> float | None:
         """매출 변화 중 '건수 변화'가 차지하는 비중(0~1). 판정이 아니라 참고 수치.
@@ -422,6 +468,17 @@ def summarize(pos: pd.DataFrame) -> PosSummary:
 
     declining_months = _count_declining_months(trend_base)
 
+    # ── 비교 단위별 증감률 ──
+    # "직전 N개월 합계 vs 그 전 N개월 합계". 2N개월이 있어야 계산된다.
+    revenue_change_by_window: dict[str, float | None] = {}
+    for name, months in COMPARE_WINDOWS.items():
+        if len(trend_base) >= 2 * months:
+            recent_sum = trend_base.iloc[-months:].sum()
+            before_sum = trend_base.iloc[-2 * months : -months].sum()
+            revenue_change_by_window[name] = _pct_change(recent_sum, before_sum)
+        else:
+            revenue_change_by_window[name] = None
+
     # ── 전년 동기 대비 ──
     revenue_change_yoy: float | None = None
     if len(trend_base) >= ANNUAL_WINDOW_MONTHS + TREND_WINDOW_MONTHS:
@@ -464,6 +521,7 @@ def summarize(pos: pd.DataFrame) -> PosSummary:
         recent_3m_avg=recent_3m_avg,
         revenue_change_3m=revenue_change_3m,
         revenue_change_yoy=revenue_change_yoy,
+        revenue_change_by_window=revenue_change_by_window,
         declining_months=declining_months,
         order_count_change_3m=order_count_change,
         avg_order_value_change_3m=aov_change,

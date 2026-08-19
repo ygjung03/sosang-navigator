@@ -108,12 +108,46 @@ class PolicyDB:
 
     @property
     def loan_rules(self) -> dict[str, Any]:
+        """재원과 무관한 융자 공통 규칙.
+
+        한도·금리·신청단위처럼 재원마다 다른 값은 여기 없다.
+        `source_rules()` 를 쓸 것.
+        """
         return self.raw["공통규칙_융자"]
+
+    def source_rules(self, source: str) -> dict[str, Any]:
+        """재원별 융자 규칙 (`재원규칙_융자[재원]`).
+
+        소진공은 기준금리 + 가산 구조이고 서울시는 자금별 고정금리다.
+        신청 금액 단위도 100만원 / 만원으로 다르다.
+        해당 재원이 없으면 빈 dict를 돌려준다.
+        """
+        return self.raw.get("재원규칙_융자", {}).get(source, {})
+
+    def loan_value(self, cand: "Candidate", key: str, default: Any = None) -> Any:
+        """융자 관련 값을 **우선순위대로** 찾는다.
+
+            후보 레벨 -> 정책 레벨 -> 재원규칙_융자[재원] -> 공통규칙_융자
+
+        같은 항목이 여러 층에 있을 수 있어 순서를 고정한다.
+        예를 들어 `신청금액_단위`는 후보마다 있지만(소진공 100만 / 서울시 만원),
+        후보에 없으면 재원 규칙이 답한다.
+        """
+        value = cand.get(key)
+        if value is not None:
+            return value
+        value = self.source_rules(cand.source).get(key)
+        if value is not None:
+            return value
+        return self.loan_rules.get(key, default)
 
     @property
     def base_rate(self) -> float:
-        """정책자금 기준금리 (분기 변동)."""
-        return self.raw["공통규칙_융자"]["기준금리"]
+        """소진공 정책자금 기준금리 (분기 변동).
+
+        서울시는 기준금리 개념이 없고 자금별 고정금리를 쓴다.
+        """
+        return self.raw["재원규칙_융자"]["소진공"]["기준금리"]
 
     @property
     def deadline_filter_enabled(self) -> bool:

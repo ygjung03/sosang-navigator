@@ -36,6 +36,7 @@ TODO(adr): 아래 원칙들의 채택 근거(왜 조기 종료를 버렸는지 �
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from itertools import combinations
 from typing import Iterable, Sequence
 
@@ -127,35 +128,75 @@ class UserContext:
     모르면 금액을 계산할 수 없으므로 후보에서 제외한다.
     """
 
-    business_years: float | None = None
-    """업력(년). 사업을 시작한 뒤 지난 햇수.
+    business_started: date | None = None
+    """사업 개시 연월. 두 가지 판정에 쓰인다.
 
-    긴급경영안정자금의 **융자방식 판정**에만 쓰인다. 연매출 1억 400만원 미만
-    **AND** 업력 7년 미만이면 직접대출(매월 원금균등), 아니면 대리대출
-    (70%를 3개월마다 + 30%를 만기에 일시상환)이다. 현금흐름이 달라진다.
+    ① 업력 — 긴급경영안정자금의 융자방식을 가른다.
+       연매출 1억 400만원 미만 **AND 업력 7년 미만**이면 직접대출(매월 원금균등),
+       아니면 대리대출(70%를 3개월마다 + 30%를 만기 일시상환)이다.
+       현금흐름이 달라진다.
 
-    **연매출 조건이 걸릴 때만 묻는다.** 연매출이 1억 400만원 이상이면 업력과
-    무관하게 대리대출이므로 물을 이유가 없다(app.py 조건부 질문).
-    모르면 직접대출 후보를 제외하고 대리대출로 보낸다 — 분기 상환이 매월보다
-    잔고를 깊게 파므로 보수적이다.
+    ② 사업 영위 기간 — 새출발기금의 신청 자격이다.
+       신용회복지원협약 제39조 ①3호가 **"2020년 4월 1일부터 2025년 6월 30일까지
+       기간 중 사업한 사실이 있는 자"**를 요구한다.
+       2025년 7월 이후 창업자는 자격이 없다.
+
+    **업력(년 수)이 아니라 개시 시점을 받는 이유**: ②가 "몇 년 됐나"가 아니라
+    "그 달력 구간에 사업했나"라서 업력만으로는 풀 수 없다. 개시 시점을 알면 둘 다 된다.
+    사용자에게도 "7년 됐나 8년 됐나"보다 "2019년 3월에 시작했다"가 답하기 쉽다.
+
+    **해당 정책이 후보에 오를 때만 묻는다**(app.py 조건부 질문).
+    연매출이 1억 400만원 이상이면 업력과 무관하게 대리대출이고,
+    국면이 회복불가가 아니면 새출발기금이 후보에 없다.
+    **모르면 두 조건 모두 후보에서 제외한다.** 면적을 모르면 점포철거비를 빼고
+    업력을 모르면 직접대출을 빼는 것과 같은 원칙이다 — 판정에 필요한 값이 없으면
+    자격을 단정하지 않는다.
+    대가: 회복불가 국면에서 이 값을 모르면 새출발기금이 사라져 채무조정 후보가
+    거의 없어진다. 그래서 조건부 질문에서 반드시 물어야 한다.
     """
 
+    @property
+    def business_years(self) -> float | None:
+        """업력(년). `business_started` 로부터 계산한다."""
+        if self.business_started is None:
+            return None
+        today = date.today()
+        return (today - self.business_started).days / 365.25
+
+    def operated_between(self, start: date, end: date) -> bool | None:
+        """`start`~`end` 구간에 사업한 사실이 있는지.
+
+        개시 시점이 구간 종료일보다 앞이면 그 구간에 사업한 것이다.
+        폐업 시점은 받지 않으므로 "구간 안에 폐업했다"는 경우도 True가 된다 —
+        새출발기금이 "2020년 4월 이후 폐업자 포함"이므로 문제되지 않는다.
+
+        Returns:
+            None이면 개시 시점을 모른다는 뜻. 호출부가 처리를 정한다.
+        """
+        if self.business_started is None:
+            return None
+        return self.business_started <= end
+
+
+    revenue_drop_by_window: dict[str, float] = field(default_factory=dict)
+    """비교 단위별 매출 감소율. 0.15 = 15% 감소.
+    `PosSummary.revenue_change_by_window` 를 부호만 뒤집어 넣는다(감소를 양수로).
+
+    **정책마다 허용하는 비교 단위가 다르기 때문에 하나로 뭉치지 않는다.**
+        소진공 긴급경영안정자금  월·분기·반기·연도 — 신청자가 유리한 단위를 고른다
+        서울시 긴급자영업자금    분기·반기만
+    자격 판정은 `자격요건.매출_비교단위`에 적힌 단위 중 최대를 쓴다.
+    """
 
     revenue_drop_rate: float = 0.0
-    """매출 감소율(소수). 0.15 = 15% 감소. 매출 요건 판정과 국면 판정에 쓴다.
+    """**국면 판정용** 매출 감소율. 분기·반기 중 큰 값을 넣는다.
 
-    **분기 비교와 반기 비교 중 큰 값**을 넣는다.
-        분기 = 직전 3개월 합계 vs 그 전 3개월 합계
-        반기 = 직전 6개월 합계 vs 그 전 6개월 합계
+    자격 판정과 다른 값을 쓰는 이유: 자격은 '제도가 허용하는 최대'이지만
+    국면은 '실제 추세'다. 월 단위는 계절성으로 크게 튀어(연말 특수가 끝난 것뿐인데
+    30% 감소로 잡힌다) 계절 사업체를 전부 위험하다고 판정하게 된다.
+    연도 단위는 POS 24개월이 있어야 계산된다.
 
-    제도가 그렇게 정하기 때문이다. 서울시 긴급자영업자금은 "신청일 기준
-    직전 분기·반기 대비 매출액이 이전 분기·반기 대비 20% 이상 급감"으로,
-    **둘 중 하나만 충족하면** 자격이 생긴다(B-21).
-    소진공 긴급경영안정자금도 "직전 매출과 직전전 매출(연도/반기/분기/월별)
-    비교"로 단위를 정하지 않아, 신청자에게 유리한 단위를 고를 수 있다.
-
-    POS 12개월이면 분기·반기 둘 다 계산할 수 있다. 연 단위나 전년 동기 대비는
-    24개월이 있어야 하므로 쓰지 않는다.
+    `revenue_drop_by_window` 가 비어 있으면 자격 판정도 이 값으로 대신한다.
     """
 
     revenue_growth_rate: float = 0.0
@@ -222,6 +263,20 @@ def _passes_revenue_requirement(cand: Candidate, ctx: UserContext) -> bool:
         return True  # 기준율을 모르면 판정하지 않고 통과
 
     if direction == "감소율_이상":
+        # 정책이 허용하는 비교 단위 중 **가장 큰 감소율**로 판정한다.
+        # 제도가 "여러 단위 중 하나만 충족하면 된다"고 하기 때문이다.
+        #   소진공 긴급경영안정자금  월·분기·반기·연도
+        #   서울시 긴급자영업자금    분기·반기
+        # 단위 목록이나 계산값이 없으면 국면용 값(분기·반기 중 최대)으로 대신한다.
+        windows = cand.raw.get("매출_비교단위") or cand.eligibility.get("매출_비교단위")
+        if windows and ctx.revenue_drop_by_window:
+            rates = [
+                ctx.revenue_drop_by_window[w]
+                for w in windows
+                if w in ctx.revenue_drop_by_window
+            ]
+            if rates:
+                return max(rates) >= threshold
         return ctx.revenue_drop_rate >= threshold
     if direction == "증가율_이상":
         return ctx.revenue_growth_rate >= threshold
@@ -326,6 +381,32 @@ def _passes_debt_requirement(
     ceiling = cand.policy_raw.get("자격요건", {}).get("대상채무_총액상한")
     if ceiling is not None and profile.existing_debt > int(ceiling):
         return False
+
+    # 개업일 상한 (경영안정 바우처). 2025년 연매출로 자격을 따지는 제도라
+    # 그 해에 매출이 있어야 한다 — "사업자등록증상 개업연월일 기준,
+    # 2025.12.31 이전 개업만 대상".
+    limit = cand.policy_raw.get("자격요건", {}).get("개업일_상한")
+    if limit:
+        if ctx.business_started is None:
+            return False  # 판정에 필요한 값이 없으면 자격을 단정하지 않는다
+        if ctx.business_started > date.fromisoformat(limit):
+            return False
+
+    # 사업 영위 기간 (새출발기금). 협약 제39조 ①3호 —
+    # "2020년 4월 1일부터 2025년 6월 30일까지 기간 중 사업한 사실이 있는 자".
+    # 개시 시점을 **모르면 제외한다.** 면적을 모르면 점포철거비를 빼고,
+    # 업력을 모르면 직접대출을 빼는 것과 같은 원칙이다 —
+    # 판정에 필요한 값이 없으면 자격을 단정하지 않는다.
+    # 조건부 질문(app.py)에서 회복불가 국면이면 이 값을 묻게 되므로
+    # 실제로 모르는 경우는 사용자가 답하지 않은 때뿐이다.
+    span = cand.policy_raw.get("자격요건", {})
+    if span.get("사업영위_종료"):
+        operated = ctx.operated_between(
+            date.fromisoformat(span["사업영위_시작"]),
+            date.fromisoformat(span["사업영위_종료"]),
+        )
+        if not operated:
+            return False
 
     # 긴급경영안정자금의 융자방식 판정.
     # 연매출 1억 400만원 미만 AND 업력 7년 미만이면 직접대출, 아니면 대리대출이다.
@@ -570,12 +651,23 @@ def _cross_source_allowed(db: PolicyDB, method: str) -> bool:
     return bool(db.combo_rules.get(method, {}).get("재원간_중복허용", False))
 
 
-def _restructure_loan_exclusive(db: PolicyDB) -> tuple[bool, frozenset[str]]:
-    """채무조정 이행 중 신규 융자가 배타인지, 그리고 **어느 재원에** 적용되는지.
+def _restructure_loan_exclusive(
+    db: PolicyDB,
+) -> tuple[bool, frozenset[str], frozenset[str]]:
+    """채무조정 이행 중 신규 융자가 배타인지, **어느 재원**과 **어느 현금효과**에 적용되는지.
 
     Returns:
-        (배타 여부, 적용 재원 집합)
+        (배타 여부, 적용 재원 집합, 배타 대상 현금효과 집합)
         적용 재원이 비어 있으면 모든 재원에 적용한다.
+        현금효과 집합이 비어 있으면 모든 채무조정에 적용한다.
+
+    **현금효과를 함께 돌려주는 이유**: `상환연장`은 배타 대상이 아니다.
+      ① 소진공 「2026 상환연장 신청 안내」 결격사유에 "공적 채무조정 신청"이
+         별도 항목으로 있다 — 상환연장 자신은 공적 채무조정이 아니다.
+      ② 재도전특별자금 자격이 "상환연장제도를 지원받고 3회차 이상 상환 중"이다
+         — 배타가 아니라 연결 관계다.
+      ③ 배타의 근거인 FAQ가 "채무조정으로 연체 정보가 해제되었더라도"라고 하는데
+         이는 공공정보 등재를 전제한다. 상환연장은 등재 대상이 아니다.
 
     "확인필요" 문자열이면 아직 모르는 상태 -> 배타로 보지 않고 조합을 만든다.
 
@@ -588,7 +680,8 @@ def _restructure_loan_exclusive(db: PolicyDB) -> tuple[bool, frozenset[str]]:
     rules = db.combo_rules.get("교차제약", {})
     enabled = rules.get("채무조정_융자_배타") is True
     scope = frozenset(rules.get("_적용범위") or ())
-    return enabled, scope
+    effects = frozenset(rules.get("_배타대상_현금효과") or ())
+    return enabled, scope, effects
 
 
 def _pick_by_method(
@@ -713,7 +806,7 @@ def build_combos(
         pool, "보조금", limits["보조금"], _cross_source_allowed(db, "보조금")
     )
 
-    exclusive, exclusive_sources = _restructure_loan_exclusive(db)
+    exclusive, exclusive_sources, exclusive_effects = _restructure_loan_exclusive(db)
 
     combos: list[Combo] = []
     for loans in loan_options:
@@ -723,9 +816,17 @@ def build_combos(
         )
         for restructures in restructure_options:
             # 채무조정 ↔ 신규 융자가 배타면 둘이 함께 있는 조합은 만들지 않는다.
-            # 단 배타는 `_적용범위`에 적힌 재원에만 걸린다(현재 소진공). 서울시 융자는
-            # 재기지원자금 지원대상에 채무조정 이력자가 명시되어 있어 배제하지 않는다.
-            if blocked_loan and restructures:
+            # 배타는 두 축으로 좁혀진다.
+            #   재원   `_적용범위`에 적힌 재원만(현재 소진공). 서울시 융자는
+            #          재기지원자금 지원대상에 채무조정 이력자가 명시되어 있어 제외
+            #   현금효과 `_배타대상_현금효과`에 적힌 것만(부채감면·이자조정).
+            #          상환연장은 공공정보 등재 대상이 아니고, 재도전특별자금이
+            #          오히려 상환연장 이력자를 자격으로 요구한다
+            blocked_restructure = restructures and any(
+                not exclusive_effects or c.effect in exclusive_effects
+                for c in restructures
+            )
+            if blocked_loan and blocked_restructure:
                 continue
             for grants in grant_options:
                 picked = loans + restructures + grants

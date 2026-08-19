@@ -299,6 +299,79 @@ def select(
 # ══════════════════════════════════════════════════════════
 
 
+def apply_links(items: Sequence[Any]) -> list[str]:
+    """신청처 — 정책별 신청 링크와 문의처.
+
+    **LLM 프롬프트에는 넣지 않는다.** 링크는 순위를 매기는 데 도움이 되지 않고,
+    후보 그룹 5~8개에 모두 붙으면 프롬프트만 길어진다.
+    LLM이 최종 3개를 고른 뒤 `app.py`가 그 조합에 대해 호출해 화면에 표시한다.
+
+    같은 정책의 후보가 여럿이면 한 번만 나온다.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        cand = item.candidate
+        if cand.policy_id in seen:
+            continue
+        seen.add(cand.policy_id)
+        link = cand.policy_raw.get("신청링크")
+        contact = cand.policy_raw.get("문의처")
+        if not (link or contact):
+            continue
+        parts = [cand.policy_name]
+        if link:
+            parts.append(link)
+        if contact:
+            parts.append(f"문의 {contact}")
+        lines.append(" · ".join(parts))
+    return lines
+
+
+def _caveats(items: Sequence[Any]) -> list[str]:
+    """조합에 붙일 주의 문구. 성격이 다른 세 종류를 모은다.
+
+    같은 문구가 여러 후보에 붙어 있을 수 있으므로 중복을 제거한다
+    (예: 서울시 융자 여러 후보가 같은 변동금리 안내를 갖는다).
+
+    ① `안내문구` — 제도가 정한 사실
+        "실제 대출 금액은 은행 심사 결과에 따라 달라질 수 있습니다."
+        우리 시뮬레이션은 "역산한 금액이 그대로 실행된다"를 전제하는데,
+        소진공 통화(2026-08-13)에서 "한도 금액으로 신청하면 은행에서
+        알아서 조절한다"는 답을 받았다. 전제가 깨질 수 있음을 알려야 한다.
+
+    ② 변동금리 — 우리 계산의 한계
+        `금리_고정여부: false`인 후보는 실제로 금리가 바뀐다.
+        소진공 정책자금은 기준금리가 분기마다 고시된다(1·4·7·10월 10일).
+        변동을 예측할 수 없어 현재 금리로 36개월을 고정 계산한다.
+
+    ③ `_계산전제` — 후보별 사정
+        예: 새출발기금 부실차주의 감면 대상(순부채·신용대출만) 미반영.
+    """
+    notes: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str) -> None:
+        if text and text not in seen:
+            seen.add(text)
+            notes.append(text)
+
+    for item in items:
+        cand = item.candidate
+        for line in cand.get("안내문구") or ():
+            add(line)
+        if cand.is_loan and cand.get("금리_고정여부") is False:
+            rate = cand.get("금리_연")
+            add(
+                f"변동금리입니다. 현재 금리 {rate:.2%}로 계산했으나 "
+                f"기준금리가 분기마다 바뀌어 실제 상환액이 달라질 수 있습니다."
+                if rate is not None
+                else "변동금리입니다. 현재 금리로 계산했으나 실제 상환액이 달라질 수 있습니다."
+            )
+        add(cand.get("_계산전제"))
+    return notes
+
+
 def to_prompt_text(
     groups: Sequence[CandidateGroup],
     reports: dict[str, TrapReport],
@@ -366,12 +439,15 @@ def to_prompt_text(
                 f"{member.result.total_payment / MAN:,.0f}만원 "
                 f"(월평균 {member.result.monthly_payment_avg / MAN:,.0f}만원)"
             )
-            # 계산 전제가 실제와 다를 수 있는 후보는 그 사실을 함께 넘긴다.
-            # (예: 새출발기금 부실차주의 감면 대상 — 순부채·신용대출만 조건 미반영)
-            for it in member.combo.items:
-                caveat = it.candidate.get("_계산전제")
-                if caveat:
-                    lines.append(f"      ※ {caveat}")
+            # ── 주의 문구 ──
+            # 성격이 다른 셋을 각각 출력한다.
+            #   안내문구       제도가 정한 사실 (JSON 정책 레벨)
+            #   변동금리       우리가 현재 금리로 고정 계산한다는 한계
+            #   _계산전제      계산 전제가 실제와 다를 수 있는 후보의 사정
+            # 섞으면 "제도 얘기인지 우리 계산의 한계인지"를 LLM이 구분하지 못한다.
+            for note in _caveats(member.combo.items):
+                lines.append(f"      ※ {note}")
+
 
             # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
             if member.result.balloon_after_horizon > 0:

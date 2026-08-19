@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from core import loader
 from core.cashflow import UserProfile, trend_revenue
+from datetime import date
+
 from core.combos import (
     Combo,
     UserContext,
@@ -52,6 +54,7 @@ def snack_shop_context() -> UserContext:
         restart_status="안함",
         revenue_drop_rate=0.22,  # 전년 대비 22% 감소
         annual_revenue=800 * MAN * 12,  # 9,600만원 -> 바우처 자격 통과
+        business_started=date(2021, 1, 1),  # 바우처 개업일 상한(2025-12-31) 통과
     )
 
 
@@ -173,8 +176,11 @@ def test_closure_filter():
         "영업 중인데 점포철거비가 통과되면 안 됨"
     )
 
-    # 폐업 예정이면 통과해야 한다
+    # 폐업 예정이면 통과해야 한다.
+    # 점포철거비는 면적에 비례하므로(단가 20만원/평, 상한 600만원)
+    # store_area_pyeong 이 없으면 금액을 계산할 수 없어 후보에서 제외된다.
     ctx.is_closed = True
+    ctx.store_area_pyeong = 20
     pool_closed = eligible_candidates(db, profile, ctx)
     assert any("철거비" in str(c) for c in pool_closed), (
         "폐업 예정이면 철거비가 나와야 함"

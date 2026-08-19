@@ -1,5 +1,8 @@
 """국면 판정 검증용 케이스 데이터 — 수익성 계층을 고르게 채운다.
 
+케이스에 `started`(사업 개시일)를 넣으면 UserContext.business_started 로 전달된다.
+생략하면 None이라 업력·사업영위기간 판정이 보수적으로 처리된다.
+
 기존 12개는 전부 영업이익이 음수라 ICR·DSCR이 음수로만 나왔다.
 비율이 의미를 갖는 구간(흑자)을 채워 4개 계층이 모두 나타나게 한다.
 
@@ -11,6 +14,8 @@
 from __future__ import annotations
 
 from core.cashflow import SIM_MONTHS, UserProfile, simulate, trend_revenue
+from datetime import date
+
 from core.combos import UserContext
 
 MAN = 10_000
@@ -38,7 +43,7 @@ def context_of(c: dict) -> UserContext:
         region="서울",
         is_closed=c["closed"],
         store_area_pyeong=c.get("area"),
-        business_years=c.get("years"),
+        business_started=c.get("started"),
         revenue_drop_rate=c.get("drop", 0.15),
         annual_revenue=c["rev"] * MAN * 12,
     )
@@ -81,7 +86,8 @@ CASES: dict[str, dict] = {
         od=0, closed=False, trend=-0.02, drop=0.25, phase="개선여지"),
     "C2 고금리·연체": dict(
         rev=750, fix=490, cash=350, debt=7_000, pay=110, rate=0.15,
-        od=35, closed=False, trend=-0.025, drop=0.3, phase="개선여지"),
+        od=35, closed=False, trend=-0.025, drop=0.3, phase="개선여지",
+        started=date(2022, 4, 1)),
     "C3 이자부담·경계": dict(
         rev=950, fix=580, cash=700, debt=6_500, pay=130, rate=0.115,
         od=0, closed=False, trend=-0.012, drop=0.15, phase="일시적자금난"),
@@ -96,19 +102,24 @@ CASES: dict[str, dict] = {
     # 매출 35% 급락 · 월 174만원 적자 · 버퍼 1개월 · 연체 45일.
     "D2 적자·연체": dict(
         rev=700, fix=650, cash=400, debt=5_000, pay=100, rate=0.09,
-        od=45, closed=False, trend=-0.03, drop=0.35, phase="회복불가"),
+        od=45, closed=False, trend=-0.03, drop=0.35, phase="회복불가",
+        started=date(2021, 3, 1)),
     "D3 적자·장기연체": dict(
         rev=700, fix=700, cash=200, debt=6_000, pay=110, rate=0.12,
-        od=120, closed=False, trend=-0.03, drop=0.45, phase="회복불가"),
+        od=120, closed=False, trend=-0.03, drop=0.45, phase="회복불가",
+        started=date(2020, 6, 1)),
     "D4 급락·고부채": dict(
         rev=600, fix=650, cash=300, debt=8_000, pay=150, rate=0.12,
-        od=100, closed=False, trend=-0.04, drop=0.5, phase="회복불가"),
+        od=100, closed=False, trend=-0.04, drop=0.5, phase="회복불가",
+        started=date(2019, 11, 1)),
     "D5 폐업·단기연체": dict(
         rev=400, fix=350, cash=300, debt=4_000, pay=80, rate=0.12,
-        od=5, closed=True, area=20, trend=-0.05, drop=0.55, phase="회복불가"),
+        od=5, closed=True, area=20, trend=-0.05, drop=0.55, phase="회복불가",
+        started=date(2022, 2, 1)),
     "D6 폐업·장기연체": dict(
         rev=350, fix=300, cash=400, debt=5_500, pay=95, rate=0.12,
-        od=150, closed=True, area=35, trend=-0.045, drop=0.6, phase="회복불가"),
+        od=150, closed=True, area=35, trend=-0.045, drop=0.6, phase="회복불가",
+        started=date(2018, 8, 1)),
     # ══ 경계 검증용 (2026-08-15 추가) ══
     #    각 지표의 경계값 바로 위/아래를 짝으로 만들어 판정이 갈리는지 본다.
 
@@ -152,10 +163,12 @@ CASES: dict[str, dict] = {
     # 연체 90일 경계
     "G3 연체 89일": dict(
         rev=750, fix=520, cash=500, debt=5_500, pay=100, rate=0.1,
-        od=89, closed=False, trend=-0.025, drop=0.28, phase="회복불가"),
+        od=89, closed=False, trend=-0.025, drop=0.28, phase="회복불가",
+        started=date(2020, 10, 1)),
     "G4 연체 91일": dict(
         rev=750, fix=520, cash=500, debt=5_500, pay=100, rate=0.1,
-        od=91, closed=False, trend=-0.025, drop=0.28, phase="회복불가"),
+        od=91, closed=False, trend=-0.025, drop=0.28, phase="회복불가",
+        started=date(2020, 10, 1)),
 
     # 36개월 생존 경계 (하드 규칙 ②)
     "H1 0점·36개월 생존": dict(
@@ -176,7 +189,8 @@ CASES: dict[str, dict] = {
     # 휴업 (하드 규칙 ①) — 폐업과 같이 다루는지
     "J1 폐업·흑자": dict(
         rev=700, fix=380, cash=1_500, debt=2_000, pay=40, rate=0.05,
-        od=0, closed=True, area=15, trend=-0.01, drop=0.1, phase="회복불가"),
+        od=0, closed=True, area=15, trend=-0.01, drop=0.1, phase="회복불가",
+        started=date(2021, 5, 1)),
 
     "D7 무부채·적자": dict(
         rev=800, fix=600, cash=500, debt=0, pay=0,
