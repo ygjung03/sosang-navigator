@@ -266,6 +266,11 @@ def _passes_revenue_requirement(cand: Candidate, ctx: UserContext) -> bool:
     # 다른 갈래(생계형 영세 자영업자·임차료 상승 등)를 우리가 판정할 수 없으므로
     # 후보에 올려 두고 LLM이 `_확인필요_자격_매출미달시`로 되묻는다.
     # 매출 요건을 충족하면 더 묻지 않는다 — 하나만 해당하면 되기 때문이다.
+    #
+    # ⚠ **임시 구조다.** 지금은 질문이 LLM 프롬프트에 실려 나가므로, 자격 필터에서
+    #   매출 미달을 걸러내면 물어볼 대상 자체가 사라진다. 그래서 올려두고 사후에 뺀다.
+    #   app.py 에 "1차 입력 -> 국면 판정 -> 자격 필터 -> 추가 질문 -> 재계산" 흐름을
+    #   넣으면 답을 받아 이 함수가 직접 판정하게 되고, 이 플래그는 없어진다.
     if cand.get("매출_요건_택1대체"):
         return True
 
@@ -1212,7 +1217,7 @@ def resolve_by_both(
     target_months: int,
     unit: int = 1_000_000,
     horizon: int = SIM_MONTHS,
-) -> tuple[list[Combo], bool, int | None]:
+) -> tuple[list[Combo], bool, int | None, int]:
     """**금액과 목표 개월수를 둘 다 입력했을 때.**
 
     사용자가 정한 금액을 존중하되, 그 금액으로 목표를 못 채우면 알려준다.
@@ -1222,7 +1227,8 @@ def resolve_by_both(
         3단계  하나도 없으면 -> 목표 개월수 기준으로 다시 만들고,
                "목표를 채우려면 얼마가 필요한지"를 함께 돌려준다
 
-    3단계에서 금액을 올려버리는 것이 아니라 **두 가지를 다 보여주기 위한 정보**다.
+    3단계에서 금액을 올려버리는 것이 아니라 **두 가지를 다 보여주기 위한 정보**다
+    (사용자 금액으로 얼마나 버티나, 목표를 채우려면 얼마가 필요한가).
     사용자가 금액을 정한 데는 이유가 있다(신용 한도, 상환 부담 등).
     화면과 LLM 프롬프트에서 이렇게 쓴다.
 
@@ -1230,10 +1236,15 @@ def resolve_by_both(
          18개월을 채우려면 3,800만원이 필요합니다."
 
     Returns:
-        (조합 목록, 금액으로 목표 충족 여부, 목표를 채우는 데 필요한 금액)
+        (조합 목록, 금액으로 목표 충족 여부, 목표를 채우는 데 필요한 금액,
+         사용자 금액으로 버티는 최대 개월수)
 
-        충족이면 (금액 기준 조합, True, target_inflow)
-        미달이면 (목표 개월수 기준 조합, False, 필요 금액 또는 None)
+        충족이면 (금액 기준 조합, True, target_inflow, 최대 개월수)
+        미달이면 (목표 개월수 기준 조합, False, 필요 금액 또는 None, 최대 개월수)
+
+    **네 번째 값이 "3,000만원으로는 12개월까지"의 12다.** 1단계에서 이미 계산하지만
+    이전에는 버리고 있었다. 목표를 낮출지 금액을 올릴지 사용자가 판단하려면
+    두 숫자가 다 필요하다.
         None은 목표 개월수 기준으로도 못 채운다는 뜻이다(한도 초과 등).
     """
     grants = grant_amounts(db, pool, ctx)
@@ -1245,11 +1256,16 @@ def resolve_by_both(
 
     # ── 1~2단계: 사용자가 정한 금액으로 ──
     by_inflow = rebalance_to_inflow(base, target_inflow, unit)
-    if any(
-        simulate(profile, c.items, horizon=horizon).survival_months >= target_months
-        for c in by_inflow
-    ):
-        return by_inflow, True, target_inflow
+    # 그 금액으로 버틸 수 있는 최대 개월수. 목표를 못 채워도 화면에 보여준다.
+    best_months = max(
+        (
+            simulate(profile, c.items, horizon=horizon).survival_months
+            for c in by_inflow
+        ),
+        default=0,
+    )
+    if best_months >= target_months:
+        return by_inflow, True, target_inflow, best_months
 
     # ── 3단계: 목표 개월수 기준으로 다시. 필요 금액을 함께 구한다 ──
     amounts = {
@@ -1269,7 +1285,7 @@ def resolve_by_both(
         ),
         default=None,
     )
-    return by_months, False, need
+    return by_months, False, need, best_months
 
 
 def rebalance_to_months(
