@@ -299,6 +299,31 @@ def select(
 # ══════════════════════════════════════════════════════════
 
 
+def prerequisites(items: Sequence[Any]) -> list[str]:
+    """신청 전에 해야 할 일 — **최종 추천에 뽑힌 조합에 대해서만** 표시한다.
+
+    `_확인필요_자격_지금가능: true`인 후보의 선행요건이다.
+    "재기사업화에 선정되었는가" 같은 것은 지금 바꿀 수 없어 자격 판정으로 끝나지만,
+    "신용관리 교육 이수"는 사용자가 지금 하면 되는 일이라 자격에서 빼지 않고
+    **안내로 남긴다.**
+
+    `apply_links()` 와 같은 자리에서 쓴다 — LLM이 최종 3개를 고른 뒤
+    `app.py` 가 그 조합에 대해 호출해 화면에 띄운다.
+    후보 그룹 전체에 붙이면 프롬프트만 길어지고 순위 판단에 도움이 되지 않는다.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        cand = item.candidate
+        if not cand.get("_확인필요_자격_지금가능"):
+            continue
+        note = cand.get("_선행요건_안내") or cand.get("_확인필요_자격")
+        if note and note not in seen:
+            seen.add(note)
+            lines.append(f"{cand} — {note}")
+    return lines
+
+
 def apply_links(items: Sequence[Any]) -> list[str]:
     """신청처 — 정책별 신청 링크와 문의처.
 
@@ -328,7 +353,28 @@ def apply_links(items: Sequence[Any]) -> list[str]:
     return lines
 
 
-def _caveats(items: Sequence[Any]) -> list[str]:
+def _meets_revenue_rule(cand: Any, context: Any) -> bool:
+    """후보의 매출 요건을 충족하는지. 택1요건 질문을 걸러내는 데만 쓴다.
+
+    `combos._passes_revenue_requirement()` 와 달리 `매출_요건_택1대체` 를 무시하고
+    **실제 매출 수치만** 본다. 그 플래그는 "미달해도 후보에서 빼지 말라"는 뜻이지
+    "요건을 충족했다"는 뜻이 아니기 때문이다.
+    """
+    if context is None:
+        return False
+    rate = cand.get("매출_기준율") or cand.eligibility.get("매출_기준율")
+    if rate is None:
+        return True
+    windows = cand.raw.get("매출_비교단위") or cand.eligibility.get("매출_비교단위")
+    by_window = getattr(context, "revenue_drop_by_window", None) or {}
+    if windows and by_window:
+        rates = [by_window[w] for w in windows if w in by_window]
+        if rates:
+            return max(rates) >= float(rate)
+    return getattr(context, "revenue_drop_rate", 0.0) >= float(rate)
+
+
+def _caveats(items: Sequence[Any], context: Any = None) -> list[str]:
     """조합에 붙일 주의 문구. 성격이 다른 세 종류를 모은다.
 
     같은 문구가 여러 후보에 붙어 있을 수 있으므로 중복을 제거한다
@@ -369,6 +415,24 @@ def _caveats(items: Sequence[Any]) -> list[str]:
                 else "변동금리입니다. 현재 금리로 계산했으나 실제 상환액이 달라질 수 있습니다."
             )
         add(cand.get("_계산전제"))
+        # 사용자에게 확인해야 자격이 확정되는 항목.
+        # 우리가 판정할 수 없는 사실(교육 이수·선정 이력·성실상환 등)이라
+        # LLM이 되물어야 한다. 답이 "해당 없음"이면 그 후보를 빼고 다시 고른다.
+        # "모름"이면 남기되 확인을 권한다.
+        if confirm := cand.get("_확인필요_자격"):
+            # 지금 할 수 있는 일(교육 이수 등)이면 "아니오"여도 후보에 남긴다.
+            # 지금 바꿀 수 없는 사실이면 "아니오"·"모름" 모두 제외한다.
+            tail = (
+                " (미충족이어도 신청 전에 하면 됩니다)"
+                if cand.get("_확인필요_자격_지금가능")
+                else " (해당 없거나 모르시면 이 조합은 제외합니다)"
+            )
+            add(f"자격 확인 필요 — {confirm}{tail}")
+        # 택1요건 중 우리가 판정하는 갈래를 충족하지 못했을 때만 묻는다.
+        # 하나만 해당하면 되므로, 충족했으면 나머지를 물을 필요가 없다.
+        if alt := cand.get("_확인필요_자격_매출미달시"):
+            if not _meets_revenue_rule(cand, context):
+                add(f"자격 확인 필요 — {alt}")
     return notes
 
 
@@ -379,6 +443,7 @@ def to_prompt_text(
     goal_months: int | None = None,
     goal_satisfied: bool = True,
     extras: Sequence[Any] = (),
+    context: Any = None,
 ) -> str:
     """후보 그룹을 LLM 프롬프트에 넣을 텍스트로 만든다.
 
@@ -445,7 +510,7 @@ def to_prompt_text(
             #   변동금리       우리가 현재 금리로 고정 계산한다는 한계
             #   _계산전제      계산 전제가 실제와 다를 수 있는 후보의 사정
             # 섞으면 "제도 얘기인지 우리 계산의 한계인지"를 LLM이 구분하지 못한다.
-            for note in _caveats(member.combo.items):
+            for note in _caveats(member.combo.items, context):
                 lines.append(f"      ※ {note}")
 
 
@@ -485,6 +550,19 @@ def to_prompt_text(
         lines.append(
             "  ※ 현금 효과가 없거나 금액을 특정할 수 없어 순위 계산에서 뺐다. "
             "최종 추천과 함께 부가로 안내할 것."
+        )
+
+    if any("자격 확인 필요" in ln for ln in lines):
+        lines.append("")
+        lines.append(
+            "[자격 확인 안내] '자격 확인 필요'가 붙은 조합은 우리가 판정할 수 없는 "
+            "요건이 남아 있다. 최종 추천 전에 사용자에게 묻고, 선택지에 "
+            "**'예 / 아니오 / 잘 모르겠어요'** 를 준다. "
+            "**'아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 빼고 다시 고른다** — "
+            "확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다. "
+            "단, '지금 이수하면 되는 것'(신용관리 교육 등)은 예외로 남긴다. "
+            "그 조합을 **최종 3개에 넣었다면 '신청 전에 이수하셔야 합니다'를 "
+            "반드시 안내에 포함할 것.**"
         )
 
     return "\n".join(lines)

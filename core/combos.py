@@ -262,6 +262,13 @@ def _passes_revenue_requirement(cand: Candidate, ctx: UserContext) -> bool:
     if threshold is None:
         return True  # 기준율을 모르면 판정하지 않고 통과
 
+    # 택1요건의 한 갈래일 뿐이면, 매출에 미달해도 후보에서 빼지 않는다.
+    # 다른 갈래(생계형 영세 자영업자·임차료 상승 등)를 우리가 판정할 수 없으므로
+    # 후보에 올려 두고 LLM이 `_확인필요_자격_매출미달시`로 되묻는다.
+    # 매출 요건을 충족하면 더 묻지 않는다 — 하나만 해당하면 되기 때문이다.
+    if cand.get("매출_요건_택1대체"):
+        return True
+
     if direction == "감소율_이상":
         # 정책이 허용하는 비교 단위 중 **가장 큰 감소율**로 판정한다.
         # 제도가 "여러 단위 중 하나만 충족하면 된다"고 하기 때문이다.
@@ -381,6 +388,14 @@ def _passes_debt_requirement(
     ceiling = cand.policy_raw.get("자격요건", {}).get("대상채무_총액상한")
     if ceiling is not None and profile.existing_debt > int(ceiling):
         return False
+
+    # 재창업 업력 (재도전특별자금 도약형). "재창업(업력 2년 이상) 후 매출 5% 증가".
+    # 재창업자에게는 현재 사업의 개시일이 곧 재창업일이므로 business_started 로 잰다.
+    years_floor = cand.get("재창업_업력_하한_년")
+    if years_floor is not None:
+        years = ctx.business_years
+        if years is None or years < float(years_floor):
+            return False
 
     # 개업일 상한 (경영안정 바우처). 2025년 연매출로 자격을 따지는 제도라
     # 그 해에 매출이 있어야 한다 — "사업자등록증상 개업연월일 기준,
@@ -684,8 +699,47 @@ def _restructure_loan_exclusive(
     return enabled, scope, effects
 
 
+def _group_exclusions(db: PolicyDB, method: str) -> list[list[str]]:
+    """`_조합문법.<지원방법>._그룹배타` 에서 배타 그룹 목록을 꺼낸다.
+
+    `_`로 시작하는 키는 설명·근거이므로 건너뛴다.
+    """
+    block = db.combo_rules.get(method, {})
+    groups = block.get("_그룹배타") or {}
+    return [v for k, v in groups.items() if not k.startswith("_") and isinstance(v, list)]
+
+
+def _violates_group_exclusion(
+    group: Sequence[Candidate], exclusions: Sequence[Sequence[str]]
+) -> bool:
+    """같은 배타 그룹의 정책이 둘 이상 들어 있는지.
+
+    제도가 "이 사업들 중 하나만"이라고 정한 묶음이다.
+    JSON `_조합문법.<지원방법>._그룹배타` 에 정책 이름 목록으로 적는다.
+
+        서울시_소상공인_종합지원사업   서울시가 자기 사업끼리 중복을 막는다
+        창업·재도전_자금             희망리턴패키지가 "창업(사업자등록)에 소요되는
+                                  자금을 국비·지방비로 지원하는 사업"과의 중복을 막는다
+                                  (다시서기 재도전 자금 ↔ 재기사업화(재창업))
+
+    **정책 이름과 후보 id를 모두 받는다.** 아직 수록하지 않은 사업은 후보 id가
+    없으므로 이름으로 적고, 한 정책에 성격이 다른 후보가 섞여 있으면 id로 적는다 —
+    희망리턴패키지의 재기사업화(재창업)는 창업 자금이지만 점포철거비는 폐업 지원이라
+    배타 대상이 다르다.
+    """
+    for names in exclusions:
+        hit = sum(1 for c in group if c.policy_name in names or c.candidate_id in names)
+        if hit > 1:
+            return True
+    return False
+
+
 def _pick_by_method(
-    pool: Sequence[Candidate], method: str, limit: int, allow_cross_source: bool
+    pool: Sequence[Candidate],
+    method: str,
+    limit: int,
+    allow_cross_source: bool,
+    exclusions: Sequence[Sequence[str]] = (),
 ) -> list[tuple[Candidate, ...]]:
     """한 지원방법 안에서 가능한 선택지를 모두 만든다.
 
@@ -702,6 +756,9 @@ def _pick_by_method(
         for group in combinations(items, size):
             # 재원 간 중복이 금지면 서로 다른 재원이 섞인 조합은 만들지 않는다
             if not allow_cross_source and len({c.source for c in group}) > 1:
+                continue
+            # 제도가 "이 사업들 중 하나만"이라고 정한 묶음은 함께 넣지 않는다
+            if _violates_group_exclusion(group, exclusions):
                 continue
             options.append(group)
     return options
@@ -797,13 +854,16 @@ def build_combos(
     limits = _grammar_limits(db)
 
     loan_options = _pick_by_method(
-        pool, "융자", limits["융자"], _cross_source_allowed(db, "융자")
+        pool, "융자", limits["융자"], _cross_source_allowed(db, "융자"),
+        _group_exclusions(db, "융자"),
     )
     restructure_options = _pick_by_method(
-        pool, "채무조정", limits["채무조정"], _cross_source_allowed(db, "채무조정")
+        pool, "채무조정", limits["채무조정"], _cross_source_allowed(db, "채무조정"),
+        _group_exclusions(db, "채무조정"),
     )
     grant_options = _pick_by_method(
-        pool, "보조금", limits["보조금"], _cross_source_allowed(db, "보조금")
+        pool, "보조금", limits["보조금"], _cross_source_allowed(db, "보조금"),
+        _group_exclusions(db, "보조금"),
     )
 
     exclusive, exclusive_sources, exclusive_effects = _restructure_loan_exclusive(db)
