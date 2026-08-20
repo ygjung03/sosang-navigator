@@ -593,7 +593,8 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
     min_man, max_man = floor // MAN, ceiling // MAN
     step_man = max(1, unit // MAN)
     default_man = min(max(loan_item.effective_amount // MAN, min_man), max_man)
-    picked_man = st.slider(
+    picked_man = st.slider(  # transient-widget: 결과 카드 what-if. 단계 답이 아니라
+        # 되돌아가면 초기화되는 게 맞다(ss.answers 를 안 탄다).
         f"융자 금액 조정 — {cand.policy_name}",
         min_value=min_man,
         max_value=max_man,
@@ -975,21 +976,108 @@ def render_progress(cur: int, fields: list[str]) -> None:
     st.markdown(counter_html + bar, unsafe_allow_html=True)
 
 
-# ── 답 수집 (위젯을 그리지 않고 session_state 만 읽는다) ──
+# ══════════════════════════════════════════════════════════
+# 위젯 래퍼 — 답을 ss.answers 에 저장한다 (배선 버그 방지)
+# ══════════════════════════════════════════════════════════
+#
+# ⚠ 입력 위젯은 **반드시 이 래퍼**를 통해 만든다. st.number_input / st.selectbox /
+#   st.checkbox / st.radio / st.text_input / st.slider / st.date_input /
+#   st.file_uploader 를 render_* 안에서 직접 부르면 안 된다.
+#
+#   이유(2026-08 실측 버그): 단일 단계 UI라 매 rerun 에 현재 단계 위젯만 렌더되는데,
+#   Streamlit 은 이번 run 에서 렌더되지 않은 위젯의 key 를 session_state 에서 지운다.
+#   그래서 위젯 값을 직접 읽으면(ss.get("fixed_man")) 다음 단계에서 사라져, 진단·결과
+#   단계의 UserProfile 이 고정비 0·부채 0 등 기본값으로 조립되는 배선 버그가 났다.
+#
+#   래퍼는 값을 우리 소유의 dict(ss.answers[key])에 복사한다 — 이 dict 는 위젯이 아니라
+#   purge 되지 않는다. collect_* 는 위젯 key 가 아니라 **ss.answers 에서만** 읽는다.
+#   직접 호출을 막는 회귀 테스트: tests/test_app.py::test_no_direct_widget_calls
+#
+# ── WIDGET WRAPPERS START ── (아래 정의부만 st.<widget> 직접 호출 허용)
+
+
+def _answers() -> dict:
+    """답 저장소. 위젯이 아니라서 purge 되지 않는다."""
+    return st.session_state.setdefault("answers", {})
+
+
+def _num(label, key, default, **kw):
+    ans = _answers()
+    ans[key] = st.number_input(label, value=ans.get(key, default), key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _check(label, key, default, **kw):
+    ans = _answers()
+    ans[key] = st.checkbox(label, value=ans.get(key, default), key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _text(label, key, default, **kw):
+    ans = _answers()
+    ans[key] = st.text_input(label, value=ans.get(key, default), key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _slider(label, key, min_value, max_value, default, **kw):
+    ans = _answers()
+    ans[key] = st.slider(label, min_value, max_value, value=ans.get(key, default), key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _select(label, key, options, default, **kw):
+    ans = _answers()
+    current = ans.get(key, default)
+    idx = options.index(current) if current in options else 0
+    ans[key] = st.selectbox(label, options, index=idx, key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _radio(label, key, options, default, **kw):
+    ans = _answers()
+    current = ans.get(key, default)
+    idx = options.index(current) if current in options else 0
+    ans[key] = st.radio(label, options, index=idx, key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _date(label, key, default, **kw):
+    ans = _answers()
+    ans[key] = st.date_input(label, value=ans.get(key, default), key=f"{key}_w", **kw)
+    return ans[key]
+
+
+def _file(label, key, **kw):
+    """file_uploader 는 재렌더 시 None 을 돌려준다(네비게이션으로 돌아오면 파일 소실).
+    그래서 새로 올렸을 때만 저장소를 갱신한다. 소스를 바꾸면 호출부가 ans[key]를 비운다.
+    한계: 업로드 후 위젯의 x 로 취소해도 저장소엔 남는다(복귀와 구분 불가) — 소스를
+    데모/없어요로 바꾸면 지워진다.
+    """
+    ans = _answers()
+    f = st.file_uploader(label, key=f"{key}_w", **kw)
+    if f is not None:
+        ans[key] = f
+    return ans.get(key)
+
+
+# ── WIDGET WRAPPERS END ──
+
+
+# ── 답 수집 (위젯을 그리지 않고 ss.answers 에서만 읽는다) ──
 
 
 def collect_revenue() -> dict:
-    """매출 자료 답을 읽어 요약을 만든다. 지금 보이는 단계와 무관하게 호출된다."""
-    ss = st.session_state
-    source = ss.get("rev_source", "데모 시나리오")
+    """매출 자료 답을 ss.answers 에서 읽어 요약을 만든다. 보이는 단계와 무관하게 호출된다."""
+    ans = _answers()
+    source = ans.get("rev_source", "데모 시나리오")
     summary = None
     precise = True
     rough = 0
     ready = True
     if source == "데모 시나리오":
-        summary = summarize_scenario(ss.get("scenario_key", "B"), 12)
+        summary = summarize_scenario(ans.get("scenario_key", "B"), 12)
     elif source == "파일 업로드":
-        f = ss.get("pos_file")
+        f = ans.get("pos_file")
         if f is None:
             ready = False
         else:
@@ -999,11 +1087,11 @@ def collect_revenue() -> dict:
                 ready = False
     else:
         precise = False
-        rough = won(ss.get("rough_rev_man", 800))
+        rough = won(ans.get("rough_rev_man", 800))
     current_revenue = summary.recent_3m_avg if (precise and summary is not None) else rough
     return dict(
         summary=summary, precise=precise, rough=rough,
-        phase_simple=ss.get("phase_simple", "일시적자금난"),
+        phase_simple=ans.get("phase_simple", "일시적자금난"),
         current_revenue=current_revenue, ready=ready,
     )
 
@@ -1019,7 +1107,7 @@ def compute_phase_and_annual(revenue: dict, elig: dict, profile: UserProfile) ->
     """국면과 (자격 판정용) 연매출을 구한다. 애매하면 사용자가 고른 값이 우선."""
     if revenue["precise"] and revenue["summary"] is not None:
         result = judge_phase(profile, revenue["summary"], revenue["current_revenue"], elig["is_closed"])
-        phase = st.session_state.get("phase_confirm", result.phase) if result.ambiguous else result.phase
+        phase = _answers().get("phase_confirm", result.phase) if result.ambiguous else result.phase
         annual = revenue["summary"].rolling_annual_revenue
     else:
         phase = "회복불가" if elig["is_closed"] else revenue["phase_simple"]
@@ -1028,24 +1116,24 @@ def compute_phase_and_annual(revenue: dict, elig: dict, profile: UserProfile) ->
 
 
 def collect_conditional(fields: list[str]) -> dict:
-    """조건부 답을 읽는다. fields 에 없는 항목은 기본값(제외 방향)."""
-    ss = st.session_state
-    ans = dict(business_started=None, store_area_pyeong=None, policy_loan_count_5y=0)
-    if "business_started" in fields and ss.get("cond_bstart_known"):
-        ans["business_started"] = ss.get("cond_bstart")
+    """조건부 답을 ss.answers 에서 읽는다. fields 에 없는 항목은 기본값(제외 방향)."""
+    a = _answers()
+    out = dict(business_started=None, store_area_pyeong=None, policy_loan_count_5y=0)
+    if "business_started" in fields and a.get("cond_bstart_known"):
+        out["business_started"] = a.get("cond_bstart")
     if "store_area_pyeong" in fields:
-        area = ss.get("cond_area", 0)
-        ans["store_area_pyeong"] = area if area and area > 0 else None
+        area = a.get("cond_area", 0)
+        out["store_area_pyeong"] = area if area and area > 0 else None
     if "policy_loan_count_5y" in fields:
-        ans["policy_loan_count_5y"] = int(ss.get("cond_loan_count", 0))
-    return ans
+        out["policy_loan_count_5y"] = int(a.get("cond_loan_count", 0))
+    return out
 
 
 def collect_goals() -> tuple[int | None, int | None]:
-    """희망 금액 / 목표 개월수 답을 읽는다(둘 다 선택)."""
-    ss = st.session_state
-    ti = won(ss.get("goal_amt_man", 3_000)) if ss.get("goal_amt_on") else None
-    tm = int(ss.get("goal_months", DEFAULT_TARGET_MONTHS)) if ss.get("goal_months_on", True) else None
+    """희망 금액 / 목표 개월수 답을 ss.answers 에서 읽는다(둘 다 선택)."""
+    a = _answers()
+    ti = won(a.get("goal_amt_man", 3_000)) if a.get("goal_amt_on") else None
+    tm = int(a.get("goal_months", DEFAULT_TARGET_MONTHS)) if a.get("goal_months_on", True) else None
     return ti, tm
 
 
@@ -1054,31 +1142,33 @@ def collect_goals() -> tuple[int | None, int | None]:
 
 def render_situation(fields: list[str]) -> None:
     st.markdown("안녕하세요. 상황을 몇 가지로 나눠 여쭤볼게요. **먼저 기본 상황부터요.**")
-    st.text_input("사업장 지역", value="서울", key="region")
-    st.selectbox("재창업 상태", ("안함", "준비중", "이미함"), key="restart")
-    st.checkbox("폐업했거나 폐업 예정", key="is_closed")
-    st.checkbox("대출도 함께 고려", value=True, key="include_loans")
+    _text("사업장 지역", "region", "서울")
+    _select("재창업 상태", "restart", ("안함", "준비중", "이미함"), "안함")
+    _check("폐업했거나 폐업 예정", "is_closed", False)
+    _check("대출도 함께 고려", "include_loans", True)
     _nav(S_SITUATION, fields)
 
 
 def render_revenue(revenue: dict, fields: list[str]) -> None:
     st.markdown("**매출 자료가 있으신가요?** 있으면 추세를 분석해 더 정확히 진단해 드려요.")
-    source = st.radio(
-        "자료 유형", ("데모 시나리오", "파일 업로드", "없어요 (간편 진행)"), key="rev_source"
+    source = _radio(
+        "자료 유형", "rev_source",
+        ("데모 시나리오", "파일 업로드", "없어요 (간편 진행)"), "데모 시나리오",
     )
     ready = True
     if source == "데모 시나리오":
         from data.synthetic_pos import SCENARIOS
 
-        st.selectbox(
-            "시나리오", list(SCENARIOS.keys()),
-            format_func=lambda k: f"{k} — {SCENARIOS[k].name}", index=1, key="scenario_key",
+        _select(
+            "시나리오", "scenario_key", list(SCENARIOS.keys()), "B",
+            format_func=lambda k: f"{k} — {SCENARIOS[k].name}",
         )
         # 12개월 고정. 그보다 짧으면 반기 비교(직전 6개월 vs 그 전 6개월)가 계산되지
         # 않아 자격·국면 판정이 달라진다. generate(months=)는 개발용이라 노출하지 않는다.
         st.caption("추세·반기 비교를 위해 12개월치로 생성합니다.")
+        _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     elif source == "파일 업로드":
-        uploaded = st.file_uploader("POS 파일 (CSV/Excel)", type=["csv", "xlsx", "xls"], key="pos_file")
+        uploaded = _file("POS 파일 (CSV/Excel)", "pos_file", type=["csv", "xlsx", "xls"])
         if uploaded is None:
             ready = False
         else:
@@ -1088,87 +1178,86 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
                 st.error(f"POS 파일을 읽지 못했습니다: {error}")
                 ready = False
     else:
-        st.number_input("월 매출 대략값 (만원)", min_value=0, value=800, step=10, key="rough_rev_man")
-        st.selectbox("국면 (직접 선택)", ("일시적자금난", "개선여지", "회복불가"), key="phase_simple")
+        _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
+        _select("국면 (직접 선택)", "phase_simple", ("일시적자금난", "개선여지", "회복불가"), "일시적자금난")
+        _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     _nav(S_REVENUE, fields, ready=ready)
 
 
 def render_cost(fields: list[str]) -> None:
     st.markdown("**한 달 비용과 보유 현금**을 알려주세요.")
-    st.number_input("월 고정비 (만원)", min_value=0, value=500, step=10, key="fixed_man")
-    st.number_input(
-        "월 변동비 (만원)", min_value=0, value=200, step=10, key="var_man",
+    _num("월 고정비 (만원)", "fixed_man", 500, min_value=0, step=10)
+    _num(
+        "월 변동비 (만원)", "var_man", 200, min_value=0, step=10,
         help="재료비·수수료 등 매출에 비례하는 비용. 비율은 코드가 계산합니다.",
     )
-    st.number_input("보유 현금 (만원)", min_value=0, value=1_000, step=50, key="cash_man")
+    _num("보유 현금 (만원)", "cash_man", 1_000, min_value=0, step=50)
     _nav(S_COST, fields)
 
 
 def render_debt(fields: list[str]) -> None:
     """④ 부채 규모 — 총잔액·월상환·금리."""
     st.markdown("**기존 부채 규모**를 알려주세요. 없으면 0으로 두시면 됩니다.")
-    st.number_input("부채 총 잔액 (만원)", min_value=0, value=3_000, step=50, key="debt_man")
-    st.number_input("월 상환액 (만원)", min_value=0, value=80, step=5, key="debt_pay_man")
-    st.checkbox("부채 금리를 안다", value=False, key="rate_known")
-    if st.session_state.get("rate_known"):
-        st.number_input("연 금리 (%)", min_value=0.0, max_value=30.0, value=5.0, step=0.1, key="rate_pct")
+    _num("부채 총 잔액 (만원)", "debt_man", 3_000, min_value=0, step=50)
+    _num("월 상환액 (만원)", "debt_pay_man", 80, min_value=0, step=5)
+    if _check("부채 금리를 안다", "rate_known", False):
+        _num("연 금리 (%)", "rate_pct", 5.0, min_value=0.0, max_value=30.0, step=0.1)
     _nav(S_DEBT, fields)
 
 
 def render_debt2(fields: list[str]) -> None:
     """⑤ 연체·신용 — 연체일수·체납·고금리부채·직접대출잔액·신용점수."""
     st.markdown("**연체·신용 상황**이 궁금해요. 해당 없으면 그대로 두시면 됩니다.")
-    st.number_input("연체 일수", min_value=0, value=0, step=1, key="overdue_days")
-    st.checkbox("국세·지방세 체납 중", key="tax_delinquent")
-    st.selectbox(
-        "고금리(연 7%+) 부채", ("모름", "없음", "금액 입력"), key="high_rate_choice",
+    _num("연체 일수", "overdue_days", 0, min_value=0, step=1)
+    _check("국세·지방세 체납 중", "tax_delinquent", False)
+    if _select(
+        "고금리(연 7%+) 부채", "high_rate_choice", ("모름", "없음", "금액 입력"), "모름",
         help="대환대출 대상이자 자격 요건. '모름'과 '없음'은 다르게 취급됩니다.",
-    )
-    if st.session_state.get("high_rate_choice") == "금액 입력":
-        st.number_input("그중 고금리 부분 (만원)", min_value=0, value=0, step=50, key="high_rate_man")
-    st.number_input(
-        "소진공 직접대출 잔액 (만원)", min_value=0, value=0, step=50, key="policy_bal_man",
+    ) == "금액 입력":
+        _num("그중 고금리 부분 (만원)", "high_rate_man", 0, min_value=0, step=50)
+    _num(
+        "소진공 직접대출 잔액 (만원)", "policy_bal_man", 0, min_value=0, step=50,
         help="상환연장제도의 대상 금액입니다.",
     )
-    st.checkbox("신용점수를 안다", value=False, key="credit_known")
-    if st.session_state.get("credit_known"):
-        st.number_input("개인신용점수", min_value=0, max_value=1000, value=850, step=1, key="credit_score_val")
+    if _check("신용점수를 안다", "credit_known", False):
+        _num("개인신용점수", "credit_score_val", 850, min_value=0, max_value=1000, step=1)
     _nav(S_DEBT2, fields)
 
 
 def collect_finance() -> dict:
-    """session_state 에 담긴 재무 답을 원 단위 dict 로 조립한다."""
-    ss = st.session_state
-    choice = ss.get("high_rate_choice", "모름")
+    """재무 답을 ss.answers 에서 원 단위 dict 로 조립한다. 폴백은 위젯 기본값과 일치시킨다
+    (단계를 안 거쳤을 때 0이 아니라 기본값이 들어가도록)."""
+    a = _answers()
+    choice = a.get("high_rate_choice", "모름")
     if choice == "없음":
         high_rate = 0
     elif choice == "금액 입력":
-        high_rate = won(ss.get("high_rate_man", 0))
+        high_rate = won(a.get("high_rate_man", 0))
     else:
         high_rate = None
     return dict(
-        fixed_cost=won(ss.get("fixed_man", 0)),
-        variable_cost=won(ss.get("var_man", 0)),
-        cash=won(ss.get("cash_man", 0)),
-        debt=won(ss.get("debt_man", 0)),
-        debt_payment=won(ss.get("debt_pay_man", 0)),
-        debt_rate=(ss.get("rate_pct", 5.0) / 100 if ss.get("rate_known") else None),
+        fixed_cost=won(a.get("fixed_man", 500)),
+        variable_cost=won(a.get("var_man", 200)),
+        cash=won(a.get("cash_man", 1_000)),
+        debt=won(a.get("debt_man", 3_000)),
+        debt_payment=won(a.get("debt_pay_man", 80)),
+        debt_rate=(a.get("rate_pct", 5.0) / 100 if a.get("rate_known") else None),
         high_rate_debt=high_rate,
-        overdue_days=int(ss.get("overdue_days", 0)),
-        policy_loan_balance=won(ss.get("policy_bal_man", 0)),
+        overdue_days=int(a.get("overdue_days", 0)),
+        policy_loan_balance=won(a.get("policy_bal_man", 0)),
     )
 
 
 def collect_eligibility() -> dict:
-    """session_state 에 담긴 자격 답을 dict 로 조립한다."""
-    ss = st.session_state
+    """자격 답을 ss.answers 에서 dict 로 조립한다."""
+    a = _answers()
     return dict(
-        region=ss.get("region", "서울"),
-        restart_status=ss.get("restart", "안함"),
-        is_closed=ss.get("is_closed", False),
-        tax_delinquent=ss.get("tax_delinquent", False),
-        include_loans=ss.get("include_loans", True),
-        credit_score=(int(ss.get("credit_score_val", 850)) if ss.get("credit_known") else None),
+        region=a.get("region", "서울"),
+        restart_status=a.get("restart", "안함"),
+        is_closed=a.get("is_closed", False),
+        tax_delinquent=a.get("tax_delinquent", False),
+        include_loans=a.get("include_loans", True),
+        credit_score=(int(a.get("credit_score_val", 850)) if a.get("credit_known") else None),
     )
 
 
@@ -1273,10 +1362,9 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
 
         if result.ambiguous:
             st.info("경계에 가까운 판정입니다. 맞는지 골라 주세요.")
-            options = list(neighbor_phases(result))
-            st.radio(
-                "국면이 맞나요?", options,
-                index=options.index(result.phase), horizontal=True, key="phase_confirm",
+            _radio(
+                "국면이 맞나요?", "phase_confirm",
+                list(neighbor_phases(result)), result.phase, horizontal=True,
             )
         _nav(S_DIAGNOSIS, fields)
         return
@@ -1292,32 +1380,28 @@ def render_conditional(fields: list[str]) -> None:
     """⑥ 조건부 추가 질문. fields 에 든 것만 묻는다(답은 collect_conditional 이 읽는다)."""
     st.markdown("**후보에 오른 정책이 요구하는 항목만** 몇 가지 더 여쭤볼게요.")
     if "business_started" in fields:
-        if st.checkbox("사업 개시 연월을 입력", value=False, key="cond_bstart_known"):
-            st.date_input(
-                "사업 개시일",
-                value=datetime.date(2019, 3, 1),
-                min_value=datetime.date(2000, 1, 1),
-                max_value=datetime.date.today(),
-                key="cond_bstart",
+        if _check("사업 개시 연월을 입력", "cond_bstart_known", False):
+            _date(
+                "사업 개시일", "cond_bstart", datetime.date(2019, 3, 1),
+                min_value=datetime.date(2000, 1, 1), max_value=datetime.date.today(),
             )
         else:
             st.caption("입력하지 않으면 업력·사업영위 기간 판정이 필요한 정책은 제외됩니다.")
     if "store_area_pyeong" in fields:
-        area = st.number_input("점포 전용면적 (평)", min_value=0.0, value=0.0, step=1.0, key="cond_area")
-        if area <= 0:
+        if _num("점포 전용면적 (평)", "cond_area", 0.0, min_value=0.0, step=1.0) <= 0:
             st.caption("면적을 모르면 점포철거비는 금액을 계산할 수 없어 제외됩니다.")
     if "policy_loan_count_5y" in fields:
-        st.number_input("최근 5년 정책자금 지원 횟수", min_value=0, value=0, step=1, key="cond_loan_count")
+        _num("최근 5년 정책자금 지원 횟수", "cond_loan_count", 0, min_value=0, step=1)
     _nav(S_CONDITIONAL, fields)
 
 
 def render_goals(fields: list[str]) -> None:
     """⑦ 희망 금액 / 목표 생존 개월수 (둘 다 선택). 답은 collect_goals 이 읽는다."""
     st.markdown("**마지막이에요.** 필요한 금액이나 버티고 싶은 기간이 정해져 있나요? (선택)")
-    if st.checkbox("필요한 금액이 정해져 있음", key="goal_amt_on"):
-        st.number_input("희망 금액 (만원)", min_value=0, value=3_000, step=100, key="goal_amt_man")
-    if st.checkbox("목표 생존 개월수 지정", value=True, key="goal_months_on"):
-        st.slider("몇 개월 이상 버티고 싶으세요?", 1, SIM_MONTHS, DEFAULT_TARGET_MONTHS, key="goal_months")
+    if _check("필요한 금액이 정해져 있음", "goal_amt_on", False):
+        _num("희망 금액 (만원)", "goal_amt_man", 3_000, min_value=0, step=100)
+    if _check("목표 생존 개월수 지정", "goal_months_on", True):
+        _slider("몇 개월 이상 버티고 싶으세요?", "goal_months", 1, SIM_MONTHS, DEFAULT_TARGET_MONTHS)
     _nav(S_GOALS, fields)
 
 
@@ -1365,6 +1449,7 @@ def main() -> None:
     ss = st.session_state
     if "step" not in ss:
         ss.step = S_SITUATION
+    _answers()  # 답 저장소 초기화 (위젯이 아니라서 purge 되지 않는다)
 
     header = st.columns([5, 1])
     with header[0]:
