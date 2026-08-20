@@ -271,6 +271,53 @@ def test_combination():
     return r
 
 
+def test_payment_identity():
+    """payment_during == interest_during + principal_during 를 **전수** 검증한다.
+
+    cases_phase.py 33개 케이스 각각에서 자격을 통과한 조합을 모두 만들어
+    시뮬레이션하고, 모든 달에서 항등식이 성립하는지 본다. 손으로 케이스를
+    만들지 않아도 상환방식 네 가지(균등분할·분기균등·대리분기·만기일시)와
+    거치 중/거치 종료 후/만기 도달, 파산(셋 다 0), 이자>상환액(원금상환 0)이
+    자연스럽게 다 걸린다.
+    """
+    from core.combos import (
+        build_combos,
+        default_loan_amounts,
+        eligible_candidates,
+        evaluate,
+        fixed_amounts,
+        grant_amounts,
+    )
+    from tests.cases_phase import CASES, context_of, profile_of
+
+    checked = 0
+    for name, c in CASES.items():
+        profile = profile_of(c)
+        ctx = context_of(c)
+        # 무지원 베이스라인 + 자격을 통과한 모든 조합
+        results = [simulate(profile)]
+        pool = eligible_candidates(db, profile, ctx)
+        amounts = default_loan_amounts(db, pool, profile, target_months=6)
+        amounts.update(fixed_amounts(profile, pool))
+        amounts.update(grant_amounts(db, pool, ctx))
+        results += [ev.result for ev in evaluate(profile, build_combos(db, pool, amounts))]
+
+        for r in results:
+            for m in range(SIM_MONTHS):
+                diff = abs(r.payment_during[m] - (r.interest_during[m] + r.principal_during[m]))
+                assert diff < 1e-3, (
+                    f"{name} · {m + 1}개월차: payment {r.payment_during[m]:,.4f} != "
+                    f"interest {r.interest_during[m]:,.4f} + principal {r.principal_during[m]:,.4f} "
+                    f"(차이 {diff})"
+                )
+            checked += 1
+
+    print("\n-- 이자/원금 항등식 전수 검증")
+    print(f"   {len(CASES)}개 케이스 · 조합 {checked}개 · 모든 달 "
+          "payment == interest + principal 성립")
+    assert checked > 50, f"조합이 너무 적다({checked}개) — 커버리지 부족"
+
+
 def main() -> None:
     print("=" * 62)
     print("현금흐름 엔진 검증 - 현금효과 6종 + 조합")
@@ -285,6 +332,7 @@ def main() -> None:
         test_repayment_extension,
         test_cost_relief,
         test_combination,
+        test_payment_identity,
     ):
         fn()
     print("\n" + "=" * 62)
