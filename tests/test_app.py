@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import datetime
+
 import app
 from core.cashflow import SIM_MONTHS
 
@@ -225,6 +227,110 @@ def test_demo_goal_above_baseline():
     print("   데모 목표 > baseline 불변식 통과 (A/B/C)")
 
 
+def test_debt_relief_reaches_confirmation():
+    """C 의 baseline 이 채무조정 **적용시점(확정까지 걸리는 개월)** 이상인지.
+
+    새출발기금은 `적용시점_개월`(부실차주 6개월, 캠코 통화 "신청~확정 5~6개월"의 상한)
+    이후에야 감면이 반영된다. 그런데 파산하면 그 시점에서 계산이 멈추므로(가정 F1,
+    cashflow.py:100 · planning.md:447) **baseline 이 적용시점보다 짧으면 감면이
+    통째로 사라진다** — 종료부채가 baseline 과 같아져 C 의 핵심 처방(부채 4,026만 감소)이
+    화면에서 증발한다. 재무값을 만져 baseline 이 5로 떨어지면 조용히 그렇게 된다.
+
+    "확정 전까지 계속 상환한다"는 보수적 가정은 심사 중 상환 의무를 확인하지 못해서다
+    (planning.md:1470-1475, 미해결 C-37 — 캠코도 담당자가 모른다고 답했다).
+    모델링을 바꾸는 게 아니라, 그 가정 위에서 데모가 성립하는지를 지킨다."""
+    import app as _app
+    from core import loader
+
+    db = loader.load()
+    relief_at = max(
+        int(c.get("적용시점_개월", 0) or 0)
+        for c in db.candidates
+        if "새출발" in str(c) and c.effect in ("부채감면", "이자조정")
+    )
+    base = _demo_baseline("C")
+    assert base >= relief_at, (
+        f"C baseline {base}개월 < 새출발기금 적용시점 {relief_at}개월 — 확정 전에 파산해 "
+        f"감면이 통째로 사라진다(가정 F1). C 재무값을 손댔으면 baseline 을 다시 잡을 것."
+    )
+    print(f"   [C] baseline {base} >= 채무조정 적용시점 {relief_at} ✓")
+
+
+def _drive(scenarios: list[str]) -> dict:
+    """시나리오를 순서대로 골라가며 결과 단계까지 몰고, 최종 answers 를 돌려준다."""
+    at = _fresh_app()
+    while at.session_state["step"] < app.S_REVENUE:
+        _advance(at)
+    for key in scenarios:
+        at.selectbox(key="scenario_key_w").set_value(key)
+        at.run(timeout=120)
+    while at.session_state["step"] < app.S_RESULTS:
+        _advance(at)
+    return _ans(at)
+
+
+def test_preset_switch_no_leak():
+    """시나리오를 갈아탈 때 앞 시나리오의 프리셋 값이 남지 않는지.
+
+    dict.update 는 없는 키를 지우지 않는다. C 만 가진 is_closed=True·cond_area=20 이
+    남으면 **A 가 폐업 상태로 계산되는데 화면은 멀쩡해 보인다** — 시연 중에 알아채기
+    어려운 종류라 여기서 못박는다. apply_demo_preset 이 (합집합 - 이번 프리셋) 키를
+    지워서 막는다.
+
+    왕복(A→B→C→A)이 핵심이다. 전환 경로가 달라도 결과가 같아야 한다."""
+    c_only = {k for k in app.DEMO_PRESETS["C"]} - {k for k in app.DEMO_PRESETS["A"]}
+    assert c_only, "C 전용 키가 없다면 이 테스트의 전제가 깨진 것이다(프리셋 구조 변경?)"
+
+    fresh_a = _drive(["A"])
+    for path in (["C", "A"], ["A", "B", "C", "A"]):
+        got = _drive(path)
+        for key in c_only:
+            assert not got.get(key), (
+                f"{'→'.join(path)} 후 C 전용 키 {key}={got.get(key)!r} 가 남았다 — "
+                "A 가 C 의 상태로 계산된다."
+            )
+        diff = {
+            k: (fresh_a.get(k), got.get(k))
+            for k in set(fresh_a) | set(got)
+            if k != "_applied_scenario" and fresh_a.get(k) != got.get(k)
+        }
+        assert not diff, f"{'→'.join(path)} 의 A 가 처음 A 와 다르다: {diff}"
+        print(f"   {'→'.join(path):<12} 후 A 가 처음 A 와 동일 ✓")
+
+    to_c = _drive(["A", "C"])
+    assert to_c.get("is_closed") is True and to_c.get("cond_area") == app.DEMO_PRESETS["C"]["cond_area"], (
+        f"A→C 전환 시 C 프리셋이 안 들어갔다: is_closed={to_c.get('is_closed')} cond_area={to_c.get('cond_area')}"
+    )
+    print("   A→C 전환 시 C 전용 값(폐업·면적) 정상 주입 ✓")
+
+
+def test_conditional_gating():
+    """묻지 않은 조건부 항목은 프로필에 싣지 않는지.
+
+    ⑦ 추가 확인 단계는 국면·자격에 따라 묻는 항목이 달라진다. store_area_pyeong 은
+    C(회복불가·폐업)에서만 묻는다. C 에서 답한 뒤 A 로 가면 A 는 그 값을 묻지도 않으므로
+    프로필에 실려선 안 된다. collect_conditional 이 fields 로 게이팅해서 막는다
+    (collect_revenue 가 소스로 게이팅하는 것과 같은 방식).
+
+    답 자체를 지우지는 않는다 — A→C→A 로 오갈 때 A 에서 답한 것을 또 물으면 성가시다."""
+    import app as _app
+
+    summary = _app.summarize_scenario("C", 12)
+    annual = summary.rolling_annual_revenue
+    c_fields = _app.needed_conditional_fields("회복불가", annual, True)
+    a_fields = _app.needed_conditional_fields("일시적자금난", annual, True)
+    only_c = set(c_fields) - set(a_fields)
+    assert "store_area_pyeong" in only_c, (
+        f"전제가 깨졌다 — store_area_pyeong 이 C 전용이 아니다. C={c_fields} A={a_fields}"
+    )
+
+    # A 의 fields 로 게이팅하면, ans 에 면적이 남아 있어도 프로필엔 안 실려야 한다
+    ans = {"cond_area": 20.0, "cond_bstart_known": True, "cond_bstart": datetime.date(2019, 3, 1)}
+    loaded = {"store_area_pyeong": (ans.get("cond_area") if "store_area_pyeong" in a_fields else None)}
+    assert loaded["store_area_pyeong"] is None, "A 에서 묻지 않은 면적이 프로필에 실렸다"
+    print(f"   C 전용 항목 {sorted(only_c)} 은 A 에서 프로필에 안 실림 ✓")
+
+
 def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
@@ -233,6 +339,9 @@ def main() -> None:
     test_months_label()
     test_no_direct_widget_calls()
     test_demo_goal_above_baseline()
+    test_debt_relief_reaches_confirmation()
+    test_conditional_gating()
+    test_preset_switch_no_leak()
     test_answers_survive_navigation()
     test_edit_and_return()
     test_slider_does_not_leak()

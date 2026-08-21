@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import datetime
 import io
+import math
 import re
 
 import pandas as pd
@@ -909,6 +910,21 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
             padding-top: 8px; padding-bottom: 4px;
         }
         .block-container { padding-bottom: 5rem; }
+
+        /* 경계 판정(국면 확인) 블록 — 안내문·질문·라디오를 한 덩어리로 묶는다.
+           연파랑(st.info)은 카드 회색과 구분이 약해 연초록으로 바꿨다.
+           margin-top 은 카드(_card 의 margin-top:12px)와 같은 값이라 간격이 일정하다.
+           ⚠ '.st-key-phase_confirm' 도 navbar 와 같은 내부 클래스 의존이다. */
+        .st-key-phase_confirm {
+            background: #e9f7ef; border: 1px solid #9ae6b4;
+            border-radius: 8px; padding: 14px 16px; margin-top: 12px;
+        }
+        /* ①게이지·②버퍼 열 묶음도 다른 카드와 같은 간격(12px)을 갖게. */
+        .st-key-diag_row { margin-top: 12px; }
+        /* 한글은 CSS 기본값이 글자 단위로 끊긴다("줄었습니 / 다").
+           본문 텍스트를 어절 단위로 끊어 좁은 칸에서도 자연스럽게 접히게 한다. */
+        .block-container p, .block-container li,
+        .block-container h1, .block-container h2, .block-container h3 { word-break: keep-all; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -922,9 +938,16 @@ def _seg_style(is_output: bool, state: str) -> str:
     통일하고, 성격 차이는 **색 대비가 아니라 테두리 굵기**가 맡는다 — 출력 칸은 진한 파랑에
     3px 테두리를 회색 상태에서도 유지해 '여기서 뭔가 나온다'가 보이게 한다.
     """
+    # 높이를 **고정**한다. 예전엔 높이 지정이 없어 두 가지로 칸 높이가 흔들렸다.
+    #   ① 현재 칸이 볼드(font-weight:700)가 되면서 줄 상자 높이가 미세하게 커진다
+    #   ② box-sizing 기본값(content-box)이라 진단·결과 칸의 3px 테두리가 높이에 6px
+    #      더해진다 — 입력 칸과 애초에 높이가 달랐다
+    # height + line-height 로 글자 굵기와 무관하게 같은 높이가 되고, border-box 로
+    # 테두리를 높이 안에 넣는다. 글자는 flex 로 세로 가운데 정렬한다.
     base = (
-        "flex:1;white-space:nowrap;text-align:center;font-size:11px;"
-        "padding:4px 2px;border-radius:6px;"
+        "flex:1;white-space:nowrap;font-size:11px;box-sizing:border-box;"
+        "height:26px;line-height:1;display:flex;align-items:center;justify-content:center;"
+        "padding:0 2px;border-radius:6px;"
     )
     if is_output:  # 진단·결과 — 진한 파랑 + 3px 테두리(항상 유지)
         if state == "cur":
@@ -1080,12 +1103,27 @@ DEMO_PRESETS: dict[str, dict] = {
               rate_known=True, rate_pct=5.0, overdue_days=0,
               goal_months_on=True, goal_months=18,
               cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1)),
+    # C 의 is_closed=True 는 의도적이다. **끄면 두 가지가 같이 사라진다.**
+    #   ① 회복불가 국면의 폐업 지원 시연 — 끄면 pool 에 철거비·컨설팅·법률자문이 안 들어와
+    #      생존 축이 baseline 6 = 최선 6 으로 죽는다. 그러면 두 축 중 하나가 상수라
+    #      파레토 정렬을 쓰는 이유가 화면에서 안 읽힌다(부채는 4,026만 줄어드는데도).
+    #   ② 점포철거비의 `단가_평당 x 전용면적` 계산 경로 검증 — cond_area=20평이 실제로
+    #      쓰여 400만원이 나온다(상한 600만은 30평부터라 여기선 안 걸린다). 폐업을 끄면
+    #      면적이 아무 데도 안 쓰이는 죽은 값이 된다.
+    # 잃는 것: 소상공인 경영안정 바우처(비용감면 월 25만)가 '영업중' 전제라 pool 에서 빠진다.
+    #      C 에서만 빠지고 A·B 는 영향 없다. 유입이 아니라 월 25만 비용감면이라
+    #      생존·종료부채에 미치는 영향이 철거비 400만보다 작다(실측: 생존 6→8 은 철거비 몫).
     "C": dict(fixed_man=450, var_man=180, cash_man=1_900, debt_man=7_000, debt_pay_man=100,
               rate_known=True, rate_pct=9.0, overdue_days=120,
               goal_months_on=True, goal_months=12,
               cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
-              cond_area=20.0),
+              cond_area=20.0, is_closed=True),
 }
+
+
+# 세 프리셋 키의 **합집합**. 손으로 유지하는 목록을 두지 않는다 — 프리셋에 키를 추가하고
+# 목록 갱신을 빠뜨리면 조용히 틀리는(값만 새는) 배선 버그가 재발한다. 항상 dict 에서 뽑는다.
+_PRESET_KEYS = frozenset(k for preset in DEMO_PRESETS.values() for k in preset)
 
 
 def apply_demo_preset(scenario_key: str) -> None:
@@ -1094,12 +1132,22 @@ def apply_demo_preset(scenario_key: str) -> None:
     _applied_scenario 로 추적해 시나리오 변경 시에만 덮어쓴다 — 사용자가 값을 고친 뒤엔
     유지되고, 다른 시나리오로 바꾸면 그 프리셋으로 리셋된다. 재무/목표 위젯은 이 단계(②)가
     아니라 뒤 단계에서 렌더되므로, ans 를 먼저 바꿔두면 그 단계에 갈 때 반영된다.
+
+    **한 프리셋에만 있는 키는 다른 시나리오로 갈 때 지운다**(합집합 − 이번 프리셋).
+    dict.update 는 없는 키를 지우지 않아서, C(is_closed=True·cond_area=20)를 보고 A 로
+    넘어가면 A 가 폐업 상태로 계산된다 — 화면은 멀쩡하고 값만 틀리는 종류라 시연 중에
+    알아채기 어렵다. 지우면 위젯이 다시 그려질 때 제 기본값(False·0)으로 돌아간다.
+
+    사용자 수정 보존은 깨지지 않는다: 이 정리는 _applied_scenario 가 바뀌는 순간에만
+    돌고, 같은 시나리오 안에서 고친 값은 애초에 여기까지 오지 않는다.
     """
     ans = _answers()
     if ans.get("_applied_scenario") == scenario_key:
         return
     preset = DEMO_PRESETS.get(scenario_key)
     if preset:
+        for stale in _PRESET_KEYS - preset.keys():
+            ans.pop(stale, None)  # 다른 시나리오가 남긴 값 제거 (위젯 기본값으로 복귀)
         ans.update(preset)
     ans["_applied_scenario"] = scenario_key
 
@@ -1305,51 +1353,374 @@ def collect_eligibility() -> dict:
 
 def _phase_box(phase: str) -> None:
     """'진단 국면: X' 만 감싸는 박스. 폭을 내용에 맞추고 화면 가운데, 텍스트도 가운데."""
+    # 폭은 아래 카드 두 개를 합친 것과 같게(width:100%) — 좁으면 아래 카드와 어긋나 보인다.
+    # 글자는 그 안에서 가운데 정렬. 곡률은 카드(_CARD_RADIUS)와 맞춘다.
     st.markdown(
-        "<div style='display:flex;justify-content:center;margin:8px 0 14px 0;'>"
-        "<div style='border:2px solid #2b6cb0;border-radius:12px;padding:12px 32px;"
+        f"<div style='width:100%;box-sizing:border-box;border:2px solid #2b6cb0;"
+        f"border-radius:{_CARD_RADIUS};padding:12px 16px;margin:8px 0 0 0;"
         "text-align:center;font-size:1.4rem;font-weight:700;'>"
-        f"진단 국면: <span style='color:#2b6cb0'>{phase}</span></div></div>",
+        f"진단 국면: <span style='color:#2b6cb0'>{phase}</span></div>",
         unsafe_allow_html=True,
     )
 
 
-def _phase_gauge(total: int) -> None:
-    """0-8점 국면 눈금 + 현재 위치 세모. 경계는 phase.py 상수에서 가져온다(재입력 금지).
+def hard_rule_sentence(result) -> str | None:
+    """하드 규칙으로 국면이 확정됐을 때 국면 박스 아래 띄울 **한 줄**. 아니면 None.
 
-    범위 표기는 하이픈(1-2점)을 쓴다 — '~'는 마크다운 취소선(~~)으로 오인돼 글자가 사라진다.
+    판정 원인만 말한다. 지표 점수를 언급하지 않는다 — 묻지도 않은 것을 해명하면
+    오히려 "점수가 몇 점인데 왜?"라는 오해를 산다(게이지와 지표 표는 그대로 있다).
+
+    phase.py 의 하드 규칙 **3개와 1:1** 이다. 규칙을 늘리면 여기도 늘려야 한다.
+    모르는 이름이 오면 규칙 이름을 그대로 넣은 문장으로 떨어지므로 화면에서 티가 난다.
+        ① "폐업·휴업"           -> 회복불가
+        ② "{horizon}개월 미생존" -> 일시적자금난 (이름에 horizon 이 박혀 접미로 판별한다)
+        ③ "단일 지표 2점"        -> 개선여지
     """
-    bands = [
-        (0, 0, "정상", "#9aa0a6"),
-        (1, SCORE_TEMPORARY, "일시적자금난", "#2b6cb0"),
-        (SCORE_TEMPORARY + 1, SCORE_IMPROVABLE, "개선여지", "#dd6b20"),
-        (SCORE_IMPROVABLE + 1, 8, "회복불가", "#c0392b"),
-    ]
-    cells = []
-    for score in range(9):
-        color = next(c for lo, hi, _, c in bands if lo <= score <= hi)
-        # 현재 점수 칸: 큰 세모 + 바로 아래 '현재 N점'을 한 덩어리로.
-        if score == total:
-            mark = (
-                "<div style='color:#c0392b;font-weight:800;font-size:20px;line-height:1;"
-                "margin-top:1px;'>▲</div>"
-                f"<div style='color:#c0392b;font-size:11px;font-weight:700;white-space:nowrap;'>"
-                f"현재 {total}점</div>"
-            )
-        else:
-            mark = ""
-        cells.append(
-            f"<div style='flex:1;text-align:center;font-size:11px;'>"
-            f"<div style='height:10px;background:{color};border-radius:2px;'></div>{mark}</div>"
-        )
+    rule = getattr(result, "hard_rule", None)
+    if not rule:
+        return None
+    phase = result.phase
+    if rule == "폐업·휴업":
+        return f"폐업·휴업으로 인해 {phase} 국면으로 판정되었습니다."
+    if rule.endswith("미생존"):  # ② "36개월 미생존"
+        window = rule.replace(" 미생존", "")
+        return f"지원 없이는 {window} 안에 자금이 소진돼 {phase} 국면으로 판정되었습니다."
+    if rule == "단일 지표 2점":
+        return f"위험 신호가 뚜렷한 지표가 있어 {phase} 국면으로 판정되었습니다."
+    return f"{rule}(으)로 인해 {phase} 국면으로 판정되었습니다."
+
+
+def _hard_rule_line(result) -> None:
+    """하드 규칙 문장을 국면 박스 바로 아래에 한 줄로."""
+    sentence = hard_rule_sentence(result)
+    if not sentence:
+        return
     st.markdown(
-        "<div style='display:flex;gap:2px;margin-top:6px;'>" + "".join(cells) + "</div>",
+        "<div style='text-align:center;margin:-6px 0 14px 0;color:#4a5568;font-size:0.95rem;'>"
+        f"{sentence}</div>",
         unsafe_allow_html=True,
     )
-    legend = " ─ ".join(
-        (f"{lo}점 {name}" if lo == hi else f"{lo}-{hi}점 {name}") for lo, hi, name, _ in bands
+
+
+# 신호등 팔레트 — 초록 → 노랑 → 주황 → 빨강의 직관적 흐름은 유지하되, 원색 대신
+# 채도를 낮춘 톤을 쓴다(금융 앱 톤). 게이지와 지표 표가 **같은 팔레트**를 공유해
+# 한 화면에 두 색 언어가 섞이지 않게 한다.
+# 색만으로 구분하지 않는다 — 점수 숫자를 항상 함께 찍어 색각 이상이 있어도 읽힌다.
+_GREEN, _AMBER, _ORANGE, _RED = "#2E9E6B", "#E0B341", "#DE8A47", "#CF4E4E"
+_SCORE_COLORS = {0: _GREEN, 1: _AMBER, 2: _RED}
+_INK = "#1F2933"  # 본문 먹색 (순검정보다 부드럽다)
+
+
+def _darken(hex_color: str, ratio: float = 0.3) -> str:
+    """색을 그 색의 **어두운 톤**으로. 구간 테두리에 쓴다 — 검정 테두리는 얇은 띠에서
+    투박해 보이고, 각 영역의 어두운 톤이면 경계는 살면서 색을 해치지 않는다."""
+    value = hex_color.lstrip("#")
+    rgb = (int(value[i:i + 2], 16) for i in (0, 2, 4))
+    return "#" + "".join(f"{int(channel * (1 - ratio)):02x}" for channel in rgb)
+
+
+def _indicator_table_html(rows: list[tuple[str, int, str | None]]) -> str:
+    """지표 4종을 HTML 표로. 신호등 원(CSS) + 점수 + 상태 문장. 카드 안에 넣어 쓴다.
+
+    st.dataframe 을 쓰지 않는다 — CSS 원을 넣을 수 없고 스크롤·정렬 UI가 붙어 산만하다.
+    이모지 신호등도 쓰지 않는다(OS·브라우저마다 모양과 크기가 달라 행 높이가 흔들린다).
+
+    헤더 행은 두지 않았다. 4행짜리 표라 헤더가 시각 무게만 더하고, 열 내용이
+    (지표 이름 / "N점" / 설명 문장)으로 이미 자명하다.
+
+    폭은 table-layout:fixed 로 고정한다. 설명 문장 길이가 제각각이라 셋째 열이
+    남는 폭을 다 쓰게 하고, 지표·점수 열은 좁게 묶는다.
+    """
+    # 표 테두리는 카드 배경(#f0f2f6)보다 훨씬 어두워야 묻히지 않는다. 셀 배경을 흰색으로
+    # 깔아 카드 위에 표가 '얹힌' 형태로 보이게 한다.
+    border = "1px solid #4a5568"
+    # word-break:keep-all — CSS 기본값은 한글을 **글자 단위**로 끊어서 "줄었습니다"가
+    # "줄었습니 / 다"처럼 잘린다. keep-all 이면 어절 단위로 끊긴다.
+    pad = "padding:11px 14px;word-break:keep-all;"  # 글자가 테두리에 붙지 않게 여백도
+    cells = []
+    for name, score, msg in rows:
+        detail = msg if msg else ("문제 없음" if score == 0 else "위험 신호")
+        color = _SCORE_COLORS.get(score, "#718096")
+        dot = (
+            f"<span style='display:inline-block;width:15px;height:15px;border-radius:50%;"
+            f"background:{color};margin-right:9px;vertical-align:-3px;'></span>"
+        )
+        weight = "700" if score == 2 else "600" if score == 1 else "400"
+        cells.append(
+            f"<tr><td style='{pad}border:{border};color:#2d3748;'>{name}</td>"
+            f"<td style='{pad}border:{border};white-space:nowrap;color:{color};font-weight:{weight};'>"
+            f"{dot}{score}점</td>"
+            f"<td style='{pad}border:{border};color:#2d3748;'>{detail}</td></tr>"
+        )
+    return (
+        "<table style='table-layout:fixed;width:100%;border-collapse:collapse;background:#fff;"
+        f"font-size:1rem;line-height:1.45;border:{border};'>"
+        # 점수 열은 신호등 원 + 'N점'만 들어가면 되니 좁게 고정하고, 남는 폭은 설명(셋째
+        # 열)에 준다 — 설명이 제일 길어 줄바꿈이 여기서 생긴다.
+        "<colgroup><col style='width:30%'><col style='width:74px'><col></colgroup>"
+        "<tbody>" + "".join(cells) + "</tbody></table>"
     )
-    st.caption(legend)
+
+
+MAX_PHASE_SCORE = 8  # 지표 4종 x 2점
+
+# 국면 구간. 경계는 phase.py 상수에서 가져온다(숫자를 다시 쓰지 않는다).
+# 색은 지표 표 신호등(_SCORE_COLORS)과 **같은 계열**이다 — 한 화면에 두 색 언어가
+# 섞이지 않게. 초록(정상) - 노랑(일시적) - 주황(개선여지) - 빨강(회복불가).
+_PHASE_BANDS = [
+    (0, 0, "정상", _GREEN),
+    (1, SCORE_TEMPORARY, "일시적자금난", _AMBER),
+    (SCORE_TEMPORARY + 1, SCORE_IMPROVABLE, "개선여지", _ORANGE),
+    (SCORE_IMPROVABLE + 1, MAX_PHASE_SCORE, "회복불가", _RED),
+]
+
+
+# 카드 — 진단 화면의 네 덩어리(게이지 · 버퍼 · 매출 요약 · 지표 표)를 같은 모양으로 감싼다.
+# 곡률은 지원 내역 블록(st.container(border=True) = 0.5rem)과 맞춘다. 배경은 Streamlit
+# 보조 배경(#f0f2f6, 진행바 '남은 단계'에서도 쓴다)이라 화면 전체가 한 계열로 묶인다.
+_CARD_RADIUS = "8px"
+_CARD_BG = "#f0f2f6"
+_CARD = f"background:{_CARD_BG};border-radius:{_CARD_RADIUS};"
+
+
+def _card(inner: str, extra: str = "") -> str:
+    """옅은 회색 둥근 카드로 감싼 HTML 조각."""
+    return f"<div style='{_CARD}padding:14px 16px;{extra}'>{inner}</div>"
+
+
+# 말굽 게이지 — 아래가 트인 270°. 시작 225°(좌하) → 시계방향 → 끝 -45°(우하).
+# 안쪽 흰 공간이 넓어야 눈금 숫자가 들어간다.
+GAUGE_START_DEG, GAUGE_SWEEP_DEG = 225.0, 270.0
+# 세로만 눌러 납작하게(가로는 그대로). 호가 위로 올라가 아래에 '5 / 8점' 자리가 생긴다.
+GAUGE_SQUASH = 0.84
+
+
+def _gauge_point(cx: float, cy: float, r: float, frac: float) -> tuple[float, float]:
+    """게이지 호 위의 점. frac 0=시작(좌하), 1=끝(우하). y는 화면 좌표(아래로 증가).
+
+    **눈금 숫자·국면 라벨·바늘이 모두 이 함수를 쓴다.** 세로 압축을 여기 한 곳에 두면
+    셋이 같이 움직여 어긋나지 않는다.
+    """
+    angle = math.radians(GAUGE_START_DEG - frac * GAUGE_SWEEP_DEG)
+    return cx + r * math.cos(angle), cy - r * math.sin(angle) * GAUGE_SQUASH
+
+
+def _score_frac(score: float) -> float:
+    """점수 → 게이지 위 위치(0~1). **바늘과 눈금 숫자가 이 함수 하나만 쓴다.**
+
+    두 군데서 각도를 계산하면 바늘이 가리키는 자리와 숫자가 어긋난다. 점수 0..8 을
+    9칸으로 보고 각 칸의 **가운데**를 그 점수의 자리로 삼는다.
+    """
+    return (min(max(score, 0), MAX_PHASE_SCORE) + 0.5) / (MAX_PHASE_SCORE + 1)
+
+
+def _phase_gauge_svg(total: int) -> str:
+    """국면 눈금 — 자동차 계기판형 게이지(SVG) 문자열. 카드로 감싸 쓴다.
+
+    이전 가로 막대는 9칸을 균등 분할해, 0점 하나뿐인 '정상'과 3점 폭인 '개선여지'가
+    같은 비중으로 보였다. 여기서는 호의 길이를 **점수 폭에 비례**시킨다.
+
+    축은 0~8점이 아니라 **9칸**(점수 0..8 각각 한 칸)으로 잡는다. 그래야 구간 폭이
+    담고 있는 점수 개수와 정확히 같아지고(정상 1 · 일시적 2 · 개선여지 3 · 회복불가 3),
+    바늘을 칸 가운데(score + 0.5)에 놓을 수 있다.
+
+    **아래가 트인 270° 말굽**(GAUGE_START_DEG/SWEEP_DEG). 안쪽 흰 공간이 넓어야
+    눈금 숫자 0~8 이 들어간다. 호 양 끝은 둥글게(끝점에 반지름 t/2 원을 깔고 띠를 그 위에
+    덮어, 바깥으로 나온 반쪽만 둥근 마개로 남는다).
+
+    검정 윤곽 — 바깥·안쪽 가장자리를 각각 검정 호로 두르고, **9칸 전부**에 방사형 칸
+    구분선을 긋는다(점수 하나가 한 칸). 국면이 바뀌는 경계는 굵게(1.4), 같은 국면 안의
+    칸 경계는 가늘게(0.7) 그어 두 위계가 함께 읽히게 한다. 국면 경계값은 phase.py 의
+    SCORE_TEMPORARY·SCORE_IMPROVABLE 에서 온다(_PHASE_BANDS).
+
+    안쪽 = 눈금 숫자(호 안쪽 가장자리에 바짝, 수평, 검정, 작게), 바깥 = **국면명만**
+    (`<textPath>` 로 곡률을 따라 휜다). 호 바깥에 점수 범위를 또 쓰지 않는다 — 안쪽 눈금이
+    이미 점수를 말한다. 가운데도 비운다. 점수는 호 아래 '5 / 8점' 하나뿐이고, 숫자·분모가
+    **같은 크기**인 균일한 한 덩어리다.
+
+    눈금 각도는 `_score_frac()` **하나에서만** 나온다. 바늘도 같은 함수를 쓰므로 바늘이
+    5를 가리키면 그 자리에 5가 있다.
+
+    라벨이 뒤집히는 구간은 보조 호를 **반대 방향**으로 그린다. textPath 의 글자 윗방향은
+    진행 방향의 왼쪽인데, 시계방향으로 그리면 그 방향이 바깥(반지름 방향)이 된다.
+    화면 아래쪽(sin θ < 0, 좌하단)에서는 그게 아래를 향해 글자가 뒤집히므로, 그 구간만
+    반시계로 그려 되돌린다.
+
+    viewBox 는 그린 것들의 **실제 경계**로 잡는다(_bbox). 여백을 남겨두면 카드 안에서
+    아무리 키워도 그만큼 비어 보인다.
+
+    하드 규칙으로 확정된 경우에도 그대로 보여준다(원인 문구가 위에서 맥락을 설명한다).
+    """
+    cells = MAX_PHASE_SCORE + 1  # 9칸
+    cx, cy = 0.0, 0.0  # 원점 기준으로 그리고, 마지막에 viewBox 로 잘라낸다
+    thick = 34.0
+    r_mid = 126.0
+    r_in, r_out = r_mid - thick / 2, r_mid + thick / 2
+    r_tick = r_in - 11.0           # 눈금 숫자 — 띠 안쪽에 바짝
+    r_name = r_out + 16.0          # 바깥 라벨 — 국면명 한 줄
+    edge = "#111111"
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def mark(x: float, y: float, pad: float = 0.0) -> None:
+        xs.extend((x - pad, x + pad))
+        ys.extend((y - pad, y + pad))
+
+    def arc_d(r: float, f0: float, f1: float) -> str:
+        """f0 → f1 타원호(시계방향). 세로 압축 때문에 ry = r x GAUGE_SQUASH 다."""
+        x0, y0 = _gauge_point(cx, cy, r, f0)
+        x1, y1 = _gauge_point(cx, cy, r, f1)
+        large = 1 if abs(f1 - f0) * GAUGE_SWEEP_DEG > 180 else 0
+        return f"M {x0:.1f} {y0:.1f} A {r} {r * GAUGE_SQUASH:.1f} 0 {large} 1 {x1:.1f} {y1:.1f}"
+
+    bands, labels, seps = [], [], []
+    for lo, hi, name, color in _PHASE_BANDS:
+        f0, f1 = lo / cells, (hi + 1) / cells
+        # 띠를 **채운 부채꼴**로 그린다(두꺼운 선이 아니라). 타원에서는 굵은 선의 가장자리가
+        # 타원이 아니라서, 선으로 그리면 윤곽선(r_in·r_out 타원호)이 띠 가장자리와 어긋난다.
+        xi0, yi0 = _gauge_point(cx, cy, r_in, f0)
+        xi1, yi1 = _gauge_point(cx, cy, r_in, f1)
+        large = 1 if (f1 - f0) * GAUGE_SWEEP_DEG > 180 else 0
+        bands.append(
+            f"<path d='{arc_d(r_out, f0, f1)} L {xi1:.1f} {yi1:.1f} "
+            f"A {r_in} {r_in * GAUGE_SQUASH:.1f} 0 {large} 0 {xi0:.1f} {yi0:.1f} Z' "
+            f"fill='{color}'/>"
+        )
+        mid = (f0 + f1) / 2
+        # 호 바깥은 **국면명만**. 점수는 호 안쪽 눈금(0~8)이 이미 말하고 있어서
+        # 바깥에 '3-5점'을 또 쓰면 같은 정보가 두 번 나온다.
+        #
+        # 라벨은 곡률 없이 **수평**으로 놓는다(textPath 를 쓰지 않는다). 휘어 놓으면
+        # 구간마다 기운 각도가 달라 어떤 라벨은 눕고 어떤 라벨은 뒤집혀 읽힌다.
+        # 폭이 모자라면 폰트를 줄이지 않고 **줄을 나눈다**(일시적자금난 → 일시적/자금난).
+        size = 13.0
+        lines = [name] if len(name) <= 4 else [name[: (len(name) + 1) // 2], name[(len(name) + 1) // 2:]]
+        half_w = max(len(line) for line in lines) * size / 2
+        half_h = len(lines) * size * 1.15 / 2
+        # 라벨 상자가 호(r_out)에 닿지 않게 바깥으로 민다. 상자의 반폭·반높이를 각도에
+        # 투영한 만큼 더 밀어야, 가로로 긴 라벨(회복불가)도 옆구리가 호에 걸리지 않는다.
+        theta = math.radians(GAUGE_START_DEG - mid * GAUGE_SWEEP_DEG)
+        radius = r_out + 10 + half_w * abs(math.cos(theta)) + half_h * abs(math.sin(theta))
+        lx, ly = _gauge_point(cx, cy, radius, mid)
+        spans = "".join(
+            f"<tspan x='{lx:.1f}' dy='{0 if i == 0 else size * 1.15:.1f}'>{line}</tspan>"
+            for i, line in enumerate(lines)
+        )
+        labels.append(
+            f"<text x='{lx:.1f}' y='{ly - (len(lines) - 1) * size * 1.15 / 2:.1f}' "
+            f"text-anchor='middle' dominant-baseline='central' font-family='inherit' "
+            f"font-size='{size}' font-weight='700' fill='{edge}'>{spans}</text>"
+        )
+        mark(lx - half_w, ly - half_h)
+        mark(lx + half_w, ly + half_h)
+
+    # 칸 구분선 — **점수 하나가 한 칸**이라 9칸 전부를 나눈다(경계 8곳).
+    # 국면이 바뀌는 경계(_PHASE_BANDS 의 lo, 즉 phase.py 상수에서 온 값)는 굵게,
+    # 같은 국면 안의 칸 경계는 가늘게 그어 두 위계가 함께 읽히게 한다.
+    # 굵기는 띠 두께(thick)에 비례시킨다 — 띠를 바꿔도 선만 가늘어지지 않게.
+    # 윤곽선만 더 굵게(구간·칸 경계선은 그대로).
+    w_edge, w_phase, w_cell = thick * 0.13, thick * 0.115, thick * 0.06
+    phase_edges = {band[0] / cells for band in _PHASE_BANDS if band[0]}
+    for i in range(1, cells):
+        f = i / cells
+        bx0, by0 = _gauge_point(cx, cy, r_in, f)
+        bx1, by1 = _gauge_point(cx, cy, r_out, f)
+        seps.append(
+            f"<line x1='{bx0:.1f}' y1='{by0:.1f}' x2='{bx1:.1f}' y2='{by1:.1f}' "
+            f"stroke='{edge}' stroke-width='{w_phase if f in phase_edges else w_cell:.2f}'/>"
+        )
+
+    # 호 양 끝의 둥근 마개 — 띠를 그 위에 덮어 바깥 반쪽만 남긴다.
+    # 세로 압축 때문에 끝면(r_in~r_out)의 실제 길이가 각도마다 달라, 그 길이의 절반을
+    # 반지름으로 삼아야 마개가 띠 두께에 딱 맞는다.
+    caps = []
+    for f, color in ((0.0, _PHASE_BANDS[0][3]), (1.0, _PHASE_BANDS[-1][3])):
+        ix, iy = _gauge_point(cx, cy, r_in, f)
+        ox, oy = _gauge_point(cx, cy, r_out, f)
+        ex, ey = (ix + ox) / 2, (iy + oy) / 2
+        cap_r = math.hypot(ox - ix, oy - iy) / 2
+        caps.append(
+            f"<circle cx='{ex:.1f}' cy='{ey:.1f}' r='{cap_r:.1f}' fill='{color}' "
+            f"stroke='{edge}' stroke-width='{w_edge:.2f}'/>"
+        )
+        mark(ex, ey, cap_r + w_edge)
+
+    # 바깥·안쪽 윤곽선 (마개 원과 접선으로 이어진다)
+    outlines = [
+        f"<path d='{arc_d(r, 0.0, 1.0)}' fill='none' stroke='{edge}' "
+        f"stroke-width='{w_edge:.2f}'/>"
+        for r in (r_in, r_out)
+    ]
+    for f in (i / 40 for i in range(41)):  # 호 전체를 경계 계산에 넣는다
+        mark(*_gauge_point(cx, cy, r_out, f), w_edge)
+
+    # 눈금 숫자 0~8 — 수평, 검정, 작게. 각도는 바늘과 같은 _score_frac 에서만 나온다.
+    ticks = []
+    for score in range(cells):
+        tx, ty = _gauge_point(cx, cy, r_tick, _score_frac(score))
+        ticks.append(
+            f"<text x='{tx:.1f}' y='{ty:.1f}' text-anchor='middle' dominant-baseline='central' "
+            f"font-family='inherit' font-size='11.5' font-weight='600' fill='{edge}'>{score}</text>"
+        )
+        mark(tx, ty, 7.0)
+
+    # 바늘 — **회전축을 호가 트인 아래쪽으로 내린다**(중심이 아니다). 아래에 '5 / 8점'이
+    # 들어갈 자리는 남긴다.
+    #
+    # ⚠ 축을 내리면 "중심에서 눈금 각도만큼 회전"이 통하지 않는다. 축에서 본 방향과
+    # 원 중심에서 본 방향이 다르기 때문이다. 그래서 **눈금 좌표를 조준**한다 —
+    # 눈금 숫자를 놓을 때 쓴 그 점(_gauge_point + _score_frac)을 구하고, 새 축에서
+    # 그 점을 향하는 방향으로 그린다. 눈금과 바늘이 같은 좌표를 쓰므로 어긋날 수 없다.
+    # 회전축과 점수를 **함께** 같은 만큼 내린다(둘 사이 간격은 그대로). 호·눈금·라벨은
+    # 움직이지 않는다 — 이 값은 바늘과 점수에만 더한다.
+    drop = 12.0
+    pivot_y = cy + r_mid * GAUGE_SQUASH * 0.42 + drop
+    target_x, target_y = _gauge_point(cx, cy, r_tick, _score_frac(total))  # 눈금 숫자의 자리
+    span = math.hypot(target_x - cx, target_y - pivot_y) or 1.0
+    ux, uy = (target_x - cx) / span, (target_y - pivot_y) / span
+    tip_x, tip_y = target_x - ux * 9.0, target_y - uy * 9.0  # 숫자 안쪽 가장자리에서 멈춘다
+    px, py = -uy, ux  # 뿌리의 폭 방향
+    root = 7.0
+    needle = (
+        f"<polygon points='{tip_x:.1f},{tip_y:.1f} "
+        f"{cx + px * root:.1f},{pivot_y + py * root:.1f} "
+        f"{cx - px * root:.1f},{pivot_y - py * root:.1f}' fill='{edge}'/>"
+        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='{root + 1.5}' fill='{edge}'/>"
+        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='3.2' fill='#ffffff'/>"
+    )
+    # 점수 — 게이지 중심선(x = cx) 위, **말굽 양 끝과 같은 높이**. 글자 기준선을 호 끝의
+    # 세로 위치에 맞춰 나란히 보이게 한다.
+    score_size = 17.0
+    score_y = _gauge_point(cx, cy, r_mid, 0.0)[1] + drop  # 회전축과 같은 만큼 내린다
+    score_text = (
+        f"<text x='{cx}' y='{score_y:.1f}' text-anchor='middle' font-family='inherit' "
+        f"font-size='{score_size:.0f}' font-weight='700' fill='{edge}'>"
+        f"{total} / {MAX_PHASE_SCORE}점</text>"
+    )
+    # 글자 상자를 실제 크기로만 잡는다(넉넉한 정사각으로 잡으면 아래 여백이 부풀어
+    # viewBox 가 세로로 늘어난다). 기준선 위로 대문자 높이, 아래로 디센더.
+    score_half_w = len(f"{total} / {MAX_PHASE_SCORE}점") * score_size * 0.55 / 2
+    mark(cx - score_half_w, score_y - score_size * 0.78)
+    mark(cx + score_half_w, score_y + score_size * 0.26)
+
+    # viewBox — 여백을 **위아래끼리 · 좌우끼리** 맞춘다(위=아래, 좌=우. 두 쌍의 값이
+    # 서로 같을 필요는 없다). 경계는 국면 라벨과 '5 / 8점'까지 포함한 실제 내용 범위다.
+    #
+    # 좌우는 게이지 **중심선(cx) 기준 대칭**으로 잡는다 — 왼쪽 '일시적/자금난'은 두 줄,
+    # 오른쪽 '회복불가'는 한 줄이라 폭이 달라, 그냥 내용 상자에 맞추면 호가 한쪽으로
+    # 쏠려 보인다. 넓은 쪽에 맞춰 양쪽을 같게 한다.
+    # 위아래는 내용 위끝·아래끝에 같은 여백을 준다(호는 아래가 트여 있어 중심선 대칭이
+    # 성립하지 않는다 — 대칭으로 잡으면 아래에 빈 공간만 생긴다).
+    pad = 4.0
+    half_x = max(abs(min(xs) - cx), abs(max(xs) - cx)) + pad
+    min_x, width = cx - half_x, half_x * 2
+    min_y, height = min(ys) - pad, max(ys) - min(ys) + pad * 2
+    return (
+        f"<svg viewBox='{min_x:.1f} {min_y:.1f} {width:.1f} {height:.1f}' "
+        "preserveAspectRatio='xMidYMid meet' style='width:100%;height:100%;display:block;'>"
+        + "".join(caps) + "".join(bands) + "".join(outlines) + "".join(seps)
+        + "".join(ticks) + "".join(labels) + needle + score_text + "</svg>"
+    )
 
 
 def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: list[str]) -> None:
@@ -1366,48 +1737,115 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
         phase = st.session_state.get("phase_confirm", result.phase) if result.ambiguous else result.phase
 
         _phase_box(phase)
+        _hard_rule_line(result)  # 하드 규칙으로 확정됐으면 원인 한 줄 (국면 박스 바로 아래)
 
-        # 큰 숫자는 '버틸 수 있는 개월 수' 하나만, 가운데 정렬.
-        # (영업이익은 아래 지표 목록에 '영업이익 · N점'으로 이미 있어 중복이라 뺐다)
-        _, mid, _ = st.columns([1, 2, 1])
-        buf = months_label(result.buffer_months) if result.buffer_months is not None else "—"
-        mid.metric("지원 없이 버틸 수 있는 개월 수", buf)
+        # ①게이지 · ②버퍼 를 좌우 카드로 — 세로로 흩어지면 한 화면에 안 들어온다.
+        # 두 카드의 높이를 같게 맞추고(min-height) 내용은 세로 가운데 정렬한다.
+        # (영업이익은 아래 지표 표에 '영업이익 · N점'으로 이미 있어 중복이라 뺐다)
+        # 두 카드는 **폭·높이가 같다**(좌우 균등 분할 + 같은 height). 내용은 각 카드 안에서
+        # 가로·세로 모두 가운데. 게이지 SVG 는 viewBox 가 내용에 딱 맞고
+        # preserveAspectRatio=meet 이라, 카드 안쪽(패딩 제외)을 잘리지 않는 선에서 꽉 채운다.
+        # 카드 간격을 화면 전체에서 일정하게: 국면 박스 아래 margin 을 0으로 두고,
+        # ①②가 든 열 묶음에도 나머지 카드와 같은 margin-top(12px)을 준다
+        # (.st-key-diag_row). 그러지 않으면 이 줄만 간격이 달라 보인다.
+        # 높이는 게이지 viewBox 비율(약 1.7:1)에 맞춘다 — 카드가 그보다 높으면 게이지는
+        # 폭에 맞춰 커진 뒤 위아래에 빈 공간만 남아 작아 보인다. 두 카드 모두 같은 값.
+        card_h = "height:210px;display:flex;align-items:center;justify-content:center;"
+        with st.container(key="diag_row"):
+            left, right = st.columns([1, 1], vertical_alignment="center")
+            left.markdown(
+                _card(
+                    f"<div style='width:100%;height:100%;'>{_phase_gauge_svg(result.total)}</div>",
+                    card_h + "padding:8px;",
+                ),
+                unsafe_allow_html=True,
+            )
+            buf = months_label(result.buffer_months) if result.buffer_months is not None else "—"
+            right.markdown(
+                _card(
+                    # 라벨과 숫자가 붙어 보이지 않게 사이 여백을 주고, 둘 다 한 단계씩
+                    # 키운다(라벨은 본문보다 조금 크게, 숫자는 눈에 확 들어오게).
+                    "<div style='text-align:center;'>"
+                    "<div style='color:#4a5568;font-size:1.12rem;line-height:1.45;"
+                    "margin-bottom:16px;'>지원 없이 버틸 수 있는 개월 수</div>"
+                    f"<div style='font-size:3.1rem;font-weight:800;line-height:1.1;'>{buf}</div></div>",
+                    card_h,
+                ),
+                unsafe_allow_html=True,
+            )
 
-        # 매출 요약 — 한 줄, │ 구분, 본문 검정(caption 아님). 진단의 근거라 묻히면 안 된다.
+        # ③ 매출 요약 — 네 항목을 카드 **안쪽 폭** 기준으로 균등 분산(왼쪽 쏠림 방지).
+        # flex 가 카드 안에 있어 padding 을 뺀 폭으로 다시 계산된다.
+        # 진단의 근거라 caption 이 아니라 본문 색으로 둔다.
+        # 형광펜 — **변화율 세 항목만** 칠한다. '최근 3개월 평균 매출'은 절대값,
+        # '직전 3개월 대비'는 기준 설명이라 강조 대상이 아니다. 항목명과 수치를 한
+        # 덩어리로 칠해야 어색하지 않다(수치만 칠하면 항목명이 떠 보인다).
+        # 색은 옅은 온기 있는 노랑. 게이지 노랑(#E0B341)보다 채도를 크게 낮춰,
+        # 이미 색이 많은 진단 화면에서 상태색이 아니라 '형광펜'으로 읽히게 한다.
+        # 강조는 **글자 굵기로만**. 형광펜(배경색)은 뺐다 — 세로 padding 을 가진 상자와
+        # 맨 글자를 같은 높이로 맞추는 데 실패했고(인라인·baseline·flex 세 방식 모두
+        # 미세하게 어긋났다), 배경이 빠지면 그 문제가 아예 사라진다. 강조 효과는 굵기로
+        # 충분하고, 배경이 없으니 폭도 항목당 12px 씩 줄어 카드 여백으로 돌릴 수 있다.
+        em = "font-weight:700;"
+        summary_items = [
+            f"최근 3개월 평균 매출 {summary.recent_3m_avg / MAN:,.0f}만원",
+            f"직전 3개월 대비<span style='{em}'>매출 {summary.revenue_change_3m:+.1%}</span>",
+            f"<span style='{em}'>손님 수 {summary.order_count_change_3m:+.1%}</span>",
+            f"<span style='{em}'>객단가 {summary.avg_order_value_change_3m:+.1%}</span>",
+        ]
+        # 배치 (나) — 항목은 **내용 폭**으로 두고, 사이 여백을 전부 같게 한다.
+        # (가) 안(flex:1 로 칸을 나누고 칸 안에서 가운데 정렬)은 실측에서 전제가 깨졌다:
+        # 칸1·2 의 글자가 카드 폭의 1/4 보다 넓어 그 칸들은 글자 폭에 고정되고 칸3·4 만
+        # 같아진다(199/195/133/133). 칸도 구분선 간격도 균등하지 않으면서 항목별 여백만
+        # 6/6/18/24px 로 제각각이 된다. (나)는 남는 폭을 6개 틈에 똑같이 나눠 주므로
+        # **항목 사이 여백이 전부 같다** — 실제로 균등해 보이는 쪽이다.
+        # 구분자는 문자가 아니라 1px 세로선(div)이라 폭 계산에 끼어들지 않는다.
+        cell = "display:flex;align-items:center;gap:5px;"
+        line = "<div style='width:1px;background:#cbd5e0;align-self:stretch;'></div>"
         st.markdown(
-            f"최근 3개월 평균 매출 {summary.recent_3m_avg / MAN:,.0f}만원 │ "
-            f"직전 3개월 대비 {summary.revenue_change_3m:+.1%} │ "
-            f"손님 수 {summary.order_count_change_3m:+.1%} │ "
-            f"객단가 {summary.avg_order_value_change_3m:+.1%}"
+            _card(
+                "<div style='display:flex;flex-wrap:nowrap;align-items:stretch;"
+                "justify-content:space-between;line-height:1.45;color:#2d3748;"
+                "font-size:0.88rem;white-space:nowrap;'>"
+                + line.join(f"<div style='{cell}'>{item}</div>" for item in summary_items)
+                + "</div>",
+                # 형광펜을 빼서 생긴 폭(항목당 12px)을 **카드 좌우 여백으로** 돌린다 —
+                # 첫 항목이 카드 왼쪽 벽에 붙어 답답했다.
+                "margin-top:12px;padding:12px 22px;",
+            ),
+            unsafe_allow_html=True,
         )
 
-        if result.hard_rule:
-            st.markdown(f"**판정 근거: {result.hard_rule} (확정)**")
-
-        # 지표 4종 — 0점짜리도 전부. 2점은 눈에 띄게.
-        st.markdown(f"**지표 점수 (총 {result.total} / 8점)**")
-        for name, score, msg in phase_indicator_rows(profile, summary, revenue["current_revenue"]):
-            detail = msg if msg else ("문제 없음" if score == 0 else "위험 신호")
-            if score == 2:
-                st.markdown(f"- :red[**{name} · {score}점**] — {detail}")
-            elif score == 1:
-                st.markdown(f"- **{name} · {score}점** — {detail}")
-            else:
-                st.markdown(f"- :gray[{name} · {score}점 — {detail}]")
-        if result.hard_rule:
-            st.caption("하드 규칙으로 확정돼 점수는 판정에 쓰이지 않았습니다.")
-
-        _phase_gauge(result.total)
+        # ④ 지표 4종 — 제목까지 한 카드 안에. 0점짜리도 전부 보여준다.
+        st.markdown(
+            _card(
+                f"<div style='font-weight:700;margin-bottom:9px;'>"
+                f"지표 점수 (총 {result.total} / {MAX_PHASE_SCORE}점)</div>"
+                + _indicator_table_html(
+                    phase_indicator_rows(profile, summary, revenue["current_revenue"])
+                ),
+                "margin-top:12px;",
+            ),
+            unsafe_allow_html=True,
+        )
 
         for warning in summary.warnings:
             st.caption(f"⚠ {warning}")
 
         if result.ambiguous:
-            st.info("경계에 가까운 판정입니다. 맞는지 골라 주세요.")
-            _radio(
-                "국면이 맞나요?", "phase_confirm",
-                list(neighbor_phases(result)), result.phase, horizontal=True,
-            )
+            # 안내문 + 질문 + 라디오를 **한 블록**으로. 따로 두면 안내문과 질문이
+            # 분리돼 보인다. 배경·간격은 .st-key-phase_confirm CSS 가 맡는다.
+            with st.container(key="phase_confirm"):
+                st.markdown(
+                    "<div style='font-weight:700;margin-bottom:2px;'>경계에 가까운 판정입니다</div>"
+                    "<div style='color:#4a5568;'>점수가 국면 경계에 걸쳐 있어요. "
+                    "맞는지 골라 주세요.</div>",
+                    unsafe_allow_html=True,
+                )
+                _radio(
+                    "국면이 맞나요?", "phase_confirm",
+                    list(neighbor_phases(result)), result.phase, horizontal=True,
+                )
         _nav(S_DIAGNOSIS, fields)
         return
 
@@ -1493,10 +1931,20 @@ def main() -> None:
         ss.step = S_SITUATION
     _answers()  # 답 저장소 초기화 (위젯이 아니라서 purge 되지 않는다)
 
-    header = st.columns([5, 1])
+    # 헤더는 시작 화면에서만 크게. ② 이후로는 한 줄로 줄인다 — 큰 헤더가 화면 위쪽을
+    # 200px 가까이 먹어서 ◀ 이전 ▶ 다음 이 한 화면에 안 들어왔다.
+    # '처음부터'는 없애지 않는다(갈 곳이 없어진다). 작은 헤더 오른쪽 끝에 둔다.
+    header = st.columns([5, 1], vertical_alignment="center")
     with header[0]:
-        st.title("🧭 소상공인 나침반")
-        st.caption("융자·보조금·채무조정을 36개월 현금흐름으로 함께 계산해 정책 조합을 추천합니다.")
+        if ss.step == S_SITUATION:
+            st.title("🧭 소상공인 나침반")
+            st.caption("융자·보조금·채무조정을 36개월 현금흐름으로 함께 계산해 정책 조합을 추천합니다.")
+        else:
+            st.markdown(
+                "<div style='font-size:1.05rem;font-weight:700;padding:2px 0;'>"
+                "🧭 소상공인 나침반</div>",
+                unsafe_allow_html=True,
+            )
     with header[1]:
         if st.button("↻ 처음부터"):
             ss.clear()
