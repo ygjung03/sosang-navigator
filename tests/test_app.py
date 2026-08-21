@@ -113,25 +113,31 @@ def _back(at) -> None:
 
 
 def test_answers_survive_navigation():
-    """①~⑧ 기본값 통과 시 ③(비용)·④(부채) 답이 진단·이후 단계에서 살아 있는지.
-    이번 배선 버그(렌더 안 된 위젯 key 가 purge 돼 프로필이 0으로 조립됨)의 핵심 회귀."""
+    """기본 흐름(데모 시나리오 B) 통과 시 ③(비용)·④(부채) 답이 진단·이후 단계에서
+    살아 있는지. 이번 배선 버그(렌더 안 된 위젯 key 가 purge 돼 프로필이 0으로 조립됨)의
+    핵심 회귀. 기본 시나리오가 B 라 apply_demo_preset('B') 가 B 프리셋값을 넣는다 —
+    그래서 기대값이 위젯 기본값(500·200·…)이 아니라 B 프리셋(430·180·1500·2500)이다."""
     at = _fresh_app()
     seen = {}
     while at.session_state["step"] < app.S_DIAGNOSIS:
         _advance(at)
         seen[at.session_state["step"]] = _ans(at)
 
+    pB = app.DEMO_PRESETS["B"]
     a = _ans(at)  # 진단 단계에서
-    assert a.get("fixed_man") == 500, f"fixed_man 유실: {a.get('fixed_man')}"
-    assert a.get("var_man") == 200, f"var_man 유실: {a.get('var_man')}"
-    assert a.get("cash_man") == 1000, f"cash_man 유실: {a.get('cash_man')}"
-    assert a.get("debt_man") == 3000, f"debt_man 유실: {a.get('debt_man')}"
+    assert a.get("fixed_man") == pB["fixed_man"], f"fixed_man 유실: {a.get('fixed_man')}"
+    assert a.get("var_man") == pB["var_man"], f"var_man 유실: {a.get('var_man')}"
+    assert a.get("cash_man") == pB["cash_man"], f"cash_man 유실: {a.get('cash_man')}"
+    assert a.get("debt_man") == pB["debt_man"], f"debt_man 유실: {a.get('debt_man')}"
     # ⑤(연체·신용) 단계에서도 ③의 fixed_man 이 살아 있었는지 명시 확인 — 버그의 핵심
-    assert seen.get(app.S_DEBT2, {}).get("fixed_man") == 500, (
+    assert seen.get(app.S_DEBT2, {}).get("fixed_man") == pB["fixed_man"], (
         "⑤ 연체·신용 단계에서 ③ 비용 값이 사라졌다 — 배선 버그 재발"
     )
-    # UserProfile 로도 확인: collect_finance 가 answers 에서 읽어 조립한다
-    print("   ③④ 답이 진단까지 생존 · ⑤에서도 fixed_man=500 유지")
+    # 목표도 B 프리셋(18)이 들어갔는지 — 시나리오 선택이 목표 기본값을 갈아끼우는지 확인(#②)
+    assert a.get("goal_months") == pB["goal_months"], (
+        f"데모 B 목표 기본값 미적용: {a.get('goal_months')} (기대 {pB['goal_months']})"
+    )
+    print(f"   ③④ 답이 진단까지 생존 · ⑤에서도 fixed_man={pB['fixed_man']} · 목표={pB['goal_months']} 유지")
 
 
 def test_edit_and_return():
@@ -185,6 +191,40 @@ def test_slider_does_not_leak():
     print(f"   슬라이더 값 누출 없음 · 복귀 시 계산값으로 리셋({v0})")
 
 
+def _demo_baseline(scenario_key: str) -> int:
+    """데모 프리셋으로 무지원(조합 없음) 생존 개월수를 계산. app 의 데모 경로를 그대로 탄다."""
+    from core.cashflow import simulate
+
+    preset = app.DEMO_PRESETS[scenario_key]
+    summary = app.summarize_scenario(scenario_key, 12)
+    won = lambda man: int(man) * 10_000  # noqa: E731
+    finance = dict(
+        fixed_cost=won(preset["fixed_man"]), variable_cost=won(preset["var_man"]),
+        cash=won(preset["cash_man"]), debt=won(preset["debt_man"]),
+        debt_payment=won(preset["debt_pay_man"]), debt_rate=preset["rate_pct"] / 100,
+        high_rate_debt=None, overdue_days=preset["overdue_days"], policy_loan_balance=0,
+    )  # high_rate_debt 는 baseline(조합 없음)에 영향 없음 — 대환은 조합에서만 쓴다
+    profile = app.build_profile(finance, app.build_monthly_revenue(True, summary, 0), summary.recent_3m_avg)
+    return simulate(profile, []).survival_months
+
+
+def test_demo_goal_above_baseline():
+    """데모 목표(A 24·B 18·C 12)가 baseline(무지원 생존)보다 위인지 — 세 시나리오 전부.
+
+    목표 ≤ baseline 이면 filter_by_goal 이 전부 통과시켜 satisfied 가 자명해지고,
+    역산이 ~0 융자를 줘 B 의 거치 절벽도 안 뜬다. 재무값을 손대 baseline 이 움직이면
+    이 관계가 깨질 수 있어 여기서 못박는다(app.DEMO_PRESETS 주석 참조)."""
+    for key in ("A", "B", "C"):
+        base = _demo_baseline(key)
+        goal = app.DEMO_PRESETS[key]["goal_months"]
+        assert base < goal, (
+            f"[{key}] baseline {base}개월 ≥ 목표 {goal}개월 — 목표가 baseline 위가 아니라 "
+            f"filter_by_goal 이 무의미하다. 재무값을 손댔으면 DEMO_PRESETS 의 목표를 다시 잡을 것."
+        )
+        print(f"   [{key}] baseline {base} < 목표 {goal} ✓")
+    print("   데모 목표 > baseline 불변식 통과 (A/B/C)")
+
+
 def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
@@ -192,6 +232,7 @@ def main() -> None:
     test_money_to_man()
     test_months_label()
     test_no_direct_widget_calls()
+    test_demo_goal_above_baseline()
     test_answers_survive_navigation()
     test_edit_and_return()
     test_slider_does_not_leak()

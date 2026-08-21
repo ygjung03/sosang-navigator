@@ -1063,6 +1063,47 @@ def _file(label, key, **kw):
 # ── WIDGET WRAPPERS END ──
 
 
+# ── 데모 시나리오별 재무·목표 프리셋 ──
+#
+# ⚠ 목표(goal_months: A 24 · B 18 · C 12)는 **baseline(무지원 생존)보다 위**여야
+#   filter_by_goal 이 실제로 거른다(목표 ≤ baseline 이면 전부 통과해 satisfied 가 자명).
+#   재무값을 손대면 baseline 이 움직이므로 목표도 다시 잡아야 한다 —
+#   tests/test_app.py::test_demo_goal_above_baseline 이 이 관계를 지킨다.
+#   값 근거는 실측(2026-08-21): A 흑자+하드룰②+함정1·2·baseline13, B 거치절벽(goal>거치12),
+#   C 회복불가+satisfied=False+새출발 처방. A 의 36+ 미달은 trend_revenue 한계(planning 5.5).
+DEMO_PRESETS: dict[str, dict] = {
+    "A": dict(fixed_man=300, var_man=180, cash_man=1_900, debt_man=5_000, debt_pay_man=200,
+              rate_known=True, rate_pct=8.0, overdue_days=0,
+              goal_months_on=True, goal_months=24,
+              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1)),
+    "B": dict(fixed_man=430, var_man=180, cash_man=1_500, debt_man=2_500, debt_pay_man=70,
+              rate_known=True, rate_pct=5.0, overdue_days=0,
+              goal_months_on=True, goal_months=18,
+              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1)),
+    "C": dict(fixed_man=450, var_man=180, cash_man=1_900, debt_man=7_000, debt_pay_man=100,
+              rate_known=True, rate_pct=9.0, overdue_days=120,
+              goal_months_on=True, goal_months=12,
+              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
+              cond_area=20.0),
+}
+
+
+def apply_demo_preset(scenario_key: str) -> None:
+    """데모 시나리오의 재무·목표 프리셋을 ss.answers 에 넣는다. **시나리오가 바뀔 때만.**
+
+    _applied_scenario 로 추적해 시나리오 변경 시에만 덮어쓴다 — 사용자가 값을 고친 뒤엔
+    유지되고, 다른 시나리오로 바꾸면 그 프리셋으로 리셋된다. 재무/목표 위젯은 이 단계(②)가
+    아니라 뒤 단계에서 렌더되므로, ans 를 먼저 바꿔두면 그 단계에 갈 때 반영된다.
+    """
+    ans = _answers()
+    if ans.get("_applied_scenario") == scenario_key:
+        return
+    preset = DEMO_PRESETS.get(scenario_key)
+    if preset:
+        ans.update(preset)
+    ans["_applied_scenario"] = scenario_key
+
+
 # ── 답 수집 (위젯을 그리지 않고 ss.answers 에서만 읽는다) ──
 
 
@@ -1159,10 +1200,11 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
     if source == "데모 시나리오":
         from data.synthetic_pos import SCENARIOS
 
-        _select(
+        scenario_key = _select(
             "시나리오", "scenario_key", list(SCENARIOS.keys()), "B",
             format_func=lambda k: f"{k} — {SCENARIOS[k].name}",
         )
+        apply_demo_preset(scenario_key)  # 시나리오의 재무·목표 프리셋을 ans 에 적용(변경 시에만)
         # 12개월 고정. 그보다 짧으면 반기 비교(직전 6개월 vs 그 전 6개월)가 계산되지
         # 않아 자격·국면 판정이 달라진다. generate(months=)는 개발용이라 노출하지 않는다.
         st.caption("추세·반기 비교를 위해 12개월치로 생성합니다.")
