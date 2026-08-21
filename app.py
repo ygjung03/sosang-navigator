@@ -323,25 +323,35 @@ def build_context(
 
 def _phase_inputs(
     profile: UserProfile, summary: pos.PosSummary, current_revenue: int
-) -> tuple[float, float, float]:
-    """국면 지표의 세 입력값 (월 영업이익 · 월 이자비용 · 매출감소율)."""
+) -> tuple[float, float, float, int]:
+    """국면 지표의 입력값 (월 영업이익 · 월 이자비용 · 매출감소율 · 그 감소율의 비교 개월 수).
+
+    감소율은 분기·반기 중 큰 쪽이라 **실제 채택된 단위가 그때그때 다르다.** 개월 수를
+    함께 넘겨야 근거 문장이 "최근 6개월 …"처럼 실제 기간을 말한다(반기 값을 3개월이라
+    쓰면 매출 요약 바의 3개월 수치와 어긋나 보인다).
+    """
     operating_profit = current_revenue * (1 - profile.variable_ratio) - profile.fixed_cost
     rate = profile.existing_debt_rate or 0.0
     interest_cost = profile.existing_debt * rate / 12
-    drop_rate = summary.drop_rate(("분기", "반기"))
-    return operating_profit, interest_cost, drop_rate
+    drop_rate, window = summary.drop_rate_detail(("분기", "반기"))
+    # 단위가 안 잡히면(데이터 부족) 감소율이 0.0 이라 0점 → 문장이 없다. 기본 3을 준다.
+    window_months = pos.COMPARE_WINDOWS.get(window or "", 3)
+    return operating_profit, interest_cost, drop_rate, window_months
 
 
 def judge_phase(
     profile: UserProfile, summary: pos.PosSummary, current_revenue: int, is_closed: bool
 ) -> PhaseResult:
     """지표 4종 + 하드 규칙으로 국면을 판정한다."""
-    operating_profit, interest_cost, drop_rate = _phase_inputs(profile, summary, current_revenue)
+    operating_profit, interest_cost, drop_rate, drop_months = _phase_inputs(
+        profile, summary, current_revenue
+    )
     buffer_months = simulate(profile, []).survival_months
     return judge(
         operating_profit=operating_profit,
         interest_cost=interest_cost,
         revenue_drop_rate=drop_rate,
+        revenue_drop_window_months=drop_months,
         overdue_days=profile.overdue_days,
         is_closed=is_closed,  # 하드 규칙 ①: 폐업·휴업 확정이면 회복불가
         buffer_months=buffer_months,
@@ -357,10 +367,12 @@ def phase_indicator_rows(
     지표별로 매핑되지 않는다. 그래서 판정과 **같은 입력**으로 score_* 를 다시 불러
     지표별 (점수, 문장)을 얻는다. 계산을 바꾸는 게 아니라 표시용으로 재사용하는 것이다.
     """
-    operating_profit, interest_cost, drop_rate = _phase_inputs(profile, summary, current_revenue)
+    operating_profit, interest_cost, drop_rate, drop_months = _phase_inputs(
+        profile, summary, current_revenue
+    )
     return [
         ("ICR (이자 대비 영업이익)", *score_icr(operating_profit, interest_cost)),
-        ("매출 감소", *score_revenue_drop(drop_rate)),
+        ("매출 감소", *score_revenue_drop(drop_rate, drop_months)),
         ("연체", *score_overdue(profile.overdue_days)),
         ("영업이익", *score_operating_profit(operating_profit)),
     ]

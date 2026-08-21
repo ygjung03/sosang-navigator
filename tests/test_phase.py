@@ -66,10 +66,16 @@ def test_icr_boundary() -> None:
     assert score_icr(99 * MAN, cost)[0] == 2
     # 부채가 없으면 이자 부담 자체가 없다
     assert score_icr(-50 * MAN, 0)[0] == 0
-    # 적자면 비율이 음수라 문구를 만들지 않는다(영업이익 지표가 담당)
+    # 적자면 비율(음수)은 감추되 **문장은 준다.** 예전에는 문장도 비웠는데(영업이익
+    # 지표가 같은 사실을 말한다는 이유), 근거를 표로 보여주게 되면서 네 줄 중 한 칸만
+    # 비어 값이 빠진 것처럼 보였다. 영업이익은 '적자다', ICR 은 '그래서 이자를 못
+    # 감당한다'로 서로 다른 것을 말한다.
     point, message = score_icr(-50 * MAN, cost)
-    assert point == 2 and message is None
-    print("  ✓ ICR 1.0 / 1.5 경계, 무부채·적자 처리")
+    assert point == 2
+    assert message and "이자" in message and "배율" not in message, (
+        f"적자 케이스는 비율 없이 이유만 말해야 한다: {message!r}"
+    )
+    print("  ✓ ICR 1.0 / 1.5 경계, 무부채·적자 처리(적자는 비율 없이 문장만)")
 
 
 def test_revenue_drop_boundary() -> None:
@@ -80,7 +86,12 @@ def test_revenue_drop_boundary() -> None:
     assert score_revenue_drop(0.40)[0] == 2
     # 매출이 늘었으면 당연히 0점
     assert score_revenue_drop(-0.1)[0] == 0
-    print("  ✓ 매출 감소 15% / 40% 경계")
+    # 문장의 기간은 **실제 채택된 비교 단위**를 따른다. 감소율은 분기·반기 중 큰 쪽을
+    # 쓰므로 반기가 뽑히면 6개월이라고 말해야 한다(3개월 고정이면 화면 수치와 어긋난다).
+    assert "최근 6개월" in score_revenue_drop(0.21, 6)[1]
+    assert "최근 3개월" in score_revenue_drop(0.21, 3)[1]
+    assert score_revenue_drop(0.10, 6)[1] is None  # 0점이면 기간을 말할 일이 없다
+    print("  ✓ 매출 감소 15% / 40% 경계 · 문장 기간이 비교 단위를 따름")
 
 
 def test_overdue_boundary() -> None:

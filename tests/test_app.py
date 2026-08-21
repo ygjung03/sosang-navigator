@@ -256,6 +256,77 @@ def test_debt_relief_reaches_confirmation():
     print(f"   [C] baseline {base} >= 채무조정 적용시점 {relief_at} ✓")
 
 
+def test_drop_window_label_matches():
+    """매출 감소 근거 문장의 기간이 **실제 채택된 비교 단위**와 같은지.
+
+    감소율은 분기·반기 중 큰 쪽을 쓰는데(제도가 "여러 단위 중 하나만 충족하면 된다"),
+    문장은 오래도록 "최근 3개월"로 고정돼 있었다. 반기가 채택되면 6개월 값을 3개월이라
+    말하게 되고, 화면 위쪽 매출 요약 바(항상 3개월)와 숫자가 어긋나 보인다.
+    판정에는 영향이 없어(둘 다 15~40% 구간이면 같은 1점) 눈에 안 띄는 종류라 못박는다.
+    """
+    from core import pos as _pos
+
+    won = lambda man: int(man) * 10_000  # noqa: E731
+    for key in ("A", "B", "C"):
+        preset = app.DEMO_PRESETS[key]
+        summary = app.summarize_scenario(key, 12)
+        finance = dict(
+            fixed_cost=won(preset["fixed_man"]), variable_cost=won(preset["var_man"]),
+            cash=won(preset["cash_man"]), debt=won(preset["debt_man"]),
+            debt_payment=won(preset["debt_pay_man"]), debt_rate=preset["rate_pct"] / 100,
+            high_rate_debt=None, overdue_days=preset["overdue_days"], policy_loan_balance=0,
+        )
+        profile = app.build_profile(
+            finance, app.build_monthly_revenue(True, summary, 0), summary.recent_3m_avg
+        )
+        rate, window = summary.drop_rate_detail(("분기", "반기"))
+        months = _pos.COMPARE_WINDOWS[window]
+        rows = app.phase_indicator_rows(profile, summary, summary.recent_3m_avg)
+        sentence = next(msg for name, _, msg in rows if name == "매출 감소")
+        if sentence is None:  # 감소율이 경계 미만이면 0점이라 문장이 없다
+            assert rate < 0.15, f"[{key}] 문장이 없는데 감소율이 {rate:.1%}다"
+            print(f"   [{key}] 감소율 {rate:.1%} < 15% → 문장 없음(0점) ✓")
+            continue
+        assert f"최근 {months}개월" in sentence and f"그 전 {months}개월" in sentence, (
+            f"[{key}] 채택 단위는 {window}({months}개월)인데 문장은 '{sentence}' 다 — "
+            "기간 표현이 실제 계산과 어긋난다."
+        )
+        print(f"   [{key}] 채택 {window}({months}개월) {rate:.0%} → '{sentence}' ✓")
+
+    # 단위별로 문장이 실제로 갈리는지(같은 값이라도 개월 수가 다르면 다른 문장)
+    from core.phase import score_revenue_drop
+
+    assert "최근 6개월" in score_revenue_drop(0.21, 6)[1]
+    assert "최근 3개월" in score_revenue_drop(0.21, 3)[1]
+    print("   score_revenue_drop 이 개월 수를 문장에 반영 ✓")
+
+
+def test_reason_sentences_end_with_period():
+    """근거 문장은 전부 완결 문장이라 마침표로 끝난다(명사구 폴백은 제외).
+
+    표로 바뀌면서 문장 끝이 제각각이면 눈에 띈다. 화면에서 붙이지 않고 phase.py 에서
+    통일한다 — 같은 문장이 LLM 프롬프트로도 나가기 때문이다."""
+    from core.phase import (
+        score_icr, score_operating_profit, score_overdue, score_revenue_drop,
+    )
+
+    produced = [
+        score_icr(-50_000, 300_000),        # 적자 → 이자 감당 불가
+        score_icr(400_000, 300_000),        # 흑자지만 여유 없음
+        score_icr(100_000, 300_000),        # 흑자, 감당 못함
+        score_revenue_drop(0.21, 6),
+        score_revenue_drop(0.45, 3),
+        score_overdue(15),
+        score_overdue(120),
+        score_operating_profit(-170_000),
+    ]
+    for _, msg in produced:
+        assert msg is not None and msg.endswith("."), f"마침표 없음: {msg!r}"
+    # ICR 적자 케이스가 비어 있지 않은지 — 표에서 한 칸만 비면 값이 빠진 것처럼 보인다
+    assert score_icr(-50_000, 300_000)[1], "ICR 적자 케이스의 근거 문장이 비어 있다"
+    print(f"   근거 문장 {len(produced)}종 전부 마침표로 끝남 · ICR 적자 문장 채워짐 ✓")
+
+
 def _drive(scenarios: list[str]) -> dict:
     """시나리오를 순서대로 골라가며 결과 단계까지 몰고, 최종 answers 를 돌려준다."""
     at = _fresh_app()
@@ -340,6 +411,8 @@ def main() -> None:
     test_no_direct_widget_calls()
     test_demo_goal_above_baseline()
     test_debt_relief_reaches_confirmation()
+    test_drop_window_label_matches()
+    test_reason_sentences_end_with_period()
     test_conditional_gating()
     test_preset_switch_no_leak()
     test_answers_survive_navigation()

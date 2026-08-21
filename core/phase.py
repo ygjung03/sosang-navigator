@@ -275,32 +275,42 @@ def score_icr(operating_profit: float, interest_cost: float) -> tuple[int, str |
     if interest_cost <= 0:
         return 0, None
     if operating_profit <= 0:
-        # 적자면 비율이 음수가 되어 사용자에게 의미가 없다. 점수만 주고
-        # 문구는 영업이익 지표가 담당한다(같은 사실을 두 번 말하지 않는다).
-        return 2, None
+        # 적자면 비율이 음수가 되어 사용자에게 의미가 없다. **비율만 감추고 문장은 준다.**
+        # (예전에는 문장도 비웠다 — "같은 사실을 영업이익 지표가 이미 말한다"는 이유였다.
+        #  근거를 표로 보여주게 되면서 전제가 달라졌다. 네 줄 중 한 칸만 비면 값이
+        #  빠진 것처럼 보인다. 영업이익 지표는 '적자다', 여기서는 '그래서 이자를 못
+        #  감당한다'로 서로 다른 것을 말한다.)
+        return 2, "영업이익이 적자라 이자를 감당할 수 없습니다."
     icr = operating_profit / interest_cost
     if icr >= ICR_SAFE:
         return 0, None
     if icr >= ICR_RISK:
-        return 1, f"이자보상배율 {icr:.2f} — 이자는 내지만 여유가 없습니다"
+        return 1, f"이자보상배율 {icr:.2f} — 이자는 내지만 여유가 없습니다."
     return 2, (
         f"이자보상배율 {icr:.2f} — 영업이익 {operating_profit / 10_000:,.0f}만원으로 "
-        f"월 이자 {interest_cost / 10_000:,.0f}만원을 감당하지 못합니다"
+        f"월 이자 {interest_cost / 10_000:,.0f}만원을 감당하지 못합니다."
     )
 
 
-def score_revenue_drop(drop_rate: float) -> tuple[int, str | None]:
+def score_revenue_drop(drop_rate: float, window_months: int = 3) -> tuple[int, str | None]:
     """매출 감소율 점수.
 
     Args:
         drop_rate: 매출 감소율(0~1). 분기 비교와 반기 비교 중 큰 값을 넣는다.
             0.22면 22% 감소. 증가했으면 음수를 넣어도 된다.
+        window_months: 그 값이 **실제로 나온 비교 단위의 개월 수**(분기 3 · 반기 6).
+            문장의 기간 표현에 쓴다 — 반기 값을 "3개월"이라고 쓰면 화면의 다른 수치와
+            어긋나 보인다. 단위 이름 대신 개월 수를 받는 이유는 '분기→3' 매핑이
+            pos.COMPARE_WINDOWS 에 있어서다(phase 가 pos 에 기대지 않게 한다).
+            **단위가 안 잡히면(감소율 0.0) 0점이라 문장 자체가 없다** — 기본값이
+            문장에 새어 나가지 않는다.
     """
     if drop_rate < DROP_WARN:
         return 0, None
+    span = f"최근 {window_months}개월 매출이 그 전 {window_months}개월보다"
     if drop_rate < DROP_SEVERE:
-        return 1, f"최근 3개월 매출이 그 전 3개월보다 {drop_rate:.0%} 줄었습니다"
-    return 2, f"최근 3개월 매출이 그 전 3개월보다 {drop_rate:.0%} 급감했습니다"
+        return 1, f"{span} {drop_rate:.0%} 줄었습니다."
+    return 2, f"{span} {drop_rate:.0%} 급감했습니다."
 
 
 def score_overdue(overdue_days: int) -> tuple[int, str | None]:
@@ -308,15 +318,15 @@ def score_overdue(overdue_days: int) -> tuple[int, str | None]:
     if overdue_days < OVERDUE_WARN:
         return 0, None
     if overdue_days < OVERDUE_SEVERE:
-        return 1, f"연체 {overdue_days}일째입니다"
-    return 2, f"연체가 {overdue_days}일로 3개월을 넘었습니다"
+        return 1, f"연체 {overdue_days}일째입니다."
+    return 2, f"연체가 {overdue_days}일로 3개월을 넘었습니다."
 
 
 def score_operating_profit(operating_profit: float) -> tuple[int, str | None]:
     """영업이익 부호 점수. 흑자 0점 / 적자 2점."""
     if operating_profit > 0:
         return 0, None
-    return 2, f"월 영업이익이 {operating_profit / 10_000:,.0f}만원으로 적자입니다"
+    return 2, f"월 영업이익이 {operating_profit / 10_000:,.0f}만원으로 적자입니다."
 
 
 def judge(
@@ -324,6 +334,7 @@ def judge(
     operating_profit: float,
     interest_cost: float,
     revenue_drop_rate: float,
+    revenue_drop_window_months: int = 3,
     overdue_days: int,
     is_closed: bool,
     buffer_months: int,
@@ -335,6 +346,9 @@ def judge(
         operating_profit: 월 영업이익 (매출 − 변동비 − 고정비). 원 단위.
         interest_cost:    월 이자비용 (기존 부채 x 연금리 / 12). 부채가 없으면 0.
         revenue_drop_rate: 매출 감소율 (0~1). 분기 비교와 반기 비교 중 큰 값.
+        revenue_drop_window_months: 그 값이 나온 비교 단위의 개월 수(분기 3 · 반기 6).
+            근거 문장의 기간 표현에만 쓰이고 점수에는 영향이 없다.
+            `PosSummary.drop_rate_detail()` 이 돌려주는 단위를 그대로 넘기면 된다.
         overdue_days:     현재 연체 일수.
         is_closed:        폐업·휴업 확정 여부.
         buffer_months:    무지원 생존 개월수. `cashflow.simulate(profile)` 결과.
@@ -346,7 +360,7 @@ def judge(
     """
     parts: list[tuple[str, int, str | None]] = [
         ("ICR", *score_icr(operating_profit, interest_cost)),
-        ("매출감소", *score_revenue_drop(revenue_drop_rate)),
+        ("매출감소", *score_revenue_drop(revenue_drop_rate, revenue_drop_window_months)),
         ("연체", *score_overdue(overdue_days)),
         ("영업이익", *score_operating_profit(operating_profit)),
     ]

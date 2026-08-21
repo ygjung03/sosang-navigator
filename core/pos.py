@@ -209,11 +209,16 @@ class PosSummary:
     """정확도에 영향을 주는 사항. 화면에 그대로 노출한다."""
 
     # ── 파생 ──
-    def drop_rate(self, windows: Sequence[str]) -> float:
-        """주어진 비교 단위 중 **가장 큰 감소율**. 0.22면 22% 감소.
+    def drop_rate_detail(self, windows: Sequence[str]) -> tuple[float, str | None]:
+        """감소율을 고르는 **원본 로직**. 여기만 고치면 된다(`drop_rate` 는 얇은 래퍼).
 
+        주어진 비교 단위 중 가장 큰 감소율과 **그 값이 나온 단위 이름**을 함께 준다.
         제도가 "여러 단위 중 하나만 충족하면 된다"고 하므로 최대를 쓴다.
-        매출이 늘었으면 음수가 나온다.
+        매출이 늘었으면 감소율이 음수가 된다.
+
+        단위 이름을 함께 돌려주는 이유: 화면 문구가 "최근 3개월 …"처럼 기간을 말하는데,
+        최대를 취하면 실제 채택된 단위가 분기일 수도 반기일 수도 있다. 값만 받으면
+        기간 표현이 실제와 어긋난다(반기 값을 3개월이라고 쓰는 식).
 
         Args:
             windows: '월'·'분기'·'반기'·'연도' 중 쓸 것들.
@@ -221,14 +226,23 @@ class PosSummary:
                 ('분기', '반기')를 넘긴다.
 
         Returns:
-            해당 단위가 하나도 계산되지 않았으면 0.0(감소 없음으로 본다).
+            (감소율, 단위 이름). 해당 단위가 하나도 계산되지 않았으면 (0.0, None) —
+            데이터가 2N개월에 못 미치면 그 단위는 None 으로 남기 때문이다.
         """
         rates = [
-            -change
+            (-change, name)
             for name in windows
             if (change := self.revenue_change_by_window.get(name)) is not None
         ]
-        return max(rates) if rates else 0.0
+        return max(rates) if rates else (0.0, None)
+
+    def drop_rate(self, windows: Sequence[str]) -> float:
+        """`drop_rate_detail()` 에서 **값만 꺼내는 얇은 래퍼**. 로직은 그쪽에 있다.
+
+        기간까지 말해야 하는 화면 문구는 `drop_rate_detail()` 을 쓴다. 여기를 고칠
+        일이 생기면 `drop_rate_detail()` 을 고쳐야 둘이 갈라지지 않는다.
+        """
+        return self.drop_rate_detail(windows)[0]
 
     @property
     def count_contribution(self) -> float | None:
