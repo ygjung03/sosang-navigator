@@ -1393,22 +1393,36 @@ def hard_rule_sentence(result) -> str | None:
         return None
     phase = result.phase
     if rule == "폐업·휴업":
+        # 점수와 판정이 어긋나지 않는다(폐업이면 점수도 대개 높다). 앞머리가 필요 없다.
         return f"폐업·휴업으로 인해 {phase} 국면으로 판정되었습니다."
     if rule.endswith("미생존"):  # ② "36개월 미생존"
         window = rule.replace(" 미생존", "")
-        return f"지원 없이는 {window} 안에 자금이 소진돼 {phase} 국면으로 판정되었습니다."
+        return (
+            f"현재 기준으로는 정상이나, 지원 없이는 {window} 안에 자금이 소진돼 "
+            f"{phase} 국면으로 판정되었습니다."
+        )
     if rule == "단일 지표 2점":
-        return f"위험 신호가 뚜렷한 지표가 있어 {phase} 국면으로 판정되었습니다."
+        return (
+            f"총점은 낮으나, 위험 신호가 뚜렷한 지표가 있어 "
+            f"{phase} 국면으로 판정되었습니다."
+        )
     return f"{rule}(으)로 인해 {phase} 국면으로 판정되었습니다."
 
 
 def _hard_rule_line(result) -> None:
-    """하드 규칙 문장을 국면 박스 바로 아래에 한 줄로."""
+    """하드 규칙 문장을 국면 박스 아래 **옅은 주황 카드**로.
+
+    맨 텍스트로 두면 국면 박스에 붙어 떠 보인다. 아래 카드들(옅은 회색)과 구분되게
+    주황 계열을 쓰되, 게이지·신호등의 주황(#DE8A47)보다 훨씬 옅게 잡아 상태색으로
+    읽히지 않게 한다. 폭·곡률·간격은 다른 카드와 같다.
+    """
     sentence = hard_rule_sentence(result)
     if not sentence:
         return
     st.markdown(
-        "<div style='text-align:center;margin:-6px 0 14px 0;color:#4a5568;font-size:0.95rem;'>"
+        f"<div style='width:100%;box-sizing:border-box;background:#FCEFE0;"
+        f"border-radius:{_CARD_RADIUS};padding:12px 18px;margin-top:12px;"
+        "text-align:center;color:#4a5568;font-size:0.95rem;line-height:1.5;'>"
         f"{sentence}</div>",
         unsafe_allow_html=True,
     )
