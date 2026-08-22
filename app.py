@@ -69,6 +69,7 @@ from core.cashflow import (
     Applied,
     UserProfile,
     flat_revenue,
+    month_display,
     simulate,
     trend_revenue,
 )
@@ -453,15 +454,15 @@ def _cliff_marker(evaluated: Evaluated, report) -> tuple[int, str] | None:
     if cliff is None:
         return None
     at = cliff.at
-    result = evaluated.result
-    principal = result.principal_during[at - 1] if 0 < at <= len(result.principal_during) else 0.0
-    # 만기일시 융자면 '만기 일시상환', 아니면 거치 종료 후 원금 상환 시작
+    # **금액을 쓰지 않는다.** 막대 높이가 이미 "여기서 꺾인다"를 보여주고, 정확한 금액은
+    # 바로 아래 함정 경고가 시점과 함께 말한다. 여기서 원금만 떼어 적으면(예전 동작)
+    # 경고문의 총액과 어긋나 보인다 — 같은 회차의 다른 구성인데 라벨이 그걸 안 밝혔다.
     is_bullet = any(
         it.candidate.is_loan and it.candidate.get("상환방식") == "만기일시"
         for it in evaluated.combo.items
     )
-    label = "만기 일시상환" if is_bullet else "원금 상환 시작"
-    return at, f"{label} {principal / MAN:,.0f}만원"
+    label = "만기 일시상환" if is_bullet else "상환액 증가"
+    return at, f"{at}개월차부터 {label}"
 
 
 def render_flow_chart(evaluated: Evaluated, key: str, report=None) -> None:
@@ -562,19 +563,17 @@ def render_support_detail(evaluated: Evaluated, baseline_first_payment: float) -
 
 
 def render_traps(report) -> None:
-    """함정 경고 + 회색지대 원본 숫자."""
+    """함정 경고.
+
+    예전에는 아래에 '월 상환액 N만원 / 월 영업이익 …' 캡션을 함께 뒀는데 **뺐다.**
+    그 값은 payment_now(=1회차)라 **거치 중이라 상환액이 가장 낮은 시점**이다.
+    부담률을 그 시점으로 계산하면 실제보다 안전해 보이게 만든다 — 부담이 커지는 것은
+    거치가 끝난 뒤다. 게다가 화면에 상환액이 시점을 안 밝힌 채 여러 번 나와, 같은 값을
+    다르게 말하는 것처럼 읽혔다. 상환액은 **시점을 밝히는** 함정 경고와 상환 스케줄 표가
+    맡는다.
+    """
     for trap in report.traps:
         st.warning(f"⚠ {trap.message}")
-    if report.burden_ratio_now is not None:
-        st.caption(
-            f"월 상환액 {report.payment_now / MAN:,.0f}만원 / "
-            f"월 영업이익 {report.operating_now / MAN:,.0f}만원 ({report.burden_ratio_now:.0%})"
-        )
-    else:
-        st.caption(
-            f"월 상환액 {report.payment_now / MAN:,.0f}만원 "
-            f"(월 영업이익 {report.operating_now / MAN:,.0f}만원 — 적자라 부담률 산출 불가)"
-        )
 
 
 def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Evaluated:
@@ -642,31 +641,95 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
     return adjusted
 
 
-def build_schedule_df(result) -> pd.DataFrame:
-    """상환 스케줄 표(만원). SimResult 가 이자/원금을 나눠 담으므로 그대로 읽는다.
+def schedule_rows(result) -> list[dict]:
+    """상환 스케줄 행들(만원). **기존 부채 / 신규 융자로 나눠** 각각 원금·이자·잔액.
 
-    payment_during == interest_during + principal_during 이 보장되므로(cashflow.py),
-    debt_at 차분으로 역산하던 근사(융자 실행 달에 어긋남)가 필요 없다.
+    나누는 이유: 합계만 보이면 "1년 거치인데 왜 1회차부터 원금이 나가지?"에 답이 없다.
+    그 원금은 기존 부채분이고 신규 융자는 거치 중이라 0이다. 나눠 놓으면 신규 원금이
+    0 → 76 으로 바뀌는 자리가 그대로 거치 절벽의 근거가 된다.
 
-    상환이 끝난 뒤 **끝에서부터 전부 0인 행은 잘라낸다.** 거치 중 원금만 0인 중간
-    행은 다른 열이 0이 아니라 남는다. 기존 부채가 남아 잔액이 0이 아니면 자연히
-    36회차까지 나온다.
+    원금과 이자를 합치지 않는다. 합치면 7.6 → 83.8 로 숫자만 커져 거치가 안 보인다.
+    합계 열(옛 '상환원리금')도 두지 않는다 — 옆을 더하면 나오는 값이라 정보가 없고,
+    총액은 함정 경고가 시점과 함께 말한다.
+
+    반올림은 cashflow.month_display 한 곳에서만 한다(표와 문장이 같은 값을 쓰게).
+
+    자르는 규칙 둘 중 **먼저 걸리는 쪽**:
+      · 자금이 소진되면 그 시점까지만 — 잔고가 마른 뒤의 상환은 일어나지 않는 일이고,
+        그래프는 이미 거기서 끊기는데 표만 계속되면 어긋나 보인다.
+      · 끝에서부터 전부 0인 행은 잘라낸다(상환이 끝난 뒤). 거치 중 원금만 0인 중간
+        행은 다른 열이 0이 아니라 남는다.
     """
-    money_cols = ("원금상환액(월)", "대출이자(월)", "상환원리금", "대출잔액")
-    rows = [
-        {
+    last = len(result.payment_during)
+    if not result.survives_full_term:
+        last = min(last, result.survival_months)
+    rows = []
+    for m in range(1, last + 1):
+        cells = month_display(result, m)
+        rows.append({
             "회차": m,
-            "원금상환액(월)": round(result.principal_during[m - 1] / MAN),
-            "대출이자(월)": round(result.interest_during[m - 1] / MAN),
-            "상환원리금": round(result.payment_during[m - 1] / MAN),
-            "대출잔액": round(result.debt_at[m] / MAN),
-        }
-        for m in range(1, len(result.payment_during) + 1)
-    ]
+            "원금(기존)": cells.existing_principal,
+            "이자(기존)": cells.existing_interest,
+            "잔액(기존)": cells.existing_debt,
+            "원금(신규)": cells.new_principal,
+            "이자(신규)": cells.new_interest,
+            "잔액(신규)": cells.new_debt,
+        })
+    money_cols = [c for c in (rows[0] if rows else {}) if c != "회차"]
     while rows and all(rows[-1][c] == 0 for c in money_cols):
         rows.pop()
-    df = pd.DataFrame(rows)
-    return df.set_index("회차") if not df.empty else df
+    return rows
+
+
+def render_schedule_table(result) -> None:
+    """상환 스케줄을 **2단 헤더** HTML 표로. 기존/신규를 먼저 가르고 그 안에서 원금·이자·잔액.
+
+    st.dataframe 은 2단 헤더를 못 그린다. 열 이름을 '원금(기존)'처럼 풀어 쓰면 7열이
+    폭을 넘겨서, 상단에 그룹 헤더를 두고 아래는 '원금·이자·잔액'만 쓴다.
+    그룹 사이에는 진한 세로 구분선을 넣되, **색·선만으로 뜻을 전하지 않게** 그룹 이름
+    텍스트를 반드시 함께 둔다.
+    """
+    rows = schedule_rows(result)
+    if not rows:
+        st.caption("상환 일정이 없습니다.")
+        return
+    div = "border-left:2px solid #4a5568;"  # 기존/신규 그룹 경계
+    thin = "1px solid #cbd5e0"
+    head = (
+        "<thead>"
+        f"<tr style='background:#eef1f5;'><th rowspan='2' style='border:{thin};padding:6px 8px;'>회차</th>"
+        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;'>기존 부채</th>"
+        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;'>신규 융자</th></tr>"
+        f"<tr style='background:#f6f8fa;'>"
+        + "".join(
+            f"<th style='border:{thin};{div if i % 3 == 0 else ''}padding:5px 8px;'>{name}</th>"
+            for i, name in enumerate(("원금", "이자", "잔액", "원금", "이자", "잔액"))
+        )
+        + "</tr></thead>"
+    )
+    body = "".join(
+        "<tr>"
+        + f"<td style='border:{thin};padding:4px 8px;text-align:center;'>{r['회차']}</td>"
+        + "".join(
+            f"<td style='border:{thin};{div if i % 3 == 0 else ''}padding:4px 8px;"
+            f"text-align:right;'>{r[key]:,}</td>"
+            for i, key in enumerate(
+                ("원금(기존)", "이자(기존)", "잔액(기존)", "원금(신규)", "이자(신규)", "잔액(신규)")
+            )
+        )
+        + "</tr>"
+        for r in rows
+    )
+    st.markdown(
+        "<div style='max-height:320px;overflow:auto;'>"
+        "<table style='width:100%;border-collapse:collapse;font-size:0.85rem;'>"
+        + head + "<tbody>" + body + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+    if not result.survives_full_term and len(rows) >= result.survival_months:
+        st.caption(
+            f"{result.survival_months}개월차에 자금이 소진되어 이후는 표시하지 않습니다."
+        )
 
 
 def render_group_card(
@@ -714,18 +777,19 @@ def render_group_card(
         # 표에 내용이 더 있다는 걸 알린다. st.dataframe 은 캔버스 기반 그리드라
         # 스크롤바를 항상 보이게 하는 CSS가 먹지 않는다(마우스를 올려야 나타난다).
         # 그래서 CSS에 의존하지 않는 방법을 쓴다 — 제목에 총 회차, 표 아래에 스크롤 안내.
-        schedule = build_schedule_df(shown.result)
-        rows = len(schedule)
+        # 회차 수는 표와 같은 함수에서 세어 제목과 표가 어긋나지 않게 한다
+        # (슬라이더로 금액이 바뀌면 소진 시점이 움직여 표 길이도 따라 바뀐다).
+        # 열 이름에서 '(월)' 을 뺐으므로 단위 표기에 '월'을 함께 밝힌다.
+        rows = len(schedule_rows(shown.result))
         title = (
-            f"상환 스케줄 보기 (총 {rows}회차 · 단위: 만원)" if rows
-            else "상환 스케줄 보기 (단위: 만원)"
+            f"상환 스케줄 보기 (총 {rows}회차 · 월 단위 금액, 만원)" if rows
+            else "상환 스케줄 보기 (월 단위 금액, 만원)"
         )
         with st.expander(title):
-            st.caption("대출잔액은 기존 부채와 신규 융자를 합친 값입니다.")
-            if schedule.empty:
-                st.caption("상환 일정이 없습니다.")
-            else:
-                st.dataframe(schedule, use_container_width=True, height=280)
+            # 옛 문구('대출잔액은 기존 부채와 신규 융자를 합친 값입니다')는 지웠다 —
+            # 이제 잔액도 기존/신규로 나뉘어 있어 틀린 말이 된다.
+            render_schedule_table(shown.result)
+            if rows > 8:
                 st.caption("↕ 스크롤하여 전체 보기")
 
         render_traps(report)

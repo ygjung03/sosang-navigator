@@ -676,6 +676,40 @@ class SimResult:
     notes: list[str] = field(default_factory=list)
     """적용 내역을 사람이 읽을 수 있게 정리한 문장들."""
 
+    # ── 기존 부채 / 신규 융자 분해 ──
+    # 합계만으로는 "1년 거치인데 왜 1회차부터 원금이 나가지?"에 화면이 답하지 못한다.
+    # 그 원금은 기존 부채분이고 신규 융자는 거치 중이라 0인데, 합쳐 놓으면 구분이 안 된다.
+    # 새로 계산하는 게 아니라 이미 내부에서 쓰던 값을 꺼내 둘 뿐이다(상환연장·대환이
+    # 기존분을 변형한 뒤의 값이 담긴다).
+    #
+    # ⚠ 이 배열들은 **약정 스케줄**이다. 반면 payment_during 등 합계 배열은 **실제로
+    #   나간 돈**이라 파산한 달부터 0으로 동결된다(가정 F1). 따라서
+    #   `합계 == existing + new` 는 **생존 구간(1..survival_months)에서만** 성립한다.
+    #   화면 표도 생존 구간까지만 그리므로 그 안에서는 항상 맞는다.
+    existing_payment_during: list[float] = field(default_factory=list)
+    """유량 — 기존 부채의 월 상환액(약정)."""
+
+    existing_interest_during: list[float] = field(default_factory=list)
+    """유량 — 기존 부채 상환액 중 이자분."""
+
+    existing_principal_during: list[float] = field(default_factory=list)
+    """유량 — 기존 부채 상환액 중 원금분."""
+
+    existing_debt_at: list[float] = field(default_factory=list)
+    """저량 — 기존 부채 잔액. 길이 horizon+1."""
+
+    new_payment_during: list[float] = field(default_factory=list)
+    """유량 — 신규 융자(대환 포함)의 월 상환액(약정)."""
+
+    new_interest_during: list[float] = field(default_factory=list)
+    """유량 — 신규 융자 상환액 중 이자분."""
+
+    new_principal_during: list[float] = field(default_factory=list)
+    """유량 — 신규 융자 상환액 중 원금분. **거치 중에는 0** 이라, 화면에서 거치가 보인다."""
+
+    new_debt_at: list[float] = field(default_factory=list)
+    """저량 — 신규 융자 잔액. 길이 horizon+1."""
+
     @property
     def survival_label(self) -> str:
         """화면 표기용. 끝까지 버티면 '36개월+'."""
@@ -1133,6 +1167,95 @@ def simulate(
         survives_full_term=survives,
         forgiven=forgiven,
         notes=notes,
+        existing_payment_during=old_payment_during,
+        existing_interest_during=old_interest_during,
+        existing_principal_during=old_principal_during,
+        existing_debt_at=old_debt_at,
+        new_payment_during=new_payment_during,
+        new_interest_during=new_interest_during,
+        new_principal_during=new_principal_during,
+        new_debt_at=new_debt_at,
+    )
+
+
+# ══════════════════════════════════════════════════════════
+# 화면 표시용 반올림 (표·문장이 같은 값을 쓰게 하는 단일 지점)
+# ══════════════════════════════════════════════════════════
+
+MAN = 10_000
+
+
+@dataclass
+class MonthDisplay:
+    """한 회차를 화면에 쓸 때의 **만원 단위 표시값**. 전부 정수다.
+
+    합이 맞는다: `total == principal + interest` 이고
+    `principal == existing_principal + new_principal`,
+    `interest == existing_interest + new_interest`,
+    `debt == existing_debt + new_debt`.
+    """
+
+    total: int
+    principal: int
+    interest: int
+    existing_principal: int
+    existing_interest: int
+    new_principal: int
+    new_interest: int
+    debt: int
+    existing_debt: int
+    new_debt: int
+
+
+def month_display(result: SimResult, month: int) -> MonthDisplay:
+    """한 회차(1-based)의 표시값. **표와 함정 경고가 이 함수 하나만 쓴다.**
+
+    각자 반올림하면 화면의 덧셈이 안 맞는다 — `round(a+b) != round(a)+round(b)` 이기
+    때문이다(실측: 데모 3종 1,132회차 중 216건에서 어긋났다. 절벽 시점도 포함이라
+    "154만원 (원금 139 + 이자 15)" 같은 문장이 조합에 따라 합이 틀렸다).
+
+    그래서 **총액을 기준으로 잡고 잔차를 이자에 몰아준다.** 원금이 거치 절벽의
+    주인공이고 금액도 커서 그쪽을 정확히 두고, 이자가 잔차를 받는다.
+    잔차는 **이자 중 실제 값이 큰 쪽**이 받는다 — 0인 항목(예: 신규 융자가 없는 조합의
+    신규 이자)에 잔차가 붙어 없던 돈이 생기지 않게 한다.
+
+    ⚠ 그 대가로 **이자 표시가 실제 반올림값과 최대 1만원 다를 수 있다.**
+      눈에 보이는 덧셈 오류보다 이쪽이 낫다고 판단했다.
+
+    잔액도 같은 규칙이다(합계를 반올림하고 신규 쪽이 잔차를 받는다) — 표에서 두 잔액을
+    더한 값이 다른 화면의 '종료 시점 부채'와 어긋나지 않게.
+    """
+    i = month - 1
+    ex_p = result.existing_principal_during[i] if i < len(result.existing_principal_during) else 0.0
+    ex_i = result.existing_interest_during[i] if i < len(result.existing_interest_during) else 0.0
+    nw_p = result.new_principal_during[i] if i < len(result.new_principal_during) else 0.0
+    nw_i = result.new_interest_during[i] if i < len(result.new_interest_during) else 0.0
+
+    total = round(result.payment_during[i] / MAN)
+    ex_p_d, nw_p_d = round(ex_p / MAN), round(nw_p / MAN)
+    interest = total - (ex_p_d + nw_p_d)  # 잔차를 이자 쪽으로
+    # 이자 내부 배분 — 실제 값이 큰 쪽이 잔차를 받는다
+    if ex_i >= nw_i:
+        nw_i_d = round(nw_i / MAN)
+        ex_i_d = interest - nw_i_d
+    else:
+        ex_i_d = round(ex_i / MAN)
+        nw_i_d = interest - ex_i_d
+
+    ex_debt = result.existing_debt_at[month] if month < len(result.existing_debt_at) else 0.0
+    debt = round(result.debt_at[month] / MAN) if month < len(result.debt_at) else 0
+    ex_debt_d = round(ex_debt / MAN)
+    return MonthDisplay(
+        total=total,
+        principal=ex_p_d + nw_p_d,
+        interest=interest,
+        existing_principal=ex_p_d,
+        existing_interest=ex_i_d,
+        new_principal=nw_p_d,
+        new_interest=nw_i_d,
+        debt=debt,
+        existing_debt=ex_debt_d,
+        new_debt=debt - ex_debt_d,
     )
 
 

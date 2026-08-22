@@ -327,6 +327,150 @@ def test_reason_sentences_end_with_period():
     print(f"   근거 문장 {len(produced)}종 전부 마침표로 끝남 · ICR 적자 문장 채워짐 ✓")
 
 
+def _demo_evals(key: str):
+    """데모 시나리오 하나의 (profile, 전체 조합 평가, 그룹, 리포트)."""
+    import datetime as _dt  # noqa: F401  (프리셋의 date 값 사용)
+
+    preset = app.DEMO_PRESETS[key]
+    summary = app.summarize_scenario(key, 12)
+    won = lambda man: int(man) * 10_000  # noqa: E731
+    finance = dict(
+        fixed_cost=won(preset["fixed_man"]), variable_cost=won(preset["var_man"]),
+        cash=won(preset["cash_man"]), debt=won(preset["debt_man"]),
+        debt_payment=won(preset["debt_pay_man"]), debt_rate=preset["rate_pct"] / 100,
+        high_rate_debt=None, overdue_days=preset["overdue_days"], policy_loan_balance=0,
+    )
+    profile = app.build_profile(
+        finance, app.build_monthly_revenue(True, summary, 0), summary.recent_3m_avg
+    )
+    phase = {"A": "일시적자금난", "B": "개선여지", "C": "회복불가"}[key]
+    ctx = app.build_context(
+        phase,
+        dict(region="서울", restart_status="안함", is_closed=preset.get("is_closed", False),
+             tax_delinquent=False, include_loans=True, credit_score=None),
+        dict(business_started=preset["cond_bstart"], store_area_pyeong=preset.get("cond_area"),
+             policy_loan_count_5y=0),
+        summary, summary.rolling_annual_revenue,
+    )
+    groups, reports, evals, *_ = app.run_pipeline(
+        app.load_db(), profile, ctx, None, preset["goal_months"]
+    )
+    return profile, evals, groups, reports
+
+
+def test_simresult_split_identity():
+    """SimResult 의 기존/신규 분해가 합계와 어긋나지 않는지.
+
+    노출한 배열은 **약정 스케줄**이고 합계 배열은 **실제로 나간 돈**이라, 파산 후에는
+    합계가 0으로 동결돼(가정 F1) 항등식이 깨진다. 그래서 **생존 구간만** 본다 —
+    화면 표도 그 범위까지만 그린다. 상환연장·대환이 기존분을 변형하는 조합에서도
+    성립해야 한다(비율 축소·구간 0 처리를 거친 값이 그대로 담기기 때문)."""
+    checked = adjusted = 0
+    for key in ("A", "B", "C"):
+        _, evals, _, _ = _demo_evals(key)
+        for ev in evals:
+            res = ev.result
+            if {"상환연장", "대환전환"} & {it.candidate.effect for it in ev.combo.items}:
+                adjusted += 1
+            for m in range(1, res.survival_months + 1):
+                i = m - 1
+                checked += 1
+                for name, total, ex, nw in (
+                    ("상환", res.payment_during, res.existing_payment_during, res.new_payment_during),
+                    ("이자", res.interest_during, res.existing_interest_during, res.new_interest_during),
+                    ("원금", res.principal_during, res.existing_principal_during, res.new_principal_during),
+                ):
+                    assert abs(total[i] - (ex[i] + nw[i])) < 1.0, (
+                        f"[{key}] {ev.label} {m}회차 {name}: 합계 {total[i]:,.0f} != "
+                        f"기존 {ex[i]:,.0f} + 신규 {nw[i]:,.0f}"
+                    )
+                assert abs(res.debt_at[m] - (res.existing_debt_at[m] + res.new_debt_at[m])) < 1.0
+    assert adjusted, "상환연장·대환이 든 조합이 하나도 없어 그 경로가 검증되지 않았다"
+    print(f"   합계 == 기존+신규 · 생존 구간 {checked:,}회차 (상환연장·대환 조합 {adjusted}개 포함) ✓")
+
+
+def test_month_display_sums():
+    """화면에 나가는 모든 회차에서 **표시값의 덧셈이 맞는지**.
+
+    round(a+b) != round(a)+round(b) 라서 각자 반올림하면 화면의 덧셈이 틀어진다
+    (이 테스트를 넣기 전 실측에서 1,132회차 중 216건이 어긋났고, 절벽 시점도 있었다.
+    "154만원 (원금 139 + 이자 15)" 같은 문장의 합이 조합에 따라 안 맞았다).
+    month_display 가 잔차를 이자에 몰아 항상 맞게 한다."""
+    from core.cashflow import month_display
+
+    checked = 0
+    for key in ("A", "B", "C"):
+        _, evals, _, _ = _demo_evals(key)
+        for ev in evals:
+            res = ev.result
+            for m in range(1, res.survival_months + 1):
+                d = month_display(res, m)
+                checked += 1
+                assert d.total == d.principal + d.interest, f"[{key}] {m}회차 총액 {d}"
+                assert d.principal == d.existing_principal + d.new_principal, f"[{key}] {m}회차 원금 {d}"
+                assert d.interest == d.existing_interest + d.new_interest, f"[{key}] {m}회차 이자 {d}"
+                assert d.debt == d.existing_debt + d.new_debt, f"[{key}] {m}회차 잔액 {d}"
+    print(f"   표시값 덧셈 일치 · {checked:,}회차 ✓")
+
+
+def test_trap_message_matches_table():
+    """함정 경고의 숫자와 상환 스케줄 표의 숫자가 **같은 회차에서 일치**하는지.
+
+    문장과 표가 각자 반올림하면 같은 13회차인데 이자가 15 / 14 로 갈린다.
+    둘 다 month_display 를 거치게 해서 막는다."""
+    import re as _re
+
+    seen = 0
+    for key in ("A", "B", "C"):
+        _, _, groups, reports = _demo_evals(key)
+        for group in groups:
+            member = group.members[0]
+            report = reports[member.label]
+            if not report.cliff_at:
+                continue
+            cliff = next((t for t in report.traps if t.at == report.cliff_at), None)
+            if cliff is None:
+                continue
+            seen += 1
+            rows = app.schedule_rows(member.result)
+            assert len(rows) >= report.cliff_at, "절벽 회차가 표 밖이면 나란히 볼 수 없다"
+            row = rows[report.cliff_at - 1]
+            total, principal, interest = (
+                int(_re.search(r"월 상환액 ([\d,]+)만원", cliff.message).group(1).replace(",", "")),
+                int(_re.search(r"원금 ([\d,]+)", cliff.message).group(1).replace(",", "")),
+                int(_re.search(r"이자 ([\d,]+)", cliff.message).group(1).replace(",", "")),
+            )
+            assert total == principal + interest, f"문장 덧셈 불일치: {cliff.message}"
+            assert principal == row["원금(기존)"] + row["원금(신규)"], (
+                f"[{key}] 문장 원금 {principal} != 표 {row['원금(기존)']}+{row['원금(신규)']}"
+            )
+            assert interest == row["이자(기존)"] + row["이자(신규)"], (
+                f"[{key}] 문장 이자 {interest} != 표 {row['이자(기존)']}+{row['이자(신규)']}"
+            )
+    assert seen, "절벽 함정이 있는 조합이 없어 검증되지 않았다"
+    print(f"   함정 경고 ↔ 표 숫자 일치 · 절벽 조합 {seen}개 ✓")
+
+
+def test_schedule_stops_at_exhaustion():
+    """표가 자금 소진 시점에서 끊기는지. 그래프는 거기서 끝나는데 표만 36회차까지
+    이어지면 어긋나 보이고, 잔고가 마른 뒤의 상환은 일어나지 않는 일이다.
+    36개월을 버티는 조합은 끝까지 보여준다."""
+    stopped = full = 0
+    for key in ("A", "B", "C"):
+        _, evals, _, _ = _demo_evals(key)
+        for ev in evals:
+            rows = app.schedule_rows(ev.result)
+            if ev.result.survives_full_term:
+                full += 1
+                assert len(rows) <= len(ev.result.payment_during)
+            else:
+                stopped += 1
+                assert len(rows) <= ev.result.survival_months, (
+                    f"[{key}] 생존 {ev.result.survival_months}개월인데 표가 {len(rows)}행이다"
+                )
+    print(f"   소진 조합 {stopped}개는 생존 시점까지만 · 완주 조합 {full}개는 끝까지 ✓")
+
+
 def _drive(scenarios: list[str]) -> dict:
     """시나리오를 순서대로 골라가며 결과 단계까지 몰고, 최종 answers 를 돌려준다."""
     at = _fresh_app()
@@ -413,6 +557,10 @@ def main() -> None:
     test_debt_relief_reaches_confirmation()
     test_drop_window_label_matches()
     test_reason_sentences_end_with_period()
+    test_simresult_split_identity()
+    test_month_display_sums()
+    test_trap_message_matches_table()
+    test_schedule_stops_at_exhaustion()
     test_conditional_gating()
     test_preset_switch_no_leak()
     test_answers_survive_navigation()

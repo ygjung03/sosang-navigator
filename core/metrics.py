@@ -90,7 +90,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
 
-from .cashflow import SIM_MONTHS, SimResult, UserProfile, simulate
+from .cashflow import SIM_MONTHS, SimResult, UserProfile, month_display, simulate
 from .combos import Combo, Evaluated
 
 # 상환액이 이만큼 뛰면 '원금 상환이 시작되었다'고 본다.
@@ -255,13 +255,15 @@ def _check_cliff(result: SimResult, horizon: int) -> tuple[Trap | None, int | No
     if result.survives_full_term:
         return None, cliff_at
 
-    payment_after = result.payment_during[cliff_at - 1]
+    # 표시값은 month_display 한 곳에서만 만든다 — 상환 스케줄 표와 **같은 값**을 써야
+    # 나란히 놓았을 때 어긋나지 않는다(각자 반올림하면 원금+이자가 총액과 안 맞는다).
+    cells = month_display(result, cliff_at)
     trap = Trap(
         kind=TrapKind.CLIFF,
         message=(
-            f"{cliff_at}개월차부터 월 상환 {payment_after / MAN:,.0f}만원이 "
-            f"시작되면서 잔고가 다시 줄어, "
-            f"{result.survival_months}개월차에 소진됩니다."
+            f"{cliff_at}개월차부터 월 상환액 {cells.total:,}만원 "
+            f"(원금 {cells.principal:,} + 이자 {cells.interest:,})이 시작되면서 "
+            f"잔고가 다시 줄어, {result.survival_months}개월차에 소진됩니다."
         ),
         at=cliff_at,
     )
