@@ -127,6 +127,7 @@ S_DIAGNOSIS = 5
 S_CONDITIONAL = 6
 S_GOALS = 7
 S_RESULTS = 8
+S_DONE = 9        # 완료 화면. 단계가 아니라 '끝'이라 진행바에 칸을 더하지 않는다.
 
 
 def won(man: float) -> int:
@@ -516,7 +517,9 @@ def render_flow_chart(
     fig.update_xaxes(range=[-0.5, SIM_MONTHS + 0.5], dtick=6, title_text="개월차")
     # (만원)은 우상단 '단위: 만원'이 대신한다. SI 접두어(40k) 없이 40,000 로.
     fig.update_yaxes(
-        range=[0, y_top * 1.22], title_text="현금잔고",  # 값 라벨이 막대와 겹치지 않게 위 여백 확보
+        # 두 줄짜리 라벨(지원 없었다면 N개월 · N개월차부터 상환액 증가)이 들어갈
+        # 위 여백을 확보한다. 좁으면 라벨이 값 라벨·제목과 겹친다.
+        range=[0, y_top * 1.46], title_text="현금잔고",
         tickformat=",d", exponentformat="none",
     )
 
@@ -531,9 +534,9 @@ def render_flow_chart(
             x=baseline_survival, line=dict(color="#a0aec0", width=1.5, dash="dot")
         )
         fig.add_annotation(
-            x=baseline_survival, y=y_top * 1.19, yref="y",
-            text=f"지원 없었다면 {baseline_survival}개월",
-            showarrow=False, font=dict(size=11, color="#718096"),
+            x=baseline_survival, y=y_top * 1.30, yref="y",
+            text=f"지원 없었다면<br>{baseline_survival}개월",  # 두 줄로 — 옆 라벨과 붙지 않게
+            showarrow=False, font=dict(size=11, color="#718096"), align="center",
             xanchor="left" if baseline_survival < SIM_MONTHS * 0.7 else "right",
         )
 
@@ -554,15 +557,18 @@ def render_flow_chart(
     # 보이고, 마커는 "어디서부터인지"만 짚는다.
     if marker is not None:
         at, note = marker
+        bar_top = balance[at] if at < len(balance) else 0
         fig.add_annotation(
-            x=at, y=balance[at] if at < len(balance) else 0, yref="y",
+            x=at, y=bar_top, yref="y",
             text="▼", showarrow=False, yshift=26,
             font=dict(size=13, color="#dd6b20"),
         )
+        # 라벨을 **마커 바로 위**에 둔다. 위쪽에 고정하면 어느 시점을 가리키는지 안 보이고,
+        # baseline 라벨과 한 줄에서 겹쳤다. 두 줄로 쪼개 가로 폭도 줄인다.
         fig.add_annotation(
-            x=at, y=y_top * 1.19, yref="y", text=note,
-            showarrow=False, font=dict(size=11, color="#dd6b20"),
-            xanchor="right" if at > SIM_MONTHS * 0.5 else "left",
+            x=at, y=bar_top, yref="y", text=note.replace("부터 ", "부터<br>"),
+            showarrow=False, yshift=64, align="center",
+            font=dict(size=11, color="#dd6b20"),
         )
 
     # 우측 상단 구석에 단위 표기
@@ -870,12 +876,16 @@ def render_group_card(
         # 지원 전후 대비 — 이 서비스가 하는 일을 한 줄로. 카드마다 오른쪽 값이 다르다
         # (조합이 다르므로). 왼쪽은 무지원 기준이라 모든 카드에서 같다.
         # 막대그래프를 따로 넣지 않는다 — 바로 아래 현금흐름 그래프가 같은 얘기를 한다.
+        # 진단 화면의 '진단 국면' 박스와 같은 형태(흰 바탕 + 짙은 파랑 테두리 + 같은 곡률).
+        # 폭은 글자에 맞춘다(inline-block) — 카드 폭으로 늘리면 상자만 커 보인다.
+        # 오른쪽 값만 굵게 하지 않는다. 한쪽만 진하면 그 숫자만 떠 보인다.
         st.markdown(
-            "<div style='margin:2px 0 10px 0;color:#4a5568;'>"
+            "<div style='text-align:center;margin:2px 0 10px 0;'>"
+            f"<span style='display:inline-block;border:2px solid #2b6cb0;"
+            f"border-radius:{_CARD_RADIUS};padding:8px 16px;color:#1F2933;'>"
             f"지원 받기 전 생존 개월: {baseline_survival}"
-            "&nbsp;&nbsp;→&nbsp;&nbsp;지원 후 생존 개월: "
-            f"<span style='font-weight:800;color:#1F2933;font-size:1.15rem;'>"
-            f"{group.survival_months}</span></div>",
+            "&nbsp;&nbsp;→&nbsp;&nbsp;"
+            f"지원 후 생존 개월: {group.survival_months}</span></div>",
             unsafe_allow_html=True,
         )
 
@@ -1063,7 +1073,7 @@ def _step_after(cur: int, fields: list[str]) -> int:
     nxt = cur + 1
     if nxt == S_CONDITIONAL and not fields:
         nxt = S_GOALS
-    return min(nxt, S_RESULTS)
+    return min(nxt, S_DONE)
 
 
 def _step_before(cur: int, fields: list[str]) -> int:
@@ -1088,10 +1098,11 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
                 ss.step = _step_before(cur, fields)
                 st.rerun()
         with next_col:
-            if cur < S_RESULTS:
-                label = "결과 보기 ▶" if _step_after(cur, fields) == S_RESULTS else "다음 ▶"
+            if cur < S_DONE:
+                nxt = _step_after(cur, fields)
+                label = {S_RESULTS: "결과 보기 ▶", S_DONE: "완료 ▶"}.get(nxt, "다음 ▶")
                 if st.button(label, key=f"next_{cur}", disabled=not ready, use_container_width=True):
-                    ss.step = _step_after(cur, fields)
+                    ss.step = nxt
                     st.rerun()
         if not ready:
             st.caption("입력을 마치면 다음으로 넘어갈 수 있어요.")
@@ -1209,7 +1220,14 @@ def render_progress(cur: int, fields: list[str]) -> None:
     total = len(answer_steps)
 
     # 카운터 — 출력 화면은 그 화면 이름을 그대로(진단 / 결과), 입력은 'pos / total'
-    if cur in OUTPUT_STEPS:
+    #
+    # 완료 화면에서는 진행바를 **없애지 않고** 모든 칸을 '지나온' 상태로 둔다.
+    # 칸을 하나 더하는 방식은 쓰지 않는다 — 완료는 단계가 아니라 끝이라, 칸을 더하면
+    # "아직 할 일이 남았다"로 읽힌다. 통째로 숨기면 화면이 갑자기 비어 어색하다.
+    # cur 가 마지막 단계보다 커서 아래 루프가 자연히 전부 'done' 을 만든다.
+    if cur == S_DONE:
+        counter = "완료"
+    elif cur in OUTPUT_STEPS:
         counter = STEP_TITLES[cur]
     else:
         pos = answer_steps.index(cur) + 1 if cur in answer_steps else total
@@ -1756,10 +1774,15 @@ def _gauge_point(cx: float, cy: float, r: float, frac: float) -> tuple[float, fl
 def _score_frac(score: float) -> float:
     """점수 → 게이지 위 위치(0~1). **바늘과 눈금 숫자가 이 함수 하나만 쓴다.**
 
-    두 군데서 각도를 계산하면 바늘이 가리키는 자리와 숫자가 어긋난다. 점수 0..8 을
-    9칸으로 보고 각 칸의 **가운데**를 그 점수의 자리로 삼는다.
+    두 군데서 각도를 계산하면 바늘이 가리키는 자리와 숫자가 어긋난다.
+
+    점수 N 은 그 점수가 **차지하는 칸의 왼쪽 경계**에 놓는다(칸 가운데가 아니다).
+    칸 가운데에 두면 3점이 개선여지 구간 한복판에 찍혀, 실제로는 그 구간이 막 시작된
+    값인데도 "한가운데"로 읽혔다. 경계에 놓으면 3이 노랑↔주황 경계에 서서
+    "막 넘어온 값"이 그대로 보인다.
+    9칸이므로 0 → 0, 8 → 8/9 이고 **오른쪽 끝(9)은 비워 둔다**(9점은 없는 값이다).
     """
-    return (min(max(score, 0), MAX_PHASE_SCORE) + 0.5) / (MAX_PHASE_SCORE + 1)
+    return min(max(score, 0), MAX_PHASE_SCORE) / (MAX_PHASE_SCORE + 1)
 
 
 def _phase_gauge_svg(total: int) -> str:
@@ -2174,6 +2197,34 @@ def render_results_step(
     _nav(S_RESULTS, fields)  # ◀ 이전으로 돌아가 답을 고칠 수 있다
 
 
+def render_done_step(fields: list[str]) -> None:
+    """완료 화면 — 체크 표시와 인사 한 줄.
+
+    체크는 **SVG** 로 그린다. 이모지(✓·✅)는 OS·브라우저마다 모양과 크기가 달라
+    가운데 정렬이 흔들린다.
+    세로로도 화면 가운데쯤 오게 위에 여백을 둔다(위쪽에 붙으면 끝난 느낌이 안 난다).
+    ◀ 이전으로 결과 화면에 돌아갈 수 있다 — 완료를 눌렀다고 막지 않는다.
+
+    agent.py 가 붙으면 이 화면에 요약·저장·공유 같은 것이 들어갈 수 있다.
+    지금은 최소한만 두고, 아래에 덧붙이기만 하면 되게 남겨 둔다.
+    """
+    check = (
+        "<svg viewBox='0 0 100 100' width='92' height='92' aria-hidden='true'>"
+        "<circle cx='50' cy='50' r='44' fill='none' stroke='#2E9E6B' stroke-width='6'/>"
+        "<path d='M30 52 L44 66 L71 37' fill='none' stroke='#2E9E6B' stroke-width='8' "
+        "stroke-linecap='round' stroke-linejoin='round'/></svg>"
+    )
+    st.markdown(
+        "<div style='display:flex;flex-direction:column;align-items:center;"
+        "justify-content:center;min-height:46vh;gap:18px;'>"
+        f"{check}"
+        "<div style='font-size:1.25rem;font-weight:700;color:#1F2933;'>"
+        "이용해주셔서 감사합니다.</div></div>",
+        unsafe_allow_html=True,
+    )
+    _nav(S_DONE, fields)
+
+
 def main() -> None:
     st.set_page_config(page_title="소상공인 나침반", page_icon="🧭", layout="centered")
     ss = st.session_state
@@ -2234,6 +2285,8 @@ def main() -> None:
         render_conditional(fields)
     elif cur == S_GOALS:
         render_goals(fields)
+    elif cur == S_DONE:
+        render_done_step(fields)
     else:
         render_results_step(db, revenue, elig, profile, phase, annual, fields)
 
