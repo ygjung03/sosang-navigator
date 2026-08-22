@@ -465,14 +465,23 @@ def _cliff_marker(evaluated: Evaluated, report) -> tuple[int, str] | None:
     return at, f"{at}개월차부터 {label}"
 
 
-def render_flow_chart(evaluated: Evaluated, key: str, report=None) -> None:
+def render_flow_chart(
+    evaluated: Evaluated, key: str, report=None, baseline_survival: int | None = None
+) -> None:
     """36개월 현금흐름 **막대**그래프. 잔고(만원)만 그린다.
 
     - 꺾은선 대신 월별 막대라 24개월차 절벽 같은 급락이 눈에 잘 들어온다.
     - x축 0~horizon 고정, y축 하한 0(balance_at 은 음수가 없다). shortfall_at 은
       역산용 가상 궤적이라 그리지 않는다(오해 방지).
-    - 소진 시점 세로선(N개월차 소진), 함정 CLIFF 시점 세로 점선(만기 일시상환 …).
     - 값 라벨은 시작·최고점·절벽 직후 3곳만(37개 전부 붙이면 안 읽힌다).
+
+    **세 시점을 성격에 따라 다르게 표시한다.** 세로선을 셋 그으면 복잡하다.
+        결과   소진 시점        빨강 세로 점선 — 가장 눈에 띄게
+        기준   baseline 소진    회색 세로 점선(옅게) — 비교 기준이라 튀면 안 된다
+        원인   원금 상환 시작   **세로선 없이** 막대 색이 바뀌는 것으로 보이고,
+                               그 자리에만 작은 ▼ 마커를 얹는다
+    라벨 셋은 위쪽에 두되 세로 위치를 나눠 서로·x축과 겹치지 않게 한다.
+    금액은 쓰지 않는다 — 정확한 값은 아래 함정 경고가 시점과 함께 말한다.
     """
     result = evaluated.result
     months = list(range(len(result.balance_at)))  # 0 .. horizon
@@ -481,12 +490,10 @@ def render_flow_chart(evaluated: Evaluated, key: str, report=None) -> None:
     marker = _cliff_marker(evaluated, report)
     cliff_at = marker[0] if marker is not None else None
 
-    # 절벽 이후 구간 막대는 옅은 색으로 — 위험 구간을 눈에 띄게(과하지 않게)
-    base_color, after_color = "#2b6cb0", "#a9c7ef"
-    bar_colors = [
-        after_color if (cliff_at is not None and m >= cliff_at) else base_color
-        for m in months
-    ]
+    # 막대는 **전부 같은 파란색**이다. 상환 시작 이후를 색이나 빗금으로 가르지 않는다 —
+    # 옅은 색은 가장 위험한 구간을 흐리게 만들었고, 빗금은 산만했다. 그 구간이 어디부터인지는
+    # ▼ 마커와 라벨이 말한다(잔고라는 같은 값을 같은 색으로 두는 게 읽기 쉽다).
+    bar_color = "#2b6cb0"
 
     # 값 라벨: 시작(t=0)·최고점·절벽 직후 3곳만
     peak_idx = max(range(len(balance)), key=lambda i: balance[i])
@@ -498,7 +505,8 @@ def render_flow_chart(evaluated: Evaluated, key: str, report=None) -> None:
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
-            x=months, y=balance, marker_color=bar_colors,
+            x=months, y=balance,
+            marker_color=bar_color,
             text=text, textposition="outside", cliponaxis=False,
             textfont=dict(size=14),  # 값 라벨을 본문 크기로 키운다
             hovertemplate="%{x}개월차 · %{y:,.0f}만원<extra></extra>",  # 툴팁도 만원 정수
@@ -512,21 +520,49 @@ def render_flow_chart(evaluated: Evaluated, key: str, report=None) -> None:
         tickformat=",d", exponentformat="none",
     )
 
-    # 소진 시점 강조 — 끝까지 버티면 표시하지 않는다
-    if not result.survives_full_term:
+    # ── 기준: 지원이 없었다면 언제 끝났는지 (옅은 회색 점선) ──
+    # 결과(소진)와 같은 자리면 그리지 않는다 — 겹쳐서 둘 다 안 읽힌다.
+    if (
+        baseline_survival is not None
+        and baseline_survival > 0
+        and baseline_survival != result.survival_months
+    ):
         fig.add_vline(
-            x=result.survival_months,
-            line=dict(color="crimson", width=2, dash="dash"),
-            annotation_text=f"{result.survival_months}개월차 소진",
-            annotation_position="top",
+            x=baseline_survival, line=dict(color="#a0aec0", width=1.5, dash="dot")
+        )
+        fig.add_annotation(
+            x=baseline_survival, y=y_top * 1.19, yref="y",
+            text=f"지원 없었다면 {baseline_survival}개월",
+            showarrow=False, font=dict(size=11, color="#718096"),
+            xanchor="left" if baseline_survival < SIM_MONTHS * 0.7 else "right",
         )
 
-    # 절벽(급락) 시점 — 함정 판정에 걸린 경우에만. 막대 위에 겹쳐 그린다.
+    # ── 결과: 실제 소진 시점 (빨강 점선). 끝까지 버티면 표시하지 않는다 ──
+    if not result.survives_full_term:
+        fig.add_vline(
+            x=result.survival_months, line=dict(color="crimson", width=2, dash="dash")
+        )
+        fig.add_annotation(
+            x=result.survival_months, y=y_top * 1.07, yref="y",
+            text=f"{result.survival_months}개월차 소진",
+            showarrow=False, font=dict(size=12, color="crimson"),
+            xanchor="left" if result.survival_months < SIM_MONTHS * 0.7 else "right",
+        )
+
+    # ── 원인: 원금 상환 시작 — 세로선 없이 막대 색 변화 + 그 자리에만 ▼ 마커 ──
+    # 세로선 셋은 과하다. 이 시점부터 막대가 옅어지므로(위 bar_colors) 꺾임은 이미
+    # 보이고, 마커는 "어디서부터인지"만 짚는다.
     if marker is not None:
         at, note = marker
-        fig.add_vline(
-            x=at, line=dict(color="#dd6b20", width=2, dash="dot"),
-            annotation_text=note, annotation_position="bottom",
+        fig.add_annotation(
+            x=at, y=balance[at] if at < len(balance) else 0, yref="y",
+            text="▼", showarrow=False, yshift=26,
+            font=dict(size=13, color="#dd6b20"),
+        )
+        fig.add_annotation(
+            x=at, y=y_top * 1.19, yref="y", text=note,
+            showarrow=False, font=dict(size=11, color="#dd6b20"),
+            xanchor="right" if at > SIM_MONTHS * 0.5 else "left",
         )
 
     # 우측 상단 구석에 단위 표기
@@ -576,13 +612,13 @@ def render_traps(report) -> None:
         st.warning(f"⚠ {trap.message}")
 
 
-def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Evaluated:
-    """융자 금액 슬라이더. 움직이면 이 카드만 다시 계산한다(순위는 고정).
+def adjustable_loan(member: Evaluated):
+    """이 조합에서 **슬라이더로 조정할 수 있는** 신규유입 융자. 없으면 None.
 
-    조정 대상은 신규유입 융자 하나뿐이다. 슬라이더가 바뀌면 그 금액으로
-    조합을 다시 시뮬레이션해 그래프·2축·함정을 갱신한 Evaluated를 돌려준다.
+    조정 대상은 신규유입 융자 하나뿐이다(대환은 갈아탈 금액이 정해져 있다).
+    한도와 하한이 같으면 움직일 폭이 없어 조정 대상이 아니다.
     """
-    loan_item = next(
+    item = next(
         (
             it
             for it in member.combo.items
@@ -590,55 +626,124 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
         ),
         None,
     )
-    if loan_item is None:
-        return member  # 조정할 융자가 없으면 슬라이더도 없다
+    if item is None:
+        return None
+    cand = item.candidate
+    if int(cand.get("금액_한도") or 0) <= int(cand.get("금액_하한") or 0):
+        return None
+    return item
 
-    cand = loan_item.candidate
-    ceiling = int(cand.get("금액_한도") or 0)
-    floor = int(cand.get("금액_하한") or 0)
-    # 신청 단위는 재원마다 다르다(소진공 100만·서울시 만). 후보 데이터에 이미 있다.
-    unit = int(cand.get("신청금액_단위") or 1_000_000)
-    if ceiling <= floor:
-        return member  # 조정 폭이 없다
 
-    # 슬라이더는 만원 단위로 보여주고, step 도 신청 단위(만원)로 잡는다.
-    min_man, max_man = floor // MAN, ceiling // MAN
-    step_man = max(1, unit // MAN)
-    default_man = min(max(loan_item.effective_amount // MAN, min_man), max_man)
-    picked_man = st.slider(  # transient-widget: 결과 카드 what-if. 단계 답이 아니라
-        # 되돌아가면 초기화되는 게 맞다(ss.answers 를 안 탄다).
-        f"융자 금액 조정 — {cand.policy_name}",
-        min_value=min_man,
-        max_value=max_man,
-        value=int(default_man),
-        step=step_man,
-        format="%d만원",
-        key=key,
-    )
-    # 슬라이더 값을 실제 신청 가능 금액으로 스냅한다(단위 올림·금액_하한 처리).
-    # 같은 규칙을 UI에서 새로 구현하지 않고 combos.snap_amount 를 그대로 통과시킨다.
-    # 스냅 결과가 슬라이더 표시와 어긋나면 스냅된 값을 화면에 쓴다.
-    amount = snap_amount(cand, picked_man * MAN)
+def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Evaluated:
+    """융자 슬라이더(있을 때만) + **결과 카드 4칸(항상)**.
+
+    슬라이더가 없다고 카드까지 사라지면 안 된다 — 두 축(생존·종료부채)은 모든 조합에
+    있고, 유입 두 칸도 '없음'으로 적으면 되기 때문이다. 예전에는 조정할 융자가 없으면
+    함수가 곧장 반환해 이 블록이 통째로 비었다(C 처럼 융자가 배제된 국면에서 전부).
+    """
+    loan_item = adjustable_loan(member)
+    amount = 0
+    if loan_item is not None:
+        cand = loan_item.candidate
+        ceiling = int(cand.get("금액_한도") or 0)
+        floor = int(cand.get("금액_하한") or 0)
+        # 신청 단위는 재원마다 다르다(소진공 100만·서울시 만). 후보 데이터에 이미 있다.
+        unit = int(cand.get("신청금액_단위") or 1_000_000)
+        # 슬라이더는 만원 단위로 보여주고, step 도 신청 단위(만원)로 잡는다.
+        min_man, max_man = floor // MAN, ceiling // MAN
+        step_man = max(1, unit // MAN)
+        default_man = min(max(loan_item.effective_amount // MAN, min_man), max_man)
+        picked_man = st.slider(  # transient-widget: 결과 카드 what-if. 단계 답이 아니라
+            # 되돌아가면 초기화되는 게 맞다(ss.answers 를 안 탄다).
+            f"융자 금액 조정 — {cand.policy_name}",
+            min_value=min_man,
+            max_value=max_man,
+            value=int(default_man),
+            step=step_man,
+            format="%d만원",
+            key=key,
+        )
+        # 슬라이더 값을 실제 신청 가능 금액으로 스냅한다(단위 올림·금액_하한 처리).
+        # 같은 규칙을 UI에서 새로 구현하지 않고 combos.snap_amount 를 그대로 통과시킨다.
+        amount = snap_amount(cand, picked_man * MAN)
+    else:
+        # 조정할 수 없는 융자(한도=하한)라도 금액 자체는 카드에 적는다.
+        fixed = next(
+            (
+                it
+                for it in member.combo.items
+                if it.candidate.is_loan and it.candidate.effect == "신규유입"
+            ),
+            None,
+        )
+        amount = fixed.effective_amount if fixed is not None else 0
+        st.caption("이 조합에는 금액을 조정할 융자가 없어 슬라이더를 두지 않았습니다.")
+
     grant_sum = sum(
         it.effective_amount
         for it in member.combo.items
         if it.candidate.effect == "신규유입" and not it.candidate.is_loan
     )
-    st.caption(f"총 유입 내역 — 보조금(확정) {fmt_man(grant_sum)} + 융자(조정) {fmt_man(amount)}")
 
-    if amount == loan_item.effective_amount:
-        return member
+    if loan_item is None or amount == loan_item.effective_amount:
+        shown = member
+    else:
+        # 이 조합만 다시 계산한다. 순위(select)는 다시 돌리지 않는다.
+        new_items = tuple(
+            Applied(it.candidate, amount) if it is loan_item else it for it in member.combo.items
+        )
+        shown = Evaluated(combo=Combo(items=new_items), result=simulate(profile, new_items))
 
-    # 이 조합만 다시 계산한다. 순위(select)는 다시 돌리지 않는다.
-    new_items = tuple(
-        Applied(it.candidate, amount) if it is loan_item else it for it in member.combo.items
+    # 슬라이더 결과 — 왼쪽 1개(유입 내역) · 오른쪽 2개(생존 · 종료부채)를 위아래로.
+    # 숫자가 먼저 바뀌고 그 근거로 아래 그래프가 잇는 순서라 슬라이더와 그래프 사이에 둔다.
+    # '조정 후' 제목은 두지 않는다 — 하늘색 상자 자체가 "조정 결과"를 뜻해 중복이다.
+    #
+    # 결과를 **2x2 격자**로. 왼쪽 열이 유입(보조금·융자), 오른쪽 열이 결과(생존·부채)다.
+    # '총 유입 내역' 제목과 '+' 는 두지 않는다 — 라벨이 이미 무엇인지 말하고, '+' 는
+    # 카드 사이에 놓으면 붕 뜬다. 왼쪽/오른쪽의 뜻은 배치가 전한다.
+    #
+    # st.columns 대신 **CSS grid 하나**로 그린다. 열을 나누면 양쪽 높이를 맞추느라
+    # min-height 를 손으로 맞춰야 했고(자연 높이가 그 값을 넘으면 한쪽만 길어져
+    # 그래프에 닿았다), Streamlit 내부 구조에도 기대게 된다. 격자는 네 칸 크기가
+    # 구조적으로 같고, 카드 행 전체가 한 요소라 아래 여백도 좌우가 자동으로 같다.
+    box = (
+        f"background:#fff;border-radius:{_CARD_RADIUS};padding:14px 16px;"
+        "text-align:center;box-sizing:border-box;display:flex;flex-direction:column;"
+        "align-items:center;justify-content:center;min-height:76px;"
     )
-    adjusted = Evaluated(combo=Combo(items=new_items), result=simulate(profile, new_items))
-    st.caption(
-        f"→ 조정 후: 생존 {months_label(adjusted.result.survival_months)} · "
-        f"종료 시점 부채 {fmt_man(adjusted.result.debt_at_exit)}"
+    head = "color:#4a5568;font-size:0.9rem;line-height:1.4;"
+    val = "font-size:1.05rem;font-weight:700;color:#1F2933;line-height:1.45;"
+
+    def cell(label: str, value: str) -> str:
+        return (
+            f"<div style='{box}'>"
+            f"<div style='{head}margin-bottom:4px;'>{label}</div>"
+            f"<div style='{val}'>{value}</div></div>"
+        )
+
+    # 네 칸은 **항상** 그린다. 오른쪽 둘은 두 축이라 모든 조합에 있고, 왼쪽 둘도 없으면
+    # '없음'으로 적는다. 칸을 빼면 격자에 구멍이 나거나(자동 배치라 아래 칸이 위로 올라와)
+    # 왼쪽=유입 / 오른쪽=결과 대응이 깨진다.
+    # '0원'이라고 쓰지 않는다 — "0원을 받는다"로 읽혀 조정할 수 있는 것처럼 보인다.
+    # 실제로는 그 조합에 그 정책이 들어 있지 않다는 뜻이다.
+    grant_text = fmt_man(grant_sum) if grant_sum > 0 else "없음"
+    loan_text = fmt_man(amount) if amount > 0 else "없음"
+    # '(조정)'은 슬라이더가 있을 때만 붙인다 — 조정할 수 없는데 그렇게 적으면 어긋난다.
+    loan_label = "융자(조정)" if loan_item is not None else "융자"
+    # 카드 행과 그래프 사이 여백을 **카드 사이 간격과 같은 값**으로 둔다(한 상수를 쓴다).
+    # 행 전체가 한 요소라 좌우가 자동으로 같다.
+    gap_px = 10
+    st.markdown(
+        f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:{gap_px}px;"
+        f"margin-bottom:{gap_px}px;'>"
+        + cell("보조금(확정)", grant_text)
+        + cell("생존", months_label(shown.result.survival_months))
+        + cell(loan_label, loan_text)
+        + cell("종료 시점 부채", fmt_man(shown.result.debt_at_exit))
+        + "</div>",
+        unsafe_allow_html=True,
     )
-    return adjusted
+    return shown
 
 
 def schedule_rows(result) -> list[dict]:
@@ -695,14 +800,17 @@ def render_schedule_table(result) -> None:
         return
     div = "border-left:2px solid #4a5568;"  # 기존/신규 그룹 경계
     thin = "1px solid #cbd5e0"
+    # 헤더 글자는 전부 가운데 정렬(숫자 칸만 오른쪽 정렬)
+    center = "text-align:center;"
     head = (
         "<thead>"
-        f"<tr style='background:#eef1f5;'><th rowspan='2' style='border:{thin};padding:6px 8px;'>회차</th>"
-        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;'>기존 부채</th>"
-        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;'>신규 융자</th></tr>"
+        f"<tr style='background:#eef1f5;'>"
+        f"<th rowspan='2' style='border:{thin};padding:6px 8px;{center}'>회차</th>"
+        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;{center}'>기존 부채</th>"
+        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;{center}'>신규 융자</th></tr>"
         f"<tr style='background:#f6f8fa;'>"
         + "".join(
-            f"<th style='border:{thin};{div if i % 3 == 0 else ''}padding:5px 8px;'>{name}</th>"
+            f"<th style='border:{thin};{div if i % 3 == 0 else ''}padding:5px 8px;{center}'>{name}</th>"
             for i, name in enumerate(("원금", "이자", "잔액", "원금", "이자", "잔액"))
         )
         + "</tr></thead>"
@@ -739,6 +847,7 @@ def render_group_card(
     profile: UserProfile,
     ctx: UserContext,
     baseline_first_payment: float,
+    baseline_survival: int,
     expanded: bool,
 ) -> None:
     """후보 그룹 하나를 카드로 그린다."""
@@ -750,49 +859,63 @@ def render_group_card(
     perf = f"생존 {months_label(group.survival_months)} · 종료 시점 부채 {fmt_man(group.debt_at_exit)}"
     title = f"**후보 {idx}**  │  :blue[{member.label}]{trap_icon}  │  {perf}"
     with st.expander(title, expanded=expanded):
-        st.caption(f"레이어 {group.layer}")
+        # '레이어 N' 은 내부 용어라 뺐다(파레토 층). agent.py 가 붙으면 이 자리에
+        # LLM 이 고른 이유가 들어간다.
 
         # 같은 성능의 다른 상환조건 멤버가 있으면 함께 보인다
         if len(group.members) > 1:
             others = " / ".join(m.label for m in group.members[1:])
             st.caption(f"같은 성능의 다른 조합: {others}")
 
+        # 지원 전후 대비 — 이 서비스가 하는 일을 한 줄로. 카드마다 오른쪽 값이 다르다
+        # (조합이 다르므로). 왼쪽은 무지원 기준이라 모든 카드에서 같다.
+        # 막대그래프를 따로 넣지 않는다 — 바로 아래 현금흐름 그래프가 같은 얘기를 한다.
+        st.markdown(
+            "<div style='margin:2px 0 10px 0;color:#4a5568;'>"
+            f"지원 받기 전 생존 개월: {baseline_survival}"
+            "&nbsp;&nbsp;→&nbsp;&nbsp;지원 후 생존 개월: "
+            f"<span style='font-weight:800;color:#1F2933;font-size:1.15rem;'>"
+            f"{group.survival_months}</span></div>",
+            unsafe_allow_html=True,
+        )
+
         render_support_detail(member, baseline_first_payment)
 
-        # 융자 슬라이더 — 움직이면 이 카드의 그래프·표·2축·함정만 갱신(순위는 고정)
-        shown = render_loan_slider(member, profile, key=f"loan_{idx}")
+        # ── 슬라이더로 다시 계산되는 영역 ──
+        # 위쪽(대비 줄·지원 내역)은 **추천된 원래 조합** 기준이라 슬라이더를 움직여도
+        # 바뀌지 않는다. 그 경계가 화면에 안 보이면 어디까지가 조정 결과인지 알 수 없어,
+        # 이 안쪽만 연한 하늘색 상자로 묶는다(.st-key-adjust_*).
+        # 신청처·자격 확인 문구는 상자 밖이다 — 슬라이더로 바뀌지 않는다.
+        with st.container(key=f"adjust_{idx}"):
+            shown = render_loan_slider(member, profile, key=f"loan_{idx}")
 
-        # 함정 판정을 먼저 구한다(그래프의 절벽 마커가 이 리포트를 쓴다).
-        # 슬라이더로 조정했으면 조정본으로 다시 판정한다.
-        if shown is member:
-            report = reports[member.label]
-        else:
-            report = detect_traps(profile, shown, ctx.phase)
+            # 함정 판정을 먼저 구한다(그래프의 절벽 마커가 이 리포트를 쓴다).
+            # 슬라이더로 조정했으면 조정본으로 다시 판정한다.
+            if shown is member:
+                report = reports[member.label]
+            else:
+                report = detect_traps(profile, shown, ctx.phase)
 
-        render_flow_chart(shown, key=f"chart_{idx}", report=report)
+            render_flow_chart(
+                shown, key=f"chart_{idx}", report=report, baseline_survival=baseline_survival
+            )
 
-        # 상환 스케줄 표 — 그래프와 같은 시뮬레이션 결과(shown)를 쓴다.
-        # 슬라이더를 움직이면 그래프와 함께 이 표도 바뀐다.
-        #
-        # 표에 내용이 더 있다는 걸 알린다. st.dataframe 은 캔버스 기반 그리드라
-        # 스크롤바를 항상 보이게 하는 CSS가 먹지 않는다(마우스를 올려야 나타난다).
-        # 그래서 CSS에 의존하지 않는 방법을 쓴다 — 제목에 총 회차, 표 아래에 스크롤 안내.
-        # 회차 수는 표와 같은 함수에서 세어 제목과 표가 어긋나지 않게 한다
-        # (슬라이더로 금액이 바뀌면 소진 시점이 움직여 표 길이도 따라 바뀐다).
-        # 열 이름에서 '(월)' 을 뺐으므로 단위 표기에 '월'을 함께 밝힌다.
-        rows = len(schedule_rows(shown.result))
-        title = (
-            f"상환 스케줄 보기 (총 {rows}회차 · 월 단위 금액, 만원)" if rows
-            else "상환 스케줄 보기 (월 단위 금액, 만원)"
-        )
-        with st.expander(title):
-            # 옛 문구('대출잔액은 기존 부채와 신규 융자를 합친 값입니다')는 지웠다 —
-            # 이제 잔액도 기존/신규로 나뉘어 있어 틀린 말이 된다.
-            render_schedule_table(shown.result)
-            if rows > 8:
-                st.caption("↕ 스크롤하여 전체 보기")
+            # 함정 경고를 **스케줄 표보다 먼저** — 경고를 읽고 근거를 펼치는 순서가 자연스럽다
+            render_traps(report)
 
-        render_traps(report)
+            # 상환 스케줄 표 — 그래프와 같은 시뮬레이션 결과(shown)를 쓴다.
+            # 회차 수는 표와 같은 함수에서 세어 제목과 표가 어긋나지 않게 한다
+            # (슬라이더로 금액이 바뀌면 소진 시점이 움직여 표 길이도 따라 바뀐다).
+            # 열 이름에서 '(월)' 을 뺐으므로 단위 표기에 '월'을 함께 밝힌다.
+            rows = len(schedule_rows(shown.result))
+            title = (
+                f"상환 스케줄 보기 (총 {rows}회차 · 월 단위 금액, 만원)" if rows
+                else "상환 스케줄 보기 (월 단위 금액, 만원)"
+            )
+            with st.expander(title):
+                # 옛 문구('대출잔액은 기존 부채와 신규 융자를 합친 값입니다')는 지웠다 —
+                # 이제 잔액도 기존/신규로 나뉘어 있어 틀린 말이 된다.
+                render_schedule_table(shown.result)
 
         # 창 밖 만기 일시상환
         if shown.result.balloon_after_horizon > 0:
@@ -844,7 +967,9 @@ def render_results(
         "두 축은 **생존 개월수**(지원을 받으면 몇 개월 버티는가)와 "
         "**종료 시점 부채**(그때 빚이 얼마 남는가)입니다."
     )
-    st.caption(f"지원을 받지 않으면 {months_label(baseline_survival)} 버틸 수 있습니다.")
+    # 무지원 생존 개월수는 여기 한 줄로 두지 않는다 — 카드마다 '지원 전 → 지원 후'로
+    # 나란히 보여야 정책이 얼마나 늘려주는지가 읽힌다(상단에 baseline 만 있으면
+    # 비교 대상이 멀리 떨어져 있어 그 대비가 안 보인다).
 
     # 목표 미달 배너 (기획서 5.2.5 (d))
     if target_months is not None and not goal_satisfied:
@@ -874,15 +999,19 @@ def render_results(
 
     # LLM 최종 선정 전이라 후보 번호는 순위가 아니다 (agent.py 가 붙으면 지울 줄).
     st.caption("LLM 최종 선정 전이라 번호는 순위가 아닙니다.")
-    st.caption(
-        "ℹ 슬라이더로 금액을 바꾸면 그 카드의 그래프·표·2축이 다시 계산됩니다. 카드 순서는 고정입니다."
-    )
+    # 조정할 융자가 있는 카드가 하나라도 있을 때만 안내한다 — 회복불가 국면처럼 융자가
+    # 통째로 배제되면 슬라이더가 아예 없어서 이 문구가 말이 안 된다.
+    if any(adjustable_loan(g.members[0]) is not None for g in groups):
+        st.caption(
+            "ℹ 슬라이더로 금액을 바꾸면 **하늘색 상자 안(슬라이더 아래)** 만 다시 계산됩니다. "
+            "그 위의 생존 개월 대비·지원 내역은 추천된 원래 금액 기준이고, 카드 순서도 고정입니다."
+        )
 
     baseline_first_payment = simulate(profile, []).payment_during[0]
     for idx, group in enumerate(groups, start=1):
         render_group_card(
             idx, group, reports, profile, ctx,
-            baseline_first_payment,
+            baseline_first_payment, baseline_survival,
             expanded=(idx == 1),  # 1순위 기본 펼침
         )
 
@@ -997,6 +1126,35 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
         }
         /* ①게이지·②버퍼 열 묶음도 다른 카드와 같은 간격(12px)을 갖게. */
         .st-key-diag_row { margin-top: 12px; }
+
+        /* 슬라이더로 다시 계산되는 영역 — 연한 하늘색 상자.
+           위쪽(대비 줄·지원 내역)은 원래 조합 기준이라 안 바뀌는데, 경계가 안 보이면
+           어디까지가 조정 결과인지 알 수 없다. 곡률은 다른 카드와 같은 8px.
+           안쪽 여백을 줘 내용이 테두리에 붙지 않게 하고, 자식 요소의 왼쪽 여백을
+           0으로 맞춰 슬라이더 제목이 슬라이더보다 튀어나오지 않게 한다.
+           ⚠ '.st-key-adjust_' 도 navbar 와 같은 내부 클래스 의존이다. */
+        [class*="st-key-adjust_"] {
+            background: #EAF3FC; border-radius: 8px;
+            padding: 14px 16px; margin: 6px 0 4px 0;
+        }
+        [class*="st-key-adjust_"] > div { padding-left: 0; padding-right: 0; }
+
+        /* 상자 안 요소 간 간격을 일정하게(슬라이더·결과 카드·그래프·경고·스케줄). */
+        [class*="st-key-adjust_"] div[data-testid="stVerticalBlock"] { gap: 14px; }
+
+        /* (결과 카드 높이 맞춤은 CSS 로 열을 stretch 시키지 않고, 양쪽 카드에 같은
+           min-height 를 줘서 맞춘다 — Streamlit 내부 구조에 덜 기대는 쪽을 골랐다.) */
+
+        /* 상환 스케줄 접힘 블록은 **통째로 흰 배경** — 하늘색 상자 위에 얹힌 형태.
+           제목 줄(summary)과 펼친 안쪽까지 전부. 모서리를 깎으려면 overflow 를 숨긴다. */
+        [class*="st-key-adjust_"] [data-testid="stExpander"] {
+            background: #ffffff; border-radius: 8px; overflow: hidden;
+        }
+        [class*="st-key-adjust_"] [data-testid="stExpander"] details,
+        [class*="st-key-adjust_"] [data-testid="stExpander"] summary,
+        [class*="st-key-adjust_"] [data-testid="stExpander"] details > div {
+            background: #ffffff;
+        }
         /* 한글은 CSS 기본값이 글자 단위로 끊긴다("줄었습니 / 다").
            본문 텍스트를 어절 단위로 끊어 좁은 칸에서도 자연스럽게 접히게 한다. */
         .block-container p, .block-container li,
@@ -1927,14 +2085,16 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
             # 분리돼 보인다. 배경·간격은 .st-key-phase_confirm CSS 가 맡는다.
             with st.container(key="phase_confirm"):
                 st.markdown(
-                    "<div style='font-weight:700;margin-bottom:2px;'>경계에 가까운 판정입니다</div>"
+                    "<div style='font-weight:700;margin-bottom:2px;'>경계에 가까운 판정입니다.</div>"
                     "<div style='color:#4a5568;'>점수가 국면 경계에 걸쳐 있어요. "
-                    "맞는지 골라 주세요.</div>",
+                    "어느 국면이라고 생각하시는지 골라 주세요.</div>",
                     unsafe_allow_html=True,
                 )
+                # 라벨은 숨긴다 — 바로 위 안내가 이미 묻고 있어 '국면이 맞나요?'는 중복이다.
                 _radio(
                     "국면이 맞나요?", "phase_confirm",
-                    list(neighbor_phases(result)), result.phase, horizontal=True,
+                    list(neighbor_phases(result)), result.phase,
+                    horizontal=True, label_visibility="collapsed",
                 )
         _nav(S_DIAGNOSIS, fields)
         return
