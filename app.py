@@ -55,6 +55,7 @@ LLM 최종 3개 선정도 아직 없다
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import math
 import re
@@ -63,7 +64,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from core import optimizer, pos
+from core import agent, optimizer, pos
 from core.cashflow import (
     SIM_MONTHS,
     Applied,
@@ -198,20 +199,90 @@ def summarize_scenario(key: str, months: int) -> pos.PosSummary:
 # ══════════════════════════════════════════════════════════
 
 
-def select_final_three(
-    prompt_text: str, groups: list[CandidateGroup], context: UserContext
-) -> list[CandidateGroup]:
-    """최종 3개 선정 — **LLM의 몫이지만 아직 미구현이다.**
+_FALLBACK_NOTE = "아래는 AI 추천 없이 시뮬레이션으로 계산된 결과입니다."
 
-    agent.py 가 생기면 여기서 호출한다:
+_FAILURE_TEXT = {
+    # (문구, 재시도 버튼을 띄울지)
+    #
+    # 문구는 **일어난 일을 그대로** 쓴다. "응답을 이해하지 못했습니다" 같은 표현은
+    # 우리 쪽 결함처럼 읽히는데, 실제로는 형식이 안 맞거나 근거 없는 값이 섞여
+    # **검증이 걸러낸 것**이다. 그건 결함이 아니라 안전장치가 작동한 것이다.
+    #
+    # 키가 없으면 버튼만 빼고 안내는 남긴다 — 지금 눌러 봐야 같은 실패가 나지만,
+    # 키를 설정하면 재시도가 통하므로 "무엇을 하고 나서 다시 시도하라"를 알려야 한다.
+    agent.Failure.NO_KEY: (
+        "AI 키가 설정되지 않았습니다. "
+        f"**ANTHROPIC_API_KEY 를 설정한 뒤 다시 시도해 주세요.** {_FALLBACK_NOTE}", False,
+    ),
+    agent.Failure.API_ERROR: (
+        f"AI 연결에 실패했습니다. **다시 시도**하면 AI 추천을 받을 수 있습니다. {_FALLBACK_NOTE}",
+        True,
+    ),
+    agent.Failure.TIMEOUT: (
+        f"AI 응답이 지연됐습니다. **다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+    ),
+    agent.Failure.PARSE: (
+        "AI 응답이 정해진 형식으로 오지 않아 사용하지 않았습니다. "
+        f"**다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+    ),
+    agent.Failure.VERIFY: (
+        "AI 응답에 **계산 결과에 없는 숫자**가 섞여 있어 사용하지 않았습니다. "
+        f"**다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+    ),
+}
 
-        return agent.select_final_three(prompt_text, groups, context)
 
-    지금은 코드가 만든 후보 그룹을 **레이어 순 그대로** 돌려준다.
-    순위가 아니라 좁히기까지가 코드의 역할이므로(optimizer 참조),
-    최종 선정 없이도 후보 그룹을 나란히 보여 주는 것 자체가 의미가 있다.
+def _render_advice_banner(advice: agent.Advice | None) -> None:
+    """LLM 실패를 **눈에 띄게** 알린다.
+
+    조용히 폴백하면 시연에서 심사위원은 그게 원래 화면인 줄 안다. 실패 이유를 구분해
+    보여줘야 무엇이 문제인지 바로 안다.
+    성공했을 때는 재시도 버튼을 띄우지 않는다 — 같은 입력에 다른 답이 나오면 신뢰를
+    잃는다. 실패했을 때의 재시도는 '다른 답'이 아니라 '첫 답'이라 괜찮다.
     """
-    return groups  # TODO(agent): LLM 최종 3개 선정으로 교체
+    if advice is None or advice.ok:
+        return
+    text, retryable = _FAILURE_TEXT.get(
+        advice.failure,
+        (f"AI 추천을 받지 못했습니다. **다시 시도**해 주세요. {_FALLBACK_NOTE}", True),
+    )
+    st.warning(f"⚠ {text}\n\n아래 순서는 **AI 판단이 아니라 계산 순서**입니다.")
+    if retryable and st.button("다시 시도", key="retry_advice"):
+        st.session_state.pop("_advice", None)  # 캐시를 비우고 재호출
+        st.rerun()
+
+
+def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
+    """LLM 최종 선정. **같은 프롬프트면 한 번만 호출**하고 세션에 캐시한다.
+
+    슬라이더는 카드 안의 what-if 라 순위를 다시 뽑지 않는다 — 재호출하지 않는다.
+    입력을 고쳐 프롬프트가 달라지면 자동으로 다시 부른다(캐시 키가 프롬프트 해시다).
+    실패했을 때만 '다시 시도' 버튼이 이 캐시를 비운다 — 성공한 답을 다시 부르면
+    같은 입력에 다른 답이 나와 신뢰를 잃는다.
+    """
+    key = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+    cached = st.session_state.get("_advice")
+    if cached and cached[0] == key:
+        return cached[1]
+    with st.spinner("AI가 최종 3개를 고르는 중..."):
+        advice = agent.select_final_three(prompt_text, labels)
+    st.session_state["_advice"] = (key, advice)
+    return advice
+
+
+def order_by_advice(
+    groups: list[CandidateGroup], advice: agent.Advice
+) -> list[CandidateGroup]:
+    """LLM 이 고른 순서로 그룹을 재배열한다. 고르지 않은 그룹은 뒤에 원래 순서대로.
+
+    그룹을 새로 만들지 않고 **순서만** 바꾼다 — 계산 결과는 코드의 것이고 LLM 은
+    고르기만 했다.
+    """
+    order = {pick.label: i for i, pick in enumerate(advice.picks)}
+    chosen = [g for g in groups if g.members[0].label in order]
+    chosen.sort(key=lambda g: order[g.members[0].label])
+    rest = [g for g in groups if g.members[0].label not in order]
+    return chosen + rest
 
 
 # ══════════════════════════════════════════════════════════
@@ -385,19 +456,112 @@ def phase_indicator_rows(
 # ══════════════════════════════════════════════════════════
 
 
+CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE = "예", "아니오", "잘 모르겠어요"
+
+
+def stable_key(prefix: str, text: str) -> str:
+    """내용으로 정해지는 위젯 key.
+
+    프로세스마다 값이 바뀌는 것(파이썬 `hash()` 는 PYTHONHASHSEED 로 랜덤화된다)이나
+    **순서에 의존하는 것**(카드 index)을 key 로 쓰면, 앱을 다시 띄우거나 순서가 바뀔 때
+    저장된 답이 엉뚱한 대상에 붙는다. 시연 중에 터지는 종류라 내용 해시로 고정한다.
+    """
+    return f"{prefix}_" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:10]
+
+
+def confirm_key(question: str) -> str:
+    """자격 확인 질문의 위젯 key. 질문 문구가 같으면 항상 같은 key 다."""
+    return stable_key("confirm", question)
+
+
+def confirm_key_of(db: PolicyDB, candidate_id: str) -> str | None:
+    """후보 id 로 그 후보의 자격 확인 질문 key 를 찾는다.
+
+    데모 프리셋이 **후보 id 로** 답을 지정하고 여기서 key 로 옮긴다. 프리셋에 해시
+    문자열을 박아 두면 정책 데이터의 질문 문구가 바뀌었을 때 조용히 어긋난다.
+    """
+    for cand in db.candidates:
+        if cand.candidate_id != candidate_id:
+            continue
+        for field_name in ("_확인필요_자격", "_확인필요_자격_매출미달시"):
+            if text := cand.get(field_name):
+                return confirm_key(text)
+    return None
+
+
+def confirm_questions(pool) -> list[dict]:
+    """후보에 붙은 **사용자 확인 질문**. 같은 문구는 하나로 묶는다.
+
+    질문 문구가 조합과 무관하게 완결돼 있어(8개 후보 전부 확인) 코드가 그대로 띄운다.
+    LLM 이 되물으면 호출이 2회가 되고, LLM 이 실패하면 자격 확인까지 사라진다.
+
+    두 종류를 함께 모은다.
+        `_확인필요_자격`            우리가 판정할 수 없는 사실(교육 이수·선정 이력 등)
+        `_확인필요_자격_매출미달시`   택1요건 중 우리가 판정하는 갈래(매출)를 못 넘겼을 때
+    """
+    found: dict[str, dict] = {}
+    for cand in pool:
+        for key in ("_확인필요_자격", "_확인필요_자격_매출미달시"):
+            text = cand.get(key)
+            if not text:
+                continue
+            if key.endswith("매출미달시") and optimizer._meets_revenue_rule(cand, None):
+                continue  # 매출 요건을 이미 충족했으면 물을 필요가 없다
+            entry = found.setdefault(
+                text,
+                {
+                    "key": confirm_key(text),
+                    "question": text,
+                    "ids": [],
+                    # '지금 하면 되는 일'(교육 이수 등)은 '아니오'여도 제외하지 않는다.
+                    "now_possible": bool(cand.get("_확인필요_자격_지금가능")),
+                },
+            )
+            entry["ids"].append(cand.candidate_id)
+            entry["now_possible"] = entry["now_possible"] or bool(
+                cand.get("_확인필요_자격_지금가능")
+            )
+    return list(found.values())
+
+
+def excluded_by_confirm(questions: list[dict], answers: dict) -> set[str]:
+    """확인 질문의 답으로 **제외되는 후보 id**.
+
+    기획서 932~935행 — **'아니오'와 '잘 모르겠어요'는 똑같이 제외한다.** 확인하지 못한
+    자격을 있다고 가정하면 신청했다가 거절당한다. '모름'을 통과시키면 안 된다.
+    답하지 않은 질문도 아직 확인되지 않은 것이라 같이 제외한다.
+
+    예외는 `_확인필요_자격_지금가능: true` — 지금 못 했어도 신청 전에 할 수 있으므로
+    남기고, `optimizer.prerequisites()` 가 '신청 전에 이수하셔야 합니다'로 안내한다.
+    """
+    dropped: set[str] = set()
+    for item in questions:
+        if item["now_possible"]:
+            continue
+        if answers.get(item["key"]) != CONFIRM_YES:
+            dropped.update(item["ids"])
+    return dropped
+
+
 def run_pipeline(
     db: PolicyDB,
     profile: UserProfile,
     ctx: UserContext,
     target_inflow: int | None,
     target_months: int | None,
+    drop_ids: set[str] | None = None,
 ):
     """CLAUDE.md의 파이프라인을 입력 경로에 맞게 호출한다.
+
+    Args:
+        drop_ids: 확인 질문에 '아니오/모름'으로 답해 제외된 후보 id.
 
     Returns:
         (groups, reports, evals, extras, baseline_survival, goal_satisfied, resolve_info)
     """
     pool = eligible_candidates(db, profile, ctx)
+    if drop_ids:
+        pool = [c for c in pool if c.candidate_id not in drop_ids]
     baseline_survival = simulate(profile, []).survival_months
     resolve_info = None
 
@@ -855,18 +1019,30 @@ def render_group_card(
     baseline_first_payment: float,
     baseline_survival: int,
     expanded: bool,
+    pick: agent.Pick | None = None,
 ) -> None:
     """후보 그룹 하나를 카드로 그린다."""
     member = group.members[0]  # 대표. 같은 좌표라 2축 성능은 동일하다.
     trap_icon = " ⚠" if group.has_trap else ""
-    # 제목: 후보 N │ 정책명(파랑) │ 성과. LLM 최종 선정 전이라 번호는 순위가 아니다.
+    # 제목: 후보 N │ 정책명(파랑) │ 성과. LLM 이 고르면 이 번호가 순위가 된다.
     # st.expander 라벨의 마크다운 색상 지시자(:blue[…])는 Streamlit 1.62 문서상 지원되나
     # 렌더링은 브라우저에서 확인해야 한다. 안 먹으면 색 대신 다른 방식으로 바꾼다.
     perf = f"생존 {months_label(group.survival_months)} · 종료 시점 부채 {fmt_man(group.debt_at_exit)}"
     title = f"**후보 {idx}**  │  :blue[{member.label}]{trap_icon}  │  {perf}"
     with st.expander(title, expanded=expanded):
-        # '레이어 N' 은 내부 용어라 뺐다(파레토 층). agent.py 가 붙으면 이 자리에
-        # LLM 이 고른 이유가 들어간다.
+        # '레이어 N'(내부 용어) 을 지운 자리에 **LLM 이 고른 이유**가 들어간다.
+        # axis_focus 는 앞에 배지로 — 어느 축을 보고 골랐는지가 한눈에 들어와야 한다.
+        if pick is not None and pick.why:
+            badge = (
+                f"<span style='background:#e6effb;color:#2a5a92;border-radius:6px;"
+                f"padding:2px 8px;font-size:0.82rem;margin-right:8px;'>"
+                f"{pick.axis_focus} 중시</span>"
+                if pick.axis_focus else ""
+            )
+            st.markdown(
+                f"<div style='margin:2px 0 10px 0;color:#2d3748;'>{badge}{pick.why}</div>",
+                unsafe_allow_html=True,
+            )
 
         # 같은 성능의 다른 상환조건 멤버가 있으면 함께 보인다
         if len(group.members) > 1:
@@ -896,8 +1072,18 @@ def render_group_card(
         # 바뀌지 않는다. 그 경계가 화면에 안 보이면 어디까지가 조정 결과인지 알 수 없어,
         # 이 안쪽만 연한 하늘색 상자로 묶는다(.st-key-adjust_*).
         # 신청처·자격 확인 문구는 상자 밖이다 — 슬라이더로 바뀌지 않는다.
-        with st.container(key=f"adjust_{idx}"):
-            shown = render_loan_slider(member, profile, key=f"loan_{idx}")
+        # key 를 카드 번호(idx)가 아니라 **조합 이름**으로 잡는다. LLM 이 순서를 바꾸면
+        # (재시도 등) idx 기준 key 는 슬라이더 값이 엉뚱한 조합에 붙는다.
+        card_id = stable_key("card", member.label)
+        with st.container(key=f"adjust_{card_id}"):
+            # 안내는 **첫 카드에만** — 상자 안에서만 쓰이는 설명이라 여기 있어야 하고,
+            # 카드마다 반복하면 다섯 번 나온다.
+            if idx == 1 and adjustable_loan(member) is not None:
+                st.caption(
+                    "ℹ 슬라이더로 금액을 바꾸면 **이 상자 안** 만 다시 계산됩니다. "
+                    "위쪽 생존 개월 대비·지원 내역은 원래 금액 기준입니다."
+                )
+            shown = render_loan_slider(member, profile, key=f"loan_{card_id}")
 
             # 함정 판정을 먼저 구한다(그래프의 절벽 마커가 이 리포트를 쓴다).
             # 슬라이더로 조정했으면 조정본으로 다시 판정한다.
@@ -907,11 +1093,16 @@ def render_group_card(
                 report = detect_traps(profile, shown, ctx.phase)
 
             render_flow_chart(
-                shown, key=f"chart_{idx}", report=report, baseline_survival=baseline_survival
+                shown, key=f"chart_{card_id}", report=report,
+                baseline_survival=baseline_survival,
             )
 
             # 함정 경고를 **스케줄 표보다 먼저** — 경고를 읽고 근거를 펼치는 순서가 자연스럽다
             render_traps(report)
+            # LLM 이 푼 말은 원문 경고 **바로 아래**에 둔다. 숫자가 든 원문을 지우지
+            # 않는 이유는 그게 근거이기 때문이고, 풀이는 그 옆에 있어야 이어 읽힌다.
+            if pick is not None and pick.trap_note and report.traps:
+                st.caption(f"↳ {pick.trap_note}")
 
             # 상환 스케줄 표 — 그래프와 같은 시뮬레이션 결과(shown)를 쓴다.
             # 회차 수는 표와 같은 함수에서 세어 제목과 표가 어긋나지 않게 한다
@@ -942,6 +1133,15 @@ def render_group_card(
         # 신청 전 해야 할 일 · 신청처 — 카드에 오른 조합에 대해서만
         for line in prerequisites(member.combo.items):
             st.info(f"신청 전 확인: {line}")
+        # LLM 이 덧붙인 준비 사항은 코드가 낸 선행요건 **바로 다음**에. 성격이 같다.
+        if pick is not None and pick.before_apply:
+            st.info(f"신청 전 확인: {pick.before_apply}")
+        # 실행 순서는 신청처 바로 위에 — "어디에 신청하나" 직전에 "어떤 순서로"가 온다.
+        # `_연계정보` 가 있는 조합에서만 채워지므로 지금은 거의 비어 있다(데이터 25개 중 1개).
+        if pick is not None and pick.steps:
+            st.markdown("**신청 순서**")
+            for index, step in enumerate(pick.steps, start=1):
+                st.markdown(f"{index}. {step}")
         links = apply_links(member.combo.items)
         if links:
             st.markdown("**신청처**")
@@ -967,16 +1167,29 @@ def render_results(
     resolve_info: dict | None,
     prompt_text: str,
     precise: bool,
+    advice: agent.Advice | None = None,
+    dropped_by_confirm: bool = False,
 ) -> None:
     """추천 조합 화면 — 카드·부가안내·심사용 프롬프트."""
     if not precise:
         st.info("간편 모드입니다. 매출 추세가 없어 모든 수치는 **입력값 기준 추정치**입니다.")
+
+    _render_advice_banner(advice)
 
     # 두 축이 무엇인지 상단에 한 번 설명한다 (카드마다 축별 강점 라벨이 붙으므로).
     st.info(
         "두 축은 **생존 개월수**(지원을 받으면 몇 개월 버티는가)와 "
         "**종료 시점 부채**(그때 빚이 얼마 남는가)입니다."
     )
+    # 국면 판단은 카드가 아니라 목록 위 한 곳에 — 조합 하나가 아니라 전체에 대한 판단이다.
+    if advice is not None and advice.ok and advice.phase_reading:
+        st.markdown(
+            f"<div style='{_CARD}padding:14px 16px;margin-bottom:10px;"
+            "border-left:4px solid #2b6cb0;'>"
+            f"<div style='font-weight:700;margin-bottom:4px;'>AI 판단</div>"
+            f"<div style='color:#2d3748;'>{advice.phase_reading}</div></div>",
+            unsafe_allow_html=True,
+        )
     # 무지원 생존 개월수는 여기 한 줄로 두지 않는다 — 카드마다 '지원 전 → 지원 후'로
     # 나란히 보여야 정책이 얼마나 늘려주는지가 읽힌다(상단에 baseline 만 있으면
     # 비교 대상이 멀리 떨어져 있어 그 대비가 안 보인다).
@@ -1007,15 +1220,42 @@ def render_results(
         st.warning("조건에 맞는 조합을 찾지 못했습니다. 자격 조건이나 입력값을 조정해 보세요.")
         return
 
-    # LLM 최종 선정 전이라 후보 번호는 순위가 아니다 (agent.py 가 붙으면 지울 줄).
-    st.caption("LLM 최종 선정 전이라 번호는 순위가 아닙니다.")
-    # 조정할 융자가 있는 카드가 하나라도 있을 때만 안내한다 — 회복불가 국면처럼 융자가
-    # 통째로 배제되면 슬라이더가 아예 없어서 이 문구가 말이 안 된다.
-    if any(adjustable_loan(g.members[0]) is not None for g in groups):
-        st.caption(
-            "ℹ 슬라이더로 금액을 바꾸면 **하늘색 상자 안(슬라이더 아래)** 만 다시 계산됩니다. "
-            "그 위의 생존 개월 대비·지원 내역은 추천된 원래 금액 기준이고, 카드 순서도 고정입니다."
-        )
+    # LLM 이 붙으면서 번호는 **진짜 순위**가 됐다. 옛 문구("번호는 순위가 아닙니다")는
+    # 지운다 — 남아 있으면 거짓말이 된다.
+    # 순위가 LLM 판단이라는 것은 위의 'AI 판단'(phase_reading) 상자가 말한다.
+    # 폴백 상태에서는 코드 순서이므로 배너가 "AI 판단이 아니라 계산 순서"라고 밝힌다.
+    picks_by_label = (
+        {p.label: p for p in advice.picks} if advice is not None and advice.ok else {}
+    )
+
+    # 후보가 하나도 없을 때. **원인에 따라 할 수 있는 일이 다르다.**
+    # ⚠ "폐업 여부를 바꿔 보세요" 같은 안내는 쓰지 않는다 — 자격을 얻으려고 상황을
+    #   다르게 적으라는 뜻으로 읽힌다. 잘못 입력한 값을 바로잡으라는 것과는 다르다.
+    if not groups:
+        if dropped_by_confirm:
+            # '예'로 고치면 늘어난다고 **단정하지 않는다** — 재도전특별자금처럼 택1
+            # 질문의 어떤 갈래(채무조정 이행 중)는 오히려 다른 정책을 배제한다.
+            # 사실대로 답하라는 쪽으로 쓴다(inquiries.md 참조).
+            st.error(
+                "지금 답으로는 신청할 수 있는 조합이 없습니다. "
+                "**확인되지 않은 자격은 없는 것으로 보고 제외했습니다.** "
+                "⑥ 추가 확인에서 실제로 해당하시는 항목이 있다면 답을 고쳐 주세요."
+            )
+            st.caption("아래 ◀ 이전 버튼으로 돌아가 답을 고칠 수 있습니다.")
+        else:
+            st.error(
+                "현재 조건으로 자격이 되는 정책이 없습니다. "
+                "지역·업력·연체 일수 같은 요건이 맞지 않으면 신청 대상이 되지 않습니다."
+            )
+            st.caption(
+                "답을 고쳐도 후보가 생기지 않는 경우입니다. 입력하신 값에 잘못 들어간 것이 "
+                "없는지 확인해 보시고, 소상공인 지원기관에 상담하시면 여기에 담기지 않은 "
+                "제도를 안내받을 수 있습니다."
+            )
+        return
+    # 슬라이더 안내는 상단에 두지 않는다 — 그 상자 안에서만 쓰이는 설명이라, 첫 카드의
+    # 하늘색 상자 안에 둔다(render_group_card). 상단 안내가 네 겹이 되면 카드까지
+    # 내려가기 전에 지친다.
 
     baseline_first_payment = simulate(profile, []).payment_during[0]
     for idx, group in enumerate(groups, start=1):
@@ -1023,18 +1263,34 @@ def render_results(
             idx, group, reports, profile, ctx,
             baseline_first_payment, baseline_survival,
             expanded=(idx == 1),  # 1순위 기본 펼침
+            pick=picks_by_label.get(group.members[0].label),
         )
 
     # 부가 추천 (컨설팅·법률자문 등)
     if extras:
-        st.markdown("**함께 안내할 것** — 순위엔 안 들지만 자격이 되는 지원")
+        st.markdown("**함께 안내할 것** — 순위엔 안 들지만 자격이 되는 지원")  # noqa: E501
         for cand in extras:
             note = cand.get("_순위제외근거") or cand.get("조건") or ""
             st.markdown(f"- {cand}" + (f" — {note[:80]}" if note else ""))
 
-    # LLM 프롬프트 (심사용) — agent.py 가 이 텍스트를 받아 최종 3개를 고른다
+    # 추천하지 않은 조합과 이유 — 자격은 되지만 뺀 것들(기획서 897·979).
+    # 목록 맨 아래 접힘에 둔다. 궁금한 사람만 열어 보면 되는 정보라 카드를 밀어내면 안 된다.
+    if advice is not None and advice.ok and advice.excluded:
+        with st.expander("추천하지 않은 조합과 이유"):
+            for item in advice.excluded:
+                st.markdown(f"- **{item.get('label', '')}** — {item.get('reason', '')}")
+
+    # LLM 프롬프트·응답 (심사용)
     with st.expander("심사용: LLM 프롬프트 보기"):
-        st.info("최종 3개 선정은 LLM의 몫이며 아직 미구현입니다. 아래는 코드가 만든 프롬프트입니다.")
+        if advice is not None and not advice.ok:
+            st.error(f"실패 유형: {advice.failure} · {advice.detail}")
+            if advice.bad_numbers:
+                st.caption("검증에 걸린 숫자: " + ", ".join(advice.bad_numbers[:10]))
+        if advice is not None and advice.usage:
+            st.caption(
+                f"토큰 — 입력 {advice.usage.get('input_tokens', 0):,} · "
+                f"출력 {advice.usage.get('output_tokens', 0):,}"
+            )
         st.text(prompt_text)
 
 
@@ -1068,10 +1324,15 @@ SEGMENT_ORDER = (
 )
 
 
+def _has_step6(fields: list[str]) -> bool:
+    """⑥ 단계에 물을 것이 있는지. 조건부 항목이나 자격 확인 질문 중 하나라도 있으면 뜬다."""
+    return bool(fields) or bool(st.session_state.get("_confirm_questions"))
+
+
 def _step_after(cur: int, fields: list[str]) -> int:
     """다음 단계. 물을 것이 없으면 ⑥ 추가 확인을 건너뛴다."""
     nxt = cur + 1
-    if nxt == S_CONDITIONAL and not fields:
+    if nxt == S_CONDITIONAL and not _has_step6(fields):
         nxt = S_GOALS
     return min(nxt, S_DONE)
 
@@ -1079,7 +1340,7 @@ def _step_after(cur: int, fields: list[str]) -> int:
 def _step_before(cur: int, fields: list[str]) -> int:
     """이전 단계. 건너뛴 ⑥은 되돌아갈 때도 건너뛴다."""
     prv = cur - 1
-    if prv == S_CONDITIONAL and not fields:
+    if prv == S_CONDITIONAL and not _has_step6(fields):
         prv = S_DIAGNOSIS
     return max(prv, S_SITUATION)
 
@@ -1347,14 +1608,30 @@ def _file(label, key, **kw):
 #   값 근거는 실측(2026-08-21): A 흑자+하드룰②+함정1·2·baseline13, B 거치절벽(goal>거치12),
 #   C 회복불가+satisfied=False+새출발 처방. A 의 36+ 미달은 trend_revenue 한계(planning 5.5).
 DEMO_PRESETS: dict[str, dict] = {
+    # `confirm_yes` — 자격 확인 질문에 '예'로 답한 상태로 시작할 **후보 id** 목록.
+    #
+    # 데모는 **자격 요건이 충족된 사용자**를 전제한다. 일반 사용자의 기본값은 여전히
+    # '잘 모르겠어요'이고(모름을 통과시키면 신청했다가 거절당한다 — 기획서 932~935),
+    # 판정 규칙도 그대로다. 프리셋은 그 질문에 대한 **답만** 미리 채운다.
+    # 재무값을 미리 넣는 것과 성격이 같고, 화면(⑥ 단계)에 라디오로 그대로 보이며
+    # 사용자가 바꿀 수 있다. 시연 중에 '아니오'로 바꾸면 그 정책이 빠지는 것도 보인다.
+    #
+    # 해시가 아니라 **후보 id 로 적는다** — 정책 데이터의 질문 문구가 바뀌면 해시는
+    # 달라지는데, 프리셋에 해시를 박아 두면 조용히 어긋난다(confirm_key_of 가 옮긴다).
     "A": dict(fixed_man=300, var_man=180, cash_man=1_900, debt_man=5_000, debt_pay_man=200,
               rate_known=True, rate_pct=8.0, overdue_days=0,
               goal_months_on=True, goal_months=24,
-              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1)),
+              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
+              # A 는 이 답이 결과를 바꾸지 않는다(제외되는 두 후보가 상위 5위 밖).
+              # 그래도 넣어 둔다 — 시나리오를 오갈 때 답이 남아 생기는 혼선을 막는다.
+              confirm_yes=("seoul_urgent_selfemp__1y4y", "fund_credit_weak__2y3y")),
     "B": dict(fixed_man=430, var_man=180, cash_man=1_500, debt_man=2_500, debt_pay_man=70,
               rate_known=True, rate_pct=5.0, overdue_days=0,
               goal_months_on=True, goal_months=18,
-              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1)),
+              cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
+              # 없으면 1위가 긴급자영업자금 -> 성장기반자금으로 바뀌고 부채가 219만 늘어난다.
+              confirm_yes=("seoul_urgent_selfemp__1y4y", "fund_credit_weak__2y3y",
+                           "seoul_standup__fund")),
     # C 의 is_closed=True 는 의도적이다. **끄면 두 가지가 같이 사라진다.**
     #   ① 회복불가 국면의 폐업 지원 시연 — 끄면 pool 에 철거비·컨설팅·법률자문이 안 들어와
     #      생존 축이 baseline 6 = 최선 6 으로 죽는다. 그러면 두 축 중 하나가 상수라
@@ -1369,7 +1646,10 @@ DEMO_PRESETS: dict[str, dict] = {
               rate_known=True, rate_pct=9.0, overdue_days=120,
               goal_months_on=True, goal_months=12,
               cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
-              cond_area=20.0, is_closed=True),
+              cond_area=20.0, is_closed=True,
+              # 없으면 다시서기가 빠져 최선 조합(새출발+철거비+다시서기)이 사라지고
+              # 생존이 8 -> 7 로 줄어, 폐업을 켜서 만든 6 -> 8 시연이 무너진다.
+              confirm_yes=("seoul_standup__fund",)),
 }
 
 
@@ -1400,7 +1680,17 @@ def apply_demo_preset(scenario_key: str) -> None:
     if preset:
         for stale in _PRESET_KEYS - preset.keys():
             ans.pop(stale, None)  # 다른 시나리오가 남긴 값 제거 (위젯 기본값으로 복귀)
+        # 자격 확인 답은 key 가 질문 문구에서 나오므로 위 목록으로는 못 지운다.
+        # 시나리오를 바꿀 때 앞 시나리오의 답이 남지 않게 접두로 걷어낸다.
+        for stale in [k for k in ans if str(k).startswith("confirm_")]:
+            ans.pop(stale, None)
         ans.update(preset)
+        # 후보 id -> 질문 key 로 옮긴다(프리셋에 해시를 박지 않으려고).
+        # 해당 후보에 확인 질문이 없으면 조용히 건너뛴다.
+        db = load_db()
+        for candidate_id in ans.pop("confirm_yes", ()) or ():
+            if key := confirm_key_of(db, candidate_id):
+                ans[key] = CONFIRM_YES
     ans["_applied_scenario"] = scenario_key
 
 
@@ -2129,8 +2419,14 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
     _nav(S_DIAGNOSIS, fields)
 
 
-def render_conditional(fields: list[str]) -> None:
-    """⑥ 조건부 추가 질문. fields 에 든 것만 묻는다(답은 collect_conditional 이 읽는다)."""
+def render_conditional(fields: list[str], questions: list[dict] | None = None) -> None:
+    """⑥ 조건부 추가 질문 + **자격 확인**. 둘 다 "후보에 오른 정책이 요구하는 것"이라
+    성격이 같아 한 단계에 담는다(진행바에 칸을 더하지 않아도 된다).
+
+    ⚠ 이 화면의 답이 후보 풀을 바꾼다(예: 정책자금 지원 횟수가 소진공 자금을 뺀다).
+      그래서 위쪽 답을 고치면 아래 자격 확인 질문이 나타나거나 사라질 수 있다.
+      논리적으로는 정확한 동작이지만 화면이 살짝 움직인다.
+    """
     st.markdown("**후보에 오른 정책이 요구하는 항목만** 몇 가지 더 여쭤볼게요.")
     if "business_started" in fields:
         if _check("사업 개시 연월을 입력", "cond_bstart_known", False):
@@ -2145,6 +2441,24 @@ def render_conditional(fields: list[str]) -> None:
             st.caption("면적을 모르면 점포철거비는 금액을 계산할 수 없어 제외됩니다.")
     if "policy_loan_count_5y" in fields:
         _num("최근 5년 정책자금 지원 횟수", "cond_loan_count", 0, min_value=0, step=1)
+
+    # ── 자격 확인 ──
+    # '아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 제외한다(기획서 932~935).
+    # 확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다.
+    for item in questions or []:
+        st.markdown("---")
+        st.markdown(item["question"])
+        tail = (
+            "지금 못 하셨어도 신청 전에 하시면 됩니다."
+            if item["now_possible"]
+            else "'아니오'나 '잘 모르겠어요'를 고르시면 그 정책은 추천에서 제외합니다."
+        )
+        st.caption(tail)
+        _radio(
+            "해당하시나요?", item["key"],
+            (CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE), CONFIRM_UNSURE,
+            horizontal=True, label_visibility="collapsed",
+        )
     _nav(S_CONDITIONAL, fields)
 
 
@@ -2172,11 +2486,20 @@ def render_results_step(
     ctx = build_context(phase, elig, conditional, revenue["summary"] if revenue["precise"] else None, annual)
     target_inflow, target_months = collect_goals()
 
+    drop_ids = excluded_by_confirm(
+        st.session_state.get("_confirm_questions") or [], _answers()
+    )
     with st.spinner("추천 조합 계산 중..."):
         (
             groups, reports, evals, extras,
             baseline_survival, goal_satisfied, resolve_info,
-        ) = run_pipeline(db, profile, ctx, target_inflow, target_months)
+        ) = run_pipeline(db, profile, ctx, target_inflow, target_months, drop_ids)
+        # 자격은 되지만 최종 후보에 못 든 것들 — LLM 이 "왜 이건 안 골랐나"를 쓸 재료.
+        picked = {m.label for g in groups for m in g.members}
+        rejected = sorted(
+            (ev for ev in evals if ev.label not in picked),
+            key=lambda v: (-v.survival_months, v.debt_at_exit),
+        )
         prompt_text = to_prompt_text(
             groups, reports,
             baseline_survival=baseline_survival,
@@ -2184,14 +2507,18 @@ def render_results_step(
             goal_satisfied=goal_satisfied,
             extras=extras,
             context=ctx,
+            profile=profile,
+            rejected=rejected,
         )
-        # LLM 자리 (지금은 groups 그대로 반환)
-        groups = select_final_three(prompt_text, groups, ctx)
+
+    advice = get_advice(prompt_text, [m.label for g in groups for m in g.members])
+    if advice.ok and advice.picks:
+        groups = order_by_advice(groups, advice)
 
     render_results(
         groups, reports, extras, profile, ctx,
         baseline_survival, goal_satisfied, target_months, resolve_info,
-        prompt_text, revenue["precise"],
+        prompt_text, revenue["precise"], advice, bool(drop_ids),
     )
     st.divider()
     _nav(S_RESULTS, fields)  # ◀ 이전으로 돌아가 답을 고칠 수 있다
@@ -2261,6 +2588,16 @@ def main() -> None:
     profile = compute_profile(revenue)
     phase, annual = compute_phase_and_annual(revenue, elig, profile)
     fields = needed_conditional_fields(phase, annual, elig["include_loans"])
+    # 후보에 붙은 자격 확인 질문. ⑥ 단계가 이것도 함께 묻고, 답이 후보를 거른다.
+    # 풀을 구하려면 컨텍스트가 필요한데, 그 컨텍스트가 ⑥ 답을 쓰므로 서로 물린다 —
+    # 지금까지의 답으로 풀을 구하고, 답이 바뀌면 Streamlit 이 다시 그린다.
+    ctx_now = build_context(
+        phase, elig, collect_conditional(fields),
+        revenue["summary"] if revenue["precise"] else None, annual,
+    )
+    questions = confirm_questions(eligible_candidates(db, profile, ctx_now))
+    # 진행바·단계 이동(_step_after/_step_before)도 이 목록을 봐야 ⑥ 을 건너뛸지 안다.
+    ss["_confirm_questions"] = questions
 
     render_progress(cur, fields)
     st.divider()
@@ -2279,10 +2616,10 @@ def main() -> None:
     elif cur == S_DIAGNOSIS:
         render_diagnosis(revenue, elig, profile, fields)
     elif cur == S_CONDITIONAL:
-        if not fields:  # 안전장치: 물을 것이 없으면 건너뛴다
+        if not fields and not questions:  # 물을 것이 하나도 없으면 건너뛴다
             ss.step = S_GOALS
             st.rerun()
-        render_conditional(fields)
+        render_conditional(fields, questions)
     elif cur == S_GOALS:
         render_goals(fields)
     elif cur == S_DONE:

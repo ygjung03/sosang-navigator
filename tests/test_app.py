@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import datetime
+import os
+import pathlib
 
 import app
 from core.cashflow import SIM_MONTHS
@@ -471,6 +473,74 @@ def test_schedule_stops_at_exhaustion():
     print(f"   소진 조합 {stopped}개는 생존 시점까지만 · 완주 조합 {full}개는 끝까지 ✓")
 
 
+def test_confirm_keys_are_stable():
+    """자격 확인 질문의 위젯 key 가 **프로세스를 나눠도 같은 값**인지.
+
+    파이썬 hash() 는 PYTHONHASHSEED 로 랜덤화돼 앱을 다시 띄우면 값이 바뀐다. 그것을
+    key 로 쓰면 저장된 답이 날아가고 데모 프리셋도 조용히 안 걸린다. 시연 중 재시작하면
+    터지는 종류라 못박는다(내용 기반 sha1 로 고쳤다)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import app;"
+        "print(app.confirm_key('테스트 질문입니다'));"
+        "print(app.stable_key('card', '조합 이름'))"
+    )
+    runs = [
+        subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True,
+            cwd=str(pathlib.Path(app.__file__).parent),
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONUTF8": "1"},
+        ).stdout.strip()
+        for seed in ("0", "12345")
+    ]
+    assert runs[0] == runs[1], f"프로세스마다 key 가 다르다:\n{runs[0]}\n{runs[1]}"
+    assert runs[0].splitlines()[0].startswith("confirm_")
+    print(f"   PYTHONHASHSEED 를 바꿔도 key 동일 ✓ ({runs[0].splitlines()[0]})")
+
+
+def test_confirm_excludes_unsure_like_no():
+    """'아니오'와 '잘 모르겠어요'가 **똑같이** 제외되는지 (기획서 932~935).
+
+    확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다. 답하지 않은 것도
+    확인되지 않은 것이라 같이 제외한다.
+    예외는 `_확인필요_자격_지금가능: true` — 지금 못 했어도 신청 전에 하면 되므로
+    남기고 prerequisites 가 안내한다."""
+    now_possible = {"key": "k1", "ids": ["c_now"], "now_possible": True, "question": "q"}
+    blocking = {"key": "k2", "ids": ["c_block"], "now_possible": False, "question": "q"}
+    questions = [now_possible, blocking]
+
+    assert app.excluded_by_confirm(questions, {"k2": app.CONFIRM_YES}) == set()
+    for answer in (app.CONFIRM_NO, app.CONFIRM_UNSURE):
+        assert app.excluded_by_confirm(questions, {"k2": answer}) == {"c_block"}, answer
+    assert app.excluded_by_confirm(questions, {}) == {"c_block"}, "무응답도 제외해야 한다"
+    # '지금가능'은 어떤 답이어도 남는다
+    assert "c_now" not in app.excluded_by_confirm(questions, {"k1": app.CONFIRM_NO})
+    print("   아니오 = 모름 = 무응답 → 제외 · '지금가능'은 예외 ✓")
+
+
+def test_demo_confirm_presets_match_real_questions():
+    """데모 프리셋의 `confirm_yes` 후보 id 가 **실제 질문 key 로 옮겨지는지**.
+
+    프리셋에 해시를 박아 두면 정책 데이터의 질문 문구가 바뀌었을 때 조용히 어긋나
+    시연 화면이 달라진다. id 로 적고 confirm_key_of 가 옮기게 했으니, 그 id 가
+    실제로 확인 질문을 가진 후보인지 여기서 확인한다."""
+    db = app.load_db()
+    checked = 0
+    for key, preset in app.DEMO_PRESETS.items():
+        for candidate_id in preset.get("confirm_yes", ()):
+            resolved = app.confirm_key_of(db, candidate_id)
+            assert resolved, (
+                f"[{key}] 프리셋의 {candidate_id} 에 자격 확인 질문이 없다 — "
+                "정책 데이터가 바뀌었으면 프리셋도 고쳐야 한다."
+            )
+            assert resolved.startswith("confirm_")
+            checked += 1
+    assert checked, "confirm_yes 를 가진 프리셋이 하나도 없다"
+    print(f"   프리셋 confirm_yes {checked}건이 실제 질문 key 로 해석됨 ✓")
+
+
 def _drive(scenarios: list[str]) -> dict:
     """시나리오를 순서대로 골라가며 결과 단계까지 몰고, 최종 answers 를 돌려준다."""
     at = _fresh_app()
@@ -546,6 +616,88 @@ def test_conditional_gating():
     print(f"   C 전용 항목 {sorted(only_c)} 은 A 에서 프로필에 안 실림 ✓")
 
 
+def _loan_sliders(at):
+    return [s for s in at.slider if s.key and s.key.startswith("loan_")]
+
+
+def _to_results(at) -> None:
+    while at.session_state["step"] < app.S_RESULTS:
+        _advance(at)
+
+
+def test_slider_resets_when_inputs_change():
+    """앞 단계로 돌아가 조건을 바꾸고 오면 슬라이더가 **새 계산값**으로 돌아오는지.
+
+    슬라이더는 카드 안의 what-if 라 되돌아가면 초기화되는 게 맞다(transient-widget).
+    그 성질을 지키는 것은 위젯 key 가 아니라 **Streamlit 의 purge** 다 — 결과 화면을
+    떠나면 loan_* 이 렌더되지 않아 키가 지워지고, 돌아오면 새 기본값으로 다시 만들어진다.
+
+    ⚠ **Streamlit 내부 동작에 기대는 부분이다**('.st-key-' 클래스 의존과 같은 성격).
+      버전이 올라가 purge 가 사라지면 굴린 값이 새 계산을 덮어써 **화면 금액이 어긋나는데
+      눈에 잘 안 띈다.** 그래서 여기서 못박는다.
+      키에 금액을 섞어 내용이 바뀌면 새 위젯이 되게 하는 방법도 있지만, 그러면 슬라이더를
+      움직일 때마다 키가 바뀌어 조작이 끊긴다.
+    """
+    at = _fresh_app()
+    _to_results(at)
+    sliders = _loan_sliders(at)
+    if not sliders:
+        print("   (융자 슬라이더가 있는 카드 없음 — 스킵)")
+        return
+    moved = sliders[0].value + 500
+    sliders[0].set_value(moved)
+    at.run(timeout=120)
+    assert _loan_sliders(at)[0].value == moved
+
+    _back(at)  # 결과 -> ⑦ 조건 설정
+    left = [k for k in at.session_state.filtered_state if str(k).startswith("loan_")]
+    assert not left, f"결과 화면을 떠났는데 loan_ 키가 남았다: {left}"
+    goal = [s for s in at.slider if s.key == "goal_months_w"]
+    assert goal, "⑦ 에 목표 개월수 슬라이더가 없다"
+    goal[0].set_value(30)
+    at.run(timeout=120)
+
+    _to_results(at)
+    after = _loan_sliders(at)[0].value
+    assert after != moved, f"조건을 바꿨는데 굴린 값({moved})이 그대로 남았다"
+    print(f"   조건 변경 후 복귀 — 굴린 값 {moved} 안 남고 새 계산값 {after} ✓")
+
+
+def test_slider_does_not_leak_across_scenarios():
+    """A 에서 굴린 슬라이더 값이 B 를 거쳐 A 로 돌아왔을 때 남지 않는지.
+
+    카드 key 를 조합 이름으로 잡으므로(순서 의존을 없애려고), 시나리오가 달라도 같은
+    조합이면 key 가 같다. 그때 값이 새면 다른 시나리오의 금액이 화면에 뜬다.
+    여기서도 purge 가 막아 주지만, 위와 같은 이유로 확인해 둔다.
+    """
+    at = _fresh_app()
+    while at.session_state["step"] < app.S_REVENUE:
+        _advance(at)
+    at.selectbox(key="scenario_key_w").set_value("A")
+    at.run(timeout=120)
+    _to_results(at)
+    sliders = _loan_sliders(at)
+    if not sliders:
+        print("   (A 에 융자 슬라이더가 있는 카드 없음 — 스킵)")
+        return
+    original = sliders[0].value
+    sliders[0].set_value(original + 700)
+    at.run(timeout=120)
+
+    for scenario in ("B", "A"):
+        while at.session_state["step"] > app.S_REVENUE:
+            _back(at)
+        at.selectbox(key="scenario_key_w").set_value(scenario)
+        at.run(timeout=120)
+        _to_results(at)
+
+    back_again = _loan_sliders(at)[0].value
+    assert back_again == original, (
+        f"A→B→A 왕복 후 굴린 값이 남았다: {back_again} (원래 {original})"
+    )
+    print(f"   A→B→A 왕복 — 굴린 값 {original + 700} 안 남고 {back_again} 로 복귀 ✓")
+
+
 def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
@@ -557,6 +709,9 @@ def main() -> None:
     test_debt_relief_reaches_confirmation()
     test_drop_window_label_matches()
     test_reason_sentences_end_with_period()
+    test_confirm_keys_are_stable()
+    test_confirm_excludes_unsure_like_no()
+    test_demo_confirm_presets_match_real_questions()
     test_simresult_split_identity()
     test_month_display_sums()
     test_trap_message_matches_table()
@@ -566,6 +721,8 @@ def main() -> None:
     test_answers_survive_navigation()
     test_edit_and_return()
     test_slider_does_not_leak()
+    test_slider_resets_when_inputs_change()
+    test_slider_does_not_leak_across_scenarios()
     print("\n전부 통과")
 
 

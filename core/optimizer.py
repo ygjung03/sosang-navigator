@@ -55,6 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from .cashflow import month_display
 from .combos import Evaluated
 from .metrics import TrapReport
 
@@ -436,6 +437,100 @@ def _caveats(items: Sequence[Any], context: Any = None) -> list[str]:
     return notes
 
 
+_CONFIRM_PREFIX = "자격 확인 필요 — "
+
+
+def _confirm_tag(note: str, defs: dict[str, int]) -> str:
+    """자격 확인 문구를 [확인 N] 딱지로 줄이고 전문은 defs 에 모은다."""
+    if not note.startswith(_CONFIRM_PREFIX):
+        return note
+    body = note[len(_CONFIRM_PREFIX):]
+    number = defs.setdefault(body, len(defs) + 1)
+    return f"자격 확인 필요 [확인 {number}]"
+
+
+def _situation_lines(context: Any, profile: Any = None) -> list[str]:
+    """사용자 상황 요약. **프롬프트에 이미 있는 값만** 쓰고 새로 계산하지 않는다."""
+    out: list[str] = []
+    drop = getattr(context, "revenue_drop_rate", 0.0) or 0.0
+    if drop > 0:
+        out.append(f"매출 {drop:.0%} 감소")
+    annual = getattr(context, "annual_revenue", None)
+    if annual:
+        out.append(f"연매출 {annual / MAN:,.0f}만원")
+    if profile is not None:
+        if getattr(profile, "existing_debt", 0):
+            out.append(f"기존 부채 {profile.existing_debt / MAN:,.0f}만원")
+        if getattr(profile, "overdue_days", 0):
+            out.append(f"연체 {profile.overdue_days}일")
+    if getattr(context, "is_closed", False):
+        out.append("폐업(예정)")
+    restart = getattr(context, "restart_status", None)
+    if restart and restart != "안함":
+        out.append(f"재창업 {restart}")
+    return out
+
+
+def _repayment_summary(result: Any, report: Any) -> list[str]:
+    """상환 부담을 판단할 **최소한의 값**. 각 값에 반드시 시점을 붙인다.
+
+    스케줄 36행을 통째로 넣지 않는다 — 프롬프트가 배로 늘고 LLM이 그 숫자를 다 쓸 일도
+    없다. 반대로 1회차만 주면 거치 중이라 가장 낮은 값이어서 부담을 과소평가한다.
+
+    넣는 값과 이유:
+        첫 달        시작 부담
+        거치 종료 후  거치가 있는 조합만. 부담이 실제로 커지는 지점
+        가장 큰 달    만기일시·분기상환처럼 특정 달만 튀는 경우를 잡는다
+        총액         to_prompt_text 가 이미 낸다
+
+    **없는 값은 "없다"고 적는다.** 그냥 빼면 읽는 쪽이 "값이 없어서 뺐는지, 앞줄과 같아서
+    뺐는지" 알 수 없다. 상환이 계속 오르는 구조인지 아닌지가 판단에 영향을 준다 —
+    만기 일시상환이 붙으면 마지막에 크게 튀는데, **그게 없다는 것도 정보다.**
+    같은 숫자를 반복하지는 않는다(산만해진다).
+
+        월 상환액 — 1개월차 78만원
+        거치 종료 후 — 13개월차부터 154만원
+        이후 변동 없음                      <- 최고액이 거치 종료 후와 같을 때
+
+        월 상환액 — 1개월차 92만원
+        거치 없음, 이후 변동 없음            <- 대환만 있는 조합
+
+    영업이익 대비 비율은 넣지 않는다. 적자면 산출이 안 되고, 흑자여도 어느 시점의
+    상환액을 쓰느냐에 따라 달라져 오해를 부른다.
+
+    반올림은 화면과 같은 month_display 를 쓴다(같은 회차를 다르게 말하지 않게).
+    """
+    payments = result.payment_during
+    last = result.survival_months if not result.survives_full_term else len(payments)
+    if last <= 0 or not payments:
+        return ["상환액 — 없음(갚을 것이 없다)"]
+    first = month_display(result, 1).total
+    out = [f"월 상환액 — 1개월차 {first:,}만원"]
+
+    cliff = getattr(report, "cliff_at", None)
+    cliff_total = None
+    if cliff and cliff <= last:
+        cliff_total = month_display(result, cliff).total
+
+    peak_month = max(range(1, last + 1), key=lambda m: payments[m - 1])
+    peak_total = month_display(result, peak_month).total
+    highest_so_far = max(first, cliff_total or 0)
+    rises_later = peak_total > highest_so_far
+
+    if cliff_total is not None:
+        out.append(f"거치 종료 후 — {cliff}개월차부터 {cliff_total:,}만원")
+        out.append(
+            f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원"
+            if rises_later else "이후 변동 없음"
+        )
+    elif rises_later:
+        out.append("거치 없음")
+        out.append(f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원")
+    else:
+        out.append("거치 없음, 이후 변동 없음")
+    return out
+
+
 def to_prompt_text(
     groups: Sequence[CandidateGroup],
     reports: dict[str, TrapReport],
@@ -444,6 +539,8 @@ def to_prompt_text(
     goal_satisfied: bool = True,
     extras: Sequence[Any] = (),
     context: Any = None,
+    profile: Any = None,
+    rejected: Sequence[Any] = (),
 ) -> str:
     """후보 그룹을 LLM 프롬프트에 넣을 텍스트로 만든다.
 
@@ -462,6 +559,19 @@ def to_prompt_text(
             "이런 것도 함께 신청해 보세요"로 덧붙이게 한다.
     """
     lines: list[str] = []
+    # ── 국면과 사용자 상황 ──
+    # 국면은 반드시 넣는다. 아래에서 "어느 축을 중시할지는 국면에 따라 판단할 것"이라
+    # 지시하면서 정작 국면을 안 주면 그 임무를 수행할 수 없다.
+    # 사용자 상황은 "사용자 말로 설명"의 재료다 — 숫자를 새로 만들지 말고 이것만 쓰게 한다.
+    if context is not None:
+        phase = getattr(context, "phase", None)
+        if phase:
+            lines.append(f"[국면] {phase}")
+        situation = _situation_lines(context, profile)
+        if situation:
+            lines.append("[사용자 상황] " + " · ".join(situation))
+        lines.append("")
+
     if baseline_survival is not None:
         lines.append(f"지원을 받지 않으면 생존 {baseline_survival}개월.")
         lines.append("")
@@ -479,12 +589,22 @@ def to_prompt_text(
             )
         lines.append("")
 
+    # '레이어가 낮을수록'이라고 쓰면 반대로 읽힌다 — 레이어 1이 숫자로는 가장 낮으면서
+    # 순위는 최상위다. 번호 기준으로 말한다.
     lines.append(
-        f"후보 그룹 {len(groups)}개. 레이어 1이 두 축 모두에서 최상위이며, "
-        "레이어가 낮을수록 한 축을 양보한 대안이다."
+        f"후보 그룹 {len(groups)}개. **레이어는 비지배(파레토) 정렬의 층**이다. "
+        "레이어 1은 어떤 후보에게도 두 축 모두에서 밀리지 않는다. "
+        "레이어 **번호가 커질수록** 앞 층에게 한 축 이상에서 밀린 대안이다."
     )
-    lines.append("어느 축을 중시할지는 국면에 따라 판단할 것.")
+    lines.append(
+        "번호가 크다고 나쁜 것은 아니다 — 사용자에게 덜 중요한 축을 양보한 것일 수 있다. "
+        "어느 축을 중시할지는 국면에 따라 판단할 것."
+    )
     lines.append("")
+    # 같은 자격 확인 문구가 조합마다 반복되면(실측 6회, 1,200자) 프롬프트의 3분의 1을
+    # 차지해 비용도 늘고 정작 중요한 정보가 묻힌다. 본문에는 [확인 N] 딱지만 달고
+    # 전문은 아래에 한 번만 싣는다.
+    confirm_defs: dict[str, int] = {}
 
     for group in groups:
         lines.append(
@@ -511,7 +631,7 @@ def to_prompt_text(
             #   _계산전제      계산 전제가 실제와 다를 수 있는 후보의 사정
             # 섞으면 "제도 얘기인지 우리 계산의 한계인지"를 LLM이 구분하지 못한다.
             for note in _caveats(member.combo.items, context):
-                lines.append(f"      ※ {note}")
+                lines.append(f"      ※ {_confirm_tag(note, confirm_defs)}")
 
 
             # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
@@ -521,19 +641,16 @@ def to_prompt_text(
                     f"{member.result.balloon_after_horizon / MAN:,.0f}만원이 "
                     f"일시상환으로 남는다 (36개월 시뮬레이션 밖)"
                 )
-            for trap in report.traps:
-                lines.append(f"      [경고] {trap.message}")
-            if report.burden_ratio_now is not None:
-                lines.append(
-                    f"      월 상환액 {report.payment_now / MAN:,.0f}만원 / "
-                    f"월 영업이익 {report.operating_now / MAN:,.0f}만원 "
-                    f"({report.burden_ratio_now:.0%})"
-                )
+            # 함정이 없을 때도 **없다고 적는다.** 줄이 그냥 빠지면 "판정에 안 걸렸다"인지
+            # "판정을 안 했다"인지 읽는 쪽이 알 수 없다. 함정 4종을 다 통과했다는 것은
+            # 그 자체로 이 조합의 강점이라 판단 재료가 된다.
+            if report.traps:
+                for trap in report.traps:
+                    lines.append(f"      [경고] {trap.message}")
             else:
-                lines.append(
-                    f"      월 상환액 {report.payment_now / MAN:,.0f}만원 "
-                    f"(월 영업이익 {report.operating_now / MAN:,.0f}만원 — 적자라 부담률 산출 불가)"
-                )
+                lines.append("      함정 판정 — 4종 모두 해당 없음")
+            for line in _repayment_summary(member.result, report):
+                lines.append(f"      {line}")
         if group.dropped:
             lines.append(
                 f"      ※ 같은 성능의 대안 {len(group.dropped)}개가 더 있으나 "
@@ -551,6 +668,27 @@ def to_prompt_text(
             "  ※ 현금 효과가 없거나 금액을 특정할 수 없어 순위 계산에서 뺐다. "
             "최종 추천과 함께 부가로 안내할 것."
         )
+
+    # 자격은 되지만 순위에서 밀린 것들. LLM 이 "왜 이건 안 골랐나"를 쓰려면 필요하다
+    # (기획서 897·979행). 후보가 많으면 프롬프트만 길어지므로 **상위 5개만** 준다 —
+    # 그보다 아래는 두 축 모두에서 확실히 밀려 설명할 가치가 없다.
+    if rejected:
+        lines.append("")
+        lines.append("[순위에서 밀린 조합] 자격은 되지만 최종 후보에 못 든 것들")
+        for member in list(rejected)[:5]:
+            lines.append(
+                f"  - {member.label} — 생존 {member.survival_months}개월 · "
+                f"종료 시점 부채 {member.debt_at_exit / MAN:,.0f}만원"
+            )
+        if len(rejected) > 5:
+            lines.append(f"  … 외 {len(rejected) - 5}개")
+        lines.append("  ※ 추천에서 뺀 이유를 물으면 이 값들로 답할 것.")
+
+    if confirm_defs:
+        lines.append("")
+        lines.append("[확인 문구 전문]")
+        for body, number in sorted(confirm_defs.items(), key=lambda kv: kv[1]):
+            lines.append(f"  [확인 {number}] {body}")
 
     if any("자격 확인 필요" in ln for ln in lines):
         lines.append("")
