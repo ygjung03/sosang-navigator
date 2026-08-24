@@ -702,6 +702,95 @@ def test_slider_does_not_leak_across_scenarios():
     print(f"   A→B→A 왕복 — 굴린 값 {original + 700} 안 남고 {back_again} 로 복귀 ✓")
 
 
+def test_reset_button_restores_only_its_card():
+    """↺ 추천 금액으로 — 그 카드만 되돌리고 나머지 카드는 굴린 값을 지키는지.
+
+    ⚠ 이 테스트가 지키는 것은 **on_click 콜백**이다. `if st.button(...): pop;
+    st.rerun()` 로 바꾸면 rerun 이 스크립트를 그 자리에서 끊어 아래 카드들의
+    슬라이더가 등록되지 않고, Streamlit 이 그 상태를 지운다. 그러면 카드 하나를
+    되돌렸을 뿐인데 아래 카드들이 전부 기본값으로 돌아간다. 화면을 봐야 알 수 있는
+    종류라 여기서 못박는다(실제로 그렇게 구현했다가 이 테스트에 걸렸다).
+
+    되돌린 카드의 아래 내용(카드 4칸·그래프·경고·표)이 함께 갱신되는지도 본다.
+    """
+    at = _fresh_app()
+    _to_results(at)
+    sliders = _loan_sliders(at)
+    if len(sliders) < 2:
+        print(f"   (융자 슬라이더가 {len(sliders)}개뿐 — 스킵)")
+        return
+
+    def screen(at):
+        return [m.value for m in at.markdown] + [w.value for w in at.warning]
+
+    keys = [s.key for s in sliders]
+    base = {s.key: s.value for s in sliders}
+    before = screen(at)
+
+    # ── ① 카드 하나만 굴렸다 되돌리면 그 아래 내용까지 원래대로 ──
+    # 나머지 카드를 건드리지 않은 상태라 화면 전체가 처음과 같아야 한다. 카드 4칸·
+    # 그래프 라벨·함정 경고·상환 표가 전부 markdown/warning 에 들어 있다.
+    sliders[0].set_value(base[keys[0]] + 900)
+    at.run(timeout=120)
+    assert screen(at) != before, "굴렸는데 화면이 안 바뀌었다"
+    at.button(key=f"reset_{keys[0]}").click()
+    at.run(timeout=120)
+    assert _loan_sliders(at)[0].value == base[keys[0]]
+    assert screen(at) == before, "되돌린 카드의 아래 내용이 원래 값으로 안 돌아왔다"
+
+    # ── ② 전부 굴린 뒤 하나만 되돌리면 나머지는 굴린 값 유지 ──
+    for i, slider in enumerate(_loan_sliders(at)):
+        slider.set_value(slider.value + 300 + i * 100)
+    at.run(timeout=120)
+    expected = {k: base[k] + 300 + i * 100 for i, k in enumerate(keys)}
+    moved = {s.key: s.value for s in _loan_sliders(at)}
+    assert moved == expected, f"굴리기 실패\n  {moved}\n  {expected}"
+
+    at.button(key=f"reset_{keys[0]}").click()
+    at.run(timeout=120)
+    after = {s.key: s.value for s in _loan_sliders(at)}
+
+    assert after[keys[0]] == base[keys[0]], (
+        f"되돌린 카드가 추천 금액이 아니다: {after[keys[0]]} (추천 {base[keys[0]]})"
+    )
+    kept = {k: after[k] for k in keys[1:]}
+    assert kept == {k: expected[k] for k in keys[1:]}, (
+        "되돌리지 않은 카드까지 초기화됐다 — st.rerun() 으로 바뀌었는지 확인하라\n"
+        f"  지금: {kept}\n  기대: {({k: expected[k] for k in keys[1:]})}"
+    )
+    print(
+        f"   되돌리기 — 카드1 {expected[keys[0]]}→{after[keys[0]]} · "
+        f"나머지 {len(kept)}개 굴린 값 유지 · 아래 내용도 원래대로 ✓"
+    )
+
+
+def test_reset_button_only_where_slider_exists():
+    """슬라이더가 없는 카드에는 되돌리기 버튼도 없어야 한다.
+
+    C(회복불가)처럼 융자가 배제된 국면에서는 조정할 융자가 없는 카드가 나온다.
+    """
+    at = _fresh_app()
+    while at.session_state["step"] < app.S_REVENUE:
+        _advance(at)
+    for scenario in ("A", "B", "C"):
+        while at.session_state["step"] > app.S_REVENUE:
+            _back(at)
+        at.selectbox(key="scenario_key_w").set_value(scenario)
+        at.run(timeout=120)
+        _to_results(at)
+        slider_keys = {s.key for s in _loan_sliders(at)}
+        reset_keys = {
+            b.key[len("reset_"):] for b in at.button
+            if b.key and b.key.startswith("reset_loan_")
+        }
+        assert reset_keys == slider_keys, (
+            f"[{scenario}] 버튼과 슬라이더가 짝이 안 맞는다\n"
+            f"  슬라이더만: {slider_keys - reset_keys}\n"
+            f"  버튼만: {reset_keys - slider_keys}"
+        )
+        print(f"   [{scenario}] 슬라이더 {len(slider_keys)}개 = 되돌리기 버튼 {len(reset_keys)}개 ✓")
+
+
 @contextlib.contextmanager
 def _capture_messages():
     """st.error/warning/caption/info 로 나간 문구를 모은다.
@@ -841,6 +930,8 @@ def main() -> None:
     test_slider_does_not_leak()
     test_slider_resets_when_inputs_change()
     test_slider_does_not_leak_across_scenarios()
+    test_reset_button_restores_only_its_card()
+    test_reset_button_only_where_slider_exists()
     print("\n전부 통과")
 
 

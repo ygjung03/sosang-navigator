@@ -832,6 +832,25 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
         min_man, max_man = floor // MAN, ceiling // MAN
         step_man = max(1, unit // MAN)
         default_man = min(max(loan_item.effective_amount // MAN, min_man), max_man)
+        # 라벨은 화면에 그리지 않는다. 조합에 융자는 최대 하나라 어느 정책의 금액을
+        # 조정하는지 헷갈릴 일이 없고, 바로 위 지원 내역에 같은 정책명이 이미 있다.
+        # 라벨 자리를 비워 슬라이더가 폭을 다 쓰고(폭이 곧 조작 정밀도다) 그 위 빈 줄에
+        # 버튼을 얹는다. 인자로는 남긴다 — 화면에 안 보일 뿐 스크린리더가 읽는다.
+        _, tail = st.columns([0.7, 0.3])
+        with tail:
+            # 위젯 값을 대입하지 않고 세션에서 key 를 지운다. 다음 실행에서 슬라이더는
+            # 저장된 값이 없는 상태로 만들어져 value=default_man 을 쓴다.
+            #
+            # ⚠ **on_click 콜백이어야 한다. st.rerun() 으로 바꾸지 마라.**
+            # `if st.button(...): pop; st.rerun()` 은 스크립트를 그 자리에서 끊는다.
+            # 그러면 아래 카드들의 슬라이더가 그 실행에 등록되지 않아 Streamlit 이
+            # 상태를 지운다(화면 전환 때 우리가 기대는 그 purge 다). 카드 1을
+            # 되돌렸는데 카드 2의 굴린 값 4,359 가 기본값 3,659 로 돌아가는 것을
+            # 실측했다. 콜백은 스크립트를 끊지 않고 다음 **전체** 실행 직전에 돈다.
+            st.button(
+                "↺ 추천 금액으로", key=f"reset_{key}", width="stretch",
+                on_click=lambda k=key: st.session_state.pop(k, None),
+            )
         picked_man = st.slider(  # transient-widget: 결과 카드 what-if. 단계 답이 아니라
             # 되돌아가면 초기화되는 게 맞다(ss.answers 를 안 탄다).
             f"융자 금액 조정 — {cand.policy_name}",
@@ -841,6 +860,7 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
             step=step_man,
             format="%d만원",
             key=key,
+            label_visibility="collapsed",
         )
         # 슬라이더 값을 실제 신청 가능 금액으로 스냅한다(단위 올림·금액_하한 처리).
         # 같은 규칙을 UI에서 새로 구현하지 않고 combos.snap_amount 를 그대로 통과시킨다.
