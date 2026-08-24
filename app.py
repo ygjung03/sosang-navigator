@@ -202,7 +202,10 @@ def summarize_scenario(key: str, months: int) -> pos.PosSummary:
 _FALLBACK_NOTE = "아래는 AI 추천 없이 시뮬레이션으로 계산된 결과입니다."
 
 _FAILURE_TEXT = {
-    # (문구, 재시도 버튼을 띄울지)
+    # (무슨 일이 있었는지, 재시도 버튼을 띄울지)
+    #
+    # **폴백 안내(_FALLBACK_NOTE)는 여기 넣지 않는다.** 배너가 줄을 바꿔 붙인다 —
+    # 한 덩어리로 이어 붙이면 두 문장이 한 문단이 되어 뒤쪽이 안 읽힌다.
     #
     # 문구는 **일어난 일을 그대로** 쓴다. "응답을 이해하지 못했습니다" 같은 표현은
     # 우리 쪽 결함처럼 읽히는데, 실제로는 형식이 안 맞거나 근거 없는 값이 섞여
@@ -212,22 +215,21 @@ _FAILURE_TEXT = {
     # 키를 설정하면 재시도가 통하므로 "무엇을 하고 나서 다시 시도하라"를 알려야 한다.
     agent.Failure.NO_KEY: (
         "AI 키가 설정되지 않았습니다. "
-        f"**ANTHROPIC_API_KEY 를 설정한 뒤 다시 시도해 주세요.** {_FALLBACK_NOTE}", False,
+        "**ANTHROPIC_API_KEY 를 설정한 뒤 다시 시도해 주세요.**", False,
     ),
     agent.Failure.API_ERROR: (
-        f"AI 연결에 실패했습니다. **다시 시도**하면 AI 추천을 받을 수 있습니다. {_FALLBACK_NOTE}",
-        True,
+        "AI 연결에 실패했습니다. **다시 시도**하면 AI 추천을 받을 수 있습니다.", True,
     ),
     agent.Failure.TIMEOUT: (
-        f"AI 응답이 지연됐습니다. **다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+        "AI 응답이 지연됐습니다. **다시 시도**해 주세요.", True,
     ),
     agent.Failure.PARSE: (
         "AI 응답이 정해진 형식으로 오지 않아 사용하지 않았습니다. "
-        f"**다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+        "**다시 시도**해 주세요.", True,
     ),
     agent.Failure.VERIFY: (
         "AI 응답에 **계산 결과에 없는 숫자**가 섞여 있어 사용하지 않았습니다. "
-        f"**다시 시도**해 주세요. {_FALLBACK_NOTE}", True,
+        "**다시 시도**해 주세요.", True,
     ),
 }
 
@@ -239,17 +241,23 @@ def _render_advice_banner(advice: agent.Advice | None) -> None:
     보여줘야 무엇이 문제인지 바로 안다.
     성공했을 때는 재시도 버튼을 띄우지 않는다 — 같은 입력에 다른 답이 나오면 신뢰를
     잃는다. 실패했을 때의 재시도는 '다른 답'이 아니라 '첫 답'이라 괜찮다.
+
+    두 문장을 문단으로 나눈다 — 한 덩어리면 뒤 문장이 안 읽힌다.
+    옛 셋째 줄("아래 순서는 AI 판단이 아니라 계산 순서입니다")은 지웠다. 앞 두 문장이
+    이미 다 말한다.
+    `advice_banner` 컨테이너로 감싸는 것은 테두리 CSS 를 이 배너에만 걸기 위해서다 —
+    같은 st.warning 인 함정 경고까지 굵어지면 위계가 사라진다.
     """
     if advice is None or advice.ok:
         return
     text, retryable = _FAILURE_TEXT.get(
-        advice.failure,
-        (f"AI 추천을 받지 못했습니다. **다시 시도**해 주세요. {_FALLBACK_NOTE}", True),
+        advice.failure, ("AI 추천을 받지 못했습니다. **다시 시도**해 주세요.", True),
     )
-    st.warning(f"⚠ {text}\n\n아래 순서는 **AI 판단이 아니라 계산 순서**입니다.")
-    if retryable and st.button("다시 시도", key="retry_advice"):
-        st.session_state.pop("_advice", None)  # 캐시를 비우고 재호출
-        st.rerun()
+    with st.container(key="advice_banner"):
+        st.warning(f"⚠ {text}\n\n{_FALLBACK_NOTE}")
+        if retryable and st.button("다시 시도", key="retry_advice"):
+            st.session_state.pop("_advice", None)  # 캐시를 비우고 재호출
+            st.rerun()
 
 
 def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
@@ -638,7 +646,7 @@ def render_flow_chart(
     - 꺾은선 대신 월별 막대라 24개월차 절벽 같은 급락이 눈에 잘 들어온다.
     - x축 0~horizon 고정, y축 하한 0(balance_at 은 음수가 없다). shortfall_at 은
       역산용 가상 궤적이라 그리지 않는다(오해 방지).
-    - 값 라벨은 시작·최고점·절벽 직후 3곳만(37개 전부 붙이면 안 읽힌다).
+    - 값 라벨은 시작·최고점 2곳만(37개 전부 붙이면 안 읽힌다).
 
     **세 시점을 성격에 따라 다르게 표시한다.** 세로선을 셋 그으면 복잡하다.
         결과   소진 시점        빨강 세로 점선 — 가장 눈에 띄게
@@ -660,11 +668,10 @@ def render_flow_chart(
     # ▼ 마커와 라벨이 말한다(잔고라는 같은 값을 같은 색으로 두는 게 읽기 쉽다).
     bar_color = "#2b6cb0"
 
-    # 값 라벨: 시작(t=0)·최고점·절벽 직후 3곳만
+    # 값 라벨: 시작(t=0)·최고점 2곳만. 절벽 달은 ▼ 마커에 자리를 내준다 —
+    # 숫자가 있으면 마커가 그 위로 밀려 어느 막대를 가리키는지 안 보인다.
     peak_idx = max(range(len(balance)), key=lambda i: balance[i])
     label_idx = {0, peak_idx}
-    if cliff_at is not None and cliff_at < len(balance):
-        label_idx.add(cliff_at)
     text = [f"{balance[i]:,.0f}" if i in label_idx else "" for i in months]
 
     fig = go.Figure()
@@ -722,16 +729,18 @@ def render_flow_chart(
     if marker is not None:
         at, note = marker
         bar_top = balance[at] if at < len(balance) else 0
+        # 라벨 → ▼ → 막대가 세로로 이어지게 붙인다. 띄우면 어느 막대를 가리키는지
+        # 안 보인다. 절벽 달이 최고점과 겹쳐 값 라벨이 있을 때만 그만큼 비켜 준다.
+        tri_shift = 30 if at in label_idx else 12
         fig.add_annotation(
             x=at, y=bar_top, yref="y",
-            text="▼", showarrow=False, yshift=26,
-            font=dict(size=13, color="#dd6b20"),
+            text="▼", showarrow=False, yshift=tri_shift,
+            font=dict(size=22, color="#dd6b20"),
         )
-        # 라벨을 **마커 바로 위**에 둔다. 위쪽에 고정하면 어느 시점을 가리키는지 안 보이고,
-        # baseline 라벨과 한 줄에서 겹쳤다. 두 줄로 쪼개 가로 폭도 줄인다.
+        # 두 줄로 쪼개 가로 폭을 줄인다 — 한 줄이면 baseline 라벨과 겹친다.
         fig.add_annotation(
             x=at, y=bar_top, yref="y", text=note.replace("부터 ", "부터<br>"),
-            showarrow=False, yshift=64, align="center",
+            showarrow=False, yshift=tri_shift + 30, align="center",
             font=dict(size=11, color="#dd6b20"),
         )
 
@@ -1020,15 +1029,21 @@ def render_group_card(
     baseline_survival: int,
     expanded: bool,
     pick: agent.Pick | None = None,
+    ranked: bool = False,
 ) -> None:
-    """후보 그룹 하나를 카드로 그린다."""
+    """후보 그룹 하나를 카드로 그린다.
+
+    ranked — LLM 이 고른 카드일 때만 True. 그때만 제목이 'N위'다. 폴백일 때 번호는
+    계산 순서일 뿐이고, LLM 이 성공해도 고른 3개 밖의 카드는 순위에 든 게 아니다.
+    """
     member = group.members[0]  # 대표. 같은 좌표라 2축 성능은 동일하다.
     trap_icon = " ⚠" if group.has_trap else ""
-    # 제목: 후보 N │ 정책명(파랑) │ 성과. LLM 이 고르면 이 번호가 순위가 된다.
+    # 제목: N위(또는 후보 N) │ 정책명(파랑) │ 성과.
     # st.expander 라벨의 마크다운 색상 지시자(:blue[…])는 Streamlit 1.62 문서상 지원되나
     # 렌더링은 브라우저에서 확인해야 한다. 안 먹으면 색 대신 다른 방식으로 바꾼다.
     perf = f"생존 {months_label(group.survival_months)} · 종료 시점 부채 {fmt_man(group.debt_at_exit)}"
-    title = f"**후보 {idx}**  │  :blue[{member.label}]{trap_icon}  │  {perf}"
+    head = f"**{idx}위**" if ranked else f"**후보 {idx}**"
+    title = f"{head}  │  :blue[{member.label}]{trap_icon}  │  {perf}"
     with st.expander(title, expanded=expanded):
         # '레이어 N'(내부 용어) 을 지운 자리에 **LLM 이 고른 이유**가 들어간다.
         # axis_focus 는 앞에 배지로 — 어느 축을 보고 골랐는지가 한눈에 들어와야 한다.
@@ -1079,9 +1094,12 @@ def render_group_card(
             # 안내는 **첫 카드에만** — 상자 안에서만 쓰이는 설명이라 여기 있어야 하고,
             # 카드마다 반복하면 다섯 번 나온다.
             if idx == 1 and adjustable_loan(member) is not None:
+                # 만져 보라고 만든 기능이라 권유하는 어투로 쓴다.
+                # 뒷문장은 남긴다 — 슬라이더로 바뀌는 부분(하늘색 상자 안)과 그렇지
+                # 않은 부분(위쪽 지원 전후 대비)을 명확히 한다.
                 st.caption(
-                    "ℹ 슬라이더로 금액을 바꾸면 **이 상자 안** 만 다시 계산됩니다. "
-                    "위쪽 생존 개월 대비·지원 내역은 원래 금액 기준입니다."
+                    "슬라이더로 금액을 바꿔보세요. **하늘색 상자 안**이 다시 계산됩니다. "
+                    "위쪽 지원 전후 대비는 원래 금액 기준입니다."
                 )
             shown = render_loan_slider(member, profile, key=f"loan_{card_id}")
 
@@ -1216,14 +1234,8 @@ def render_results(
                 "정책 한도로도 채우기 어렵습니다."
             )
 
-    if not groups:
-        st.warning("조건에 맞는 조합을 찾지 못했습니다. 자격 조건이나 입력값을 조정해 보세요.")
-        return
-
-    # LLM 이 붙으면서 번호는 **진짜 순위**가 됐다. 옛 문구("번호는 순위가 아닙니다")는
-    # 지운다 — 남아 있으면 거짓말이 된다.
-    # 순위가 LLM 판단이라는 것은 위의 'AI 판단'(phase_reading) 상자가 말한다.
-    # 폴백 상태에서는 코드 순서이므로 배너가 "AI 판단이 아니라 계산 순서"라고 밝힌다.
+    # LLM 이 고른 카드만 'N위'가 된다(render_group_card 의 ranked). 폴백이면 전부
+    # '후보 N' 이라 옛 문구("번호는 순위가 아닙니다")는 필요 없다.
     picks_by_label = (
         {p.label: p for p in advice.picks} if advice is not None and advice.ok else {}
     )
@@ -1259,11 +1271,12 @@ def render_results(
 
     baseline_first_payment = simulate(profile, []).payment_during[0]
     for idx, group in enumerate(groups, start=1):
+        pick = picks_by_label.get(group.members[0].label)
         render_group_card(
             idx, group, reports, profile, ctx,
             baseline_first_payment, baseline_survival,
             expanded=(idx == 1),  # 1순위 기본 펼침
-            pick=picks_by_label.get(group.members[0].label),
+            pick=pick, ranked=pick is not None,
         )
 
     # 부가 추천 (컨설팅·법률자문 등)
@@ -1398,6 +1411,16 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
         }
         /* ①게이지·②버퍼 열 묶음도 다른 카드와 같은 간격(12px)을 갖게. */
         .st-key-diag_row { margin-top: 12px; }
+
+        /* AI 실패 배너 — 배경색만 있어 경계가 흐리고 그냥 지나친다.
+           **색은 노랑 그대로 둔다.** 주황으로 올리면 아래 함정 경고(노랑)보다 세져
+           "돈 얘기보다 시스템 얘기가 더 급한 것"처럼 위계가 뒤집힌다.
+           대신 왼쪽 굵은 세로선 + 전체 테두리로 경계만 세운다.
+           ⚠ '.st-key-advice_banner' 와 stAlert 도 navbar 와 같은 내부 구조 의존이다. */
+        .st-key-advice_banner [data-testid="stAlert"] {
+            border: 1px solid #d69e2e;
+            border-left: 6px solid #b7791f;
+        }
 
         /* 슬라이더로 다시 계산되는 영역 — 연한 하늘색 상자.
            위쪽(대비 줄·지원 내역)은 원래 조합 기준이라 안 바뀌는데, 경계가 안 보이면

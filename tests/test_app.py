@@ -6,9 +6,13 @@
 """
 from __future__ import annotations
 
+import ast
+import contextlib
 import datetime
 import os
 import pathlib
+
+import streamlit
 
 import app
 from core.cashflow import SIM_MONTHS
@@ -698,6 +702,118 @@ def test_slider_does_not_leak_across_scenarios():
     print(f"   A→B→A 왕복 — 굴린 값 {original + 700} 안 남고 {back_again} 로 복귀 ✓")
 
 
+@contextlib.contextmanager
+def _capture_messages():
+    """st.error/warning/caption/info 로 나간 문구를 모은다.
+
+    app.py 는 `import streamlit as st` 라 모듈 속성을 갈아끼우면 그대로 잡힌다.
+    """
+    seen: list[tuple[str, str]] = []
+    names = ("error", "warning", "caption", "info")
+    orig = {n: getattr(streamlit, n) for n in names}
+    for name in names:
+        setattr(
+            streamlit, name,
+            lambda msg, *a, _n=name, **k: seen.append((_n, str(msg))),
+        )
+    try:
+        yield seen
+    finally:
+        for name, fn in orig.items():
+            setattr(streamlit, name, fn)
+
+
+def test_zero_candidates_message_by_cause():
+    """후보 0개일 때 원인별로 다른 문구가 뜨는지.
+
+    자격 확인으로 빠진 경우와 애초에 자격이 없는 경우는 사용자가 할 수 있는 일이 다르다.
+    이 분기는 앞선 커밋에서 넣었지만 옛 경고가 먼저 return 해 실행되지 않았다.
+    화면 문구를 직접 보는 테스트가 없어 못 잡았다.
+    """
+    def run(dropped: bool) -> str:
+        with _capture_messages() as seen:
+            # groups 가 비면 profile·ctx 를 쓰기 전에 return 한다.
+            app.render_results(
+                [], {}, [], None, None,
+                baseline_survival=6, goal_satisfied=True, target_months=None,
+                resolve_info=None, prompt_text="", precise=True,
+                advice=None, dropped_by_confirm=dropped,
+            )
+        return " / ".join(text for _, text in seen)
+
+    by_confirm = run(True)
+    assert "확인되지 않은 자격은 없는 것으로 보고 제외했습니다" in by_confirm
+    assert "⑥ 추가 확인" in by_confirm
+    assert "조건에 맞는 조합을 찾지 못했습니다" not in by_confirm, (
+        "옛 경고가 살아 있다 — 원인별 분기가 다시 죽었다"
+    )
+
+    no_eligible = run(False)
+    assert "현재 조건으로 자격이 되는 정책이 없습니다" in no_eligible
+    assert "소상공인 지원기관" in no_eligible
+    assert "⑥ 추가 확인" not in no_eligible
+
+    # 자격을 얻으려고 상황을 다르게 적으라는 안내는 쓰지 않는다.
+    for text in (by_confirm, no_eligible):
+        for banned in ("폐업", "재창업"):
+            assert banned not in text, f"'{banned}' 를 바꿔 보라는 안내는 쓰지 않는다"
+    print("   후보 0개 — 자격확인 제외 / 애초에 자격 없음 문구가 갈린다 ✓")
+
+
+def test_no_unreachable_code():
+    """이른 return 뒤에 놓여 실행되지 않는 코드를 찾는다.
+
+    같은 조건을 두 번 검사하면(`if not groups:` 가 둘) 뒤 블록이 죽는데, 화면은
+    옛 문구를 그대로 띄워서 눈에 띄지 않는다. 조건 안의 이름이 그 사이에 재대입되면
+    정상이므로 건너뛴다.
+    """
+    term = (ast.Return, ast.Raise, ast.Break, ast.Continue)
+
+    def names_in(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    def assigned_in(stmts):
+        return {
+            n.id for s in stmts for n in ast.walk(s)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+        }
+
+    root = pathlib.Path(app.__file__).parent
+    files = sorted(root.glob("*.py")) + sorted((root / "core").glob("*.py"))
+    problems = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            for attr in ("body", "orelse", "finalbody"):
+                stmts = getattr(node, attr, None)
+                if not (isinstance(stmts, list) and stmts
+                        and isinstance(stmts[0], ast.stmt)):
+                    continue
+                for i, stmt in enumerate(stmts[:-1]):
+                    if isinstance(stmt, term):
+                        problems.append(
+                            f"{path.name}:{stmts[i + 1].lineno} "
+                            f"— {stmt.lineno}행 {type(stmt).__name__} 뒤"
+                        )
+                guards: dict[str, int] = {}
+                for i, stmt in enumerate(stmts):
+                    if not isinstance(stmt, ast.If):
+                        continue
+                    cond = ast.unparse(stmt.test)
+                    if cond in guards:
+                        prev = guards[cond]
+                        if not (names_in(stmt.test) & assigned_in(stmts[prev + 1:i])):
+                            problems.append(
+                                f"{path.name}:{stmt.lineno} — `if {cond}` 를 "
+                                f"{stmts[prev].lineno}행이 이미 걸러 return 한다"
+                            )
+                    if stmt.body and isinstance(stmt.body[-1], term) and not stmt.orelse:
+                        guards[cond] = i
+
+    assert not problems, "도달하지 않는 코드\n  " + "\n  ".join(problems)
+    print(f"   도달 불가 코드 없음 · 파일 {len(files)}개 ✓")
+
+
 def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
@@ -712,6 +828,8 @@ def main() -> None:
     test_confirm_keys_are_stable()
     test_confirm_excludes_unsure_like_no()
     test_demo_confirm_presets_match_real_questions()
+    test_zero_candidates_message_by_cause()
+    test_no_unreachable_code()
     test_simresult_split_identity()
     test_month_display_sums()
     test_trap_message_matches_table()
