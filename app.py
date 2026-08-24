@@ -813,6 +813,23 @@ def adjustable_loan(member: Evaluated):
     return item
 
 
+def restore_loan_amount(widget_key: str, default_man: int) -> None:
+    """[↺ 추천 금액으로] 콜백 — 세션에 추천 금액을 **대입**한다.
+
+    ⚠ `st.session_state.pop(widget_key)` 로 지우면 안 된다. 파이썬 쪽 계산은 추천
+    금액으로 돌아가지만 브라우저의 눈금은 굴린 자리에 그대로 남아 화면에 두 값이
+    다르게 뜬다. 슬라이더 proto 의 set_value 가 "눈금을 옮겨라"를 전달하는데,
+    지우면 False 이고 대입해야 True 가 된다.
+
+    ⚠ st.rerun() 도 쓰지 마라. 스크립트를 그 자리에서 끊으면 아래 카드들의 슬라이더가
+    그 실행에 등록되지 않아 Streamlit 이 그 상태를 지운다(화면 전환 때 기대는 purge).
+    카드 하나를 되돌렸을 뿐인데 아래 카드들이 전부 기본값으로 돌아간다.
+
+    콜백은 위젯이 만들어지기 전에 도므로 위젯 key 에 대입해도 예외가 나지 않는다.
+    """
+    st.session_state[widget_key] = default_man
+
+
 def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Evaluated:
     """융자 슬라이더(있을 때만) + **결과 카드 4칸(항상)**.
 
@@ -832,35 +849,36 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
         min_man, max_man = floor // MAN, ceiling // MAN
         step_man = max(1, unit // MAN)
         default_man = min(max(loan_item.effective_amount // MAN, min_man), max_man)
-        # 라벨은 화면에 그리지 않는다. 조합에 융자는 최대 하나라 어느 정책의 금액을
-        # 조정하는지 헷갈릴 일이 없고, 바로 위 지원 내역에 같은 정책명이 이미 있다.
-        # 라벨 자리를 비워 슬라이더가 폭을 다 쓰고(폭이 곧 조작 정밀도다) 그 위 빈 줄에
-        # 버튼을 얹는다. 인자로는 남긴다 — 화면에 안 보일 뿐 스크린리더가 읽는다.
-        _, tail = st.columns([0.7, 0.3])
+        # 라벨과 버튼을 한 줄에 놓고 슬라이더는 그 아래 100% 폭으로 둔다(폭이 곧 조작
+        # 정밀도다). 라벨을 직접 그리므로 native 위젯 라벨과 미세하게 다를 수 있는데,
+        # 하늘색 상자 안에 다른 위젯이 없어 나란히 비교될 일이 없다.
+        head, tail = st.columns([0.7, 0.3])
+        with head:
+            st.markdown(
+                "<div style='font-size:0.875rem;padding-top:8px;'>"
+                f"융자 금액 조정 — {cand.policy_name}</div>",
+                unsafe_allow_html=True,
+            )
         with tail:
-            # 위젯 값을 대입하지 않고 세션에서 key 를 지운다. 다음 실행에서 슬라이더는
-            # 저장된 값이 없는 상태로 만들어져 value=default_man 을 쓴다.
-            #
-            # ⚠ **on_click 콜백이어야 한다. st.rerun() 으로 바꾸지 마라.**
-            # `if st.button(...): pop; st.rerun()` 은 스크립트를 그 자리에서 끊는다.
-            # 그러면 아래 카드들의 슬라이더가 그 실행에 등록되지 않아 Streamlit 이
-            # 상태를 지운다(화면 전환 때 우리가 기대는 그 purge 다). 카드 1을
-            # 되돌렸는데 카드 2의 굴린 값 4,359 가 기본값 3,659 로 돌아가는 것을
-            # 실측했다. 콜백은 스크립트를 끊지 않고 다음 **전체** 실행 직전에 돈다.
             st.button(
                 "↺ 추천 금액으로", key=f"reset_{key}", width="stretch",
-                on_click=lambda k=key: st.session_state.pop(k, None),
+                on_click=restore_loan_amount, args=(key, int(default_man)),
             )
+        # 세션에 값이 있으면 value= 를 넘기지 않는다. 둘을 같이 주면 Streamlit 이
+        # "default value 로 만들었는데 Session State API 로도 값을 넣었다"고 경고하며
+        # 스택까지 찍는다. 되돌리기가 세션에 대입하는 방식이라 굴릴 때마다 나온다.
+        # value 만 갈리고 min·max·step·format 은 두 경로에서 같다.
+        initial = {} if key in st.session_state else {"value": int(default_man)}
         picked_man = st.slider(  # transient-widget: 결과 카드 what-if. 단계 답이 아니라
             # 되돌아가면 초기화되는 게 맞다(ss.answers 를 안 탄다).
-            f"융자 금액 조정 — {cand.policy_name}",
+            f"융자 금액 조정 — {cand.policy_name}",  # 위에 직접 그려 화면에서는 감춘다
             min_value=min_man,
             max_value=max_man,
-            value=int(default_man),
             step=step_man,
             format="%d만원",
             key=key,
             label_visibility="collapsed",
+            **initial,
         )
         # 슬라이더 값을 실제 신청 가능 금액으로 스냅한다(단위 올림·금액_하한 처리).
         # 같은 규칙을 UI에서 새로 구현하지 않고 combos.snap_amount 를 그대로 통과시킨다.
@@ -1111,9 +1129,9 @@ def render_group_card(
         # (재시도 등) idx 기준 key 는 슬라이더 값이 엉뚱한 조합에 붙는다.
         card_id = stable_key("card", member.label)
         with st.container(key=f"adjust_{card_id}"):
-            # 안내는 **첫 카드에만** — 상자 안에서만 쓰이는 설명이라 여기 있어야 하고,
-            # 카드마다 반복하면 다섯 번 나온다.
-            if idx == 1 and adjustable_loan(member) is not None:
+            # 안내는 **모든 카드에** 같은 자리로. 카드를 펼치는 순서가 정해져 있지
+            # 않아 첫 카드에만 두면 후보 3만 펼친 사람은 이 설명을 못 본다.
+            if adjustable_loan(member) is not None:
                 # 만져 보라고 만든 기능이라 권유하는 어투로 쓴다.
                 # 뒷문장은 남긴다 — 슬라이더로 바뀌는 부분(하늘색 상자 안)과 그렇지
                 # 않은 부분(위쪽 지원 전후 대비)을 명확히 한다.

@@ -9,8 +9,10 @@ from __future__ import annotations
 import ast
 import contextlib
 import datetime
+import logging
 import os
 import pathlib
+import re
 
 import streamlit
 
@@ -624,6 +626,40 @@ def _loan_sliders(at):
     return [s for s in at.slider if s.key and s.key.startswith("loan_")]
 
 
+_LOAN_CELL = re.compile(r"융자\(조정\)</div><div style='[^']*'>([\d,]+)만원")
+
+
+def _card_loan_amount(at) -> int | None:
+    """'융자(조정)' 칸에 적힌 만원 값. 슬라이더 표시값과 같아야 한다.
+
+    둘이 갈리는 게 되돌리기 버그의 증상이었다 — 파이썬은 추천 금액으로 계산하는데
+    브라우저 눈금은 굴린 자리에 남아 화면에 두 값이 다르게 떴다.
+    """
+    for block in at.markdown:
+        hit = _LOAN_CELL.search(block.value)
+        if hit:
+            return int(hit.group(1).replace(",", ""))
+    return None
+
+
+@contextlib.contextmanager
+def _streamlit_warnings():
+    """Streamlit 이 로거로 내는 경고를 모은다(화면 요소가 아니라 stderr 로 나간다)."""
+    seen: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = _Collect()
+    logger = logging.getLogger("streamlit")
+    logger.addHandler(handler)
+    try:
+        yield seen
+    finally:
+        logger.removeHandler(handler)
+
+
 def _to_results(at) -> None:
     while at.session_state["step"] < app.S_RESULTS:
         _advance(at)
@@ -735,8 +771,21 @@ def test_reset_button_restores_only_its_card():
     assert screen(at) != before, "굴렸는데 화면이 안 바뀌었다"
     at.button(key=f"reset_{keys[0]}").click()
     at.run(timeout=120)
-    assert _loan_sliders(at)[0].value == base[keys[0]]
+    restored = _loan_sliders(at)[0]
+    assert restored.value == base[keys[0]]
     assert screen(at) == before, "되돌린 카드의 아래 내용이 원래 값으로 안 돌아왔다"
+
+    # 눈금이 실제로 움직이는지. set_value 가 False 면 파이썬은 추천 금액으로 계산하는데
+    # 브라우저는 굴린 자리를 그대로 들고 있어 화면에 두 값이 다르게 뜬다.
+    # AppTest 의 .value 는 proto 를 되읽은 값이라 이 차이를 못 본다 — 그래서 플래그를
+    # 직접 본다. 세션에서 key 를 지우는 방식으로 되돌리면 여기서 걸린다.
+    assert restored.proto.set_value, (
+        "슬라이더 proto 의 set_value 가 False 다 — 브라우저 눈금이 안 움직인다. "
+        "되돌리기가 세션 대입이 아니라 pop 으로 바뀌었는지 확인하라"
+    )
+    assert _card_loan_amount(at) == restored.value, (
+        f"슬라이더({restored.value})와 융자(조정) 카드({_card_loan_amount(at)})가 다르다"
+    )
 
     # ── ② 전부 굴린 뒤 하나만 되돌리면 나머지는 굴린 값 유지 ──
     for i, slider in enumerate(_loan_sliders(at)):
@@ -761,6 +810,79 @@ def test_reset_button_restores_only_its_card():
     print(
         f"   되돌리기 — 카드1 {expected[keys[0]]}→{after[keys[0]]} · "
         f"나머지 {len(kept)}개 굴린 값 유지 · 아래 내용도 원래대로 ✓"
+    )
+
+
+def test_slider_init_paths_and_no_warning():
+    """슬라이더 초기화 두 경로가 어긋나지 않고, Streamlit 경고가 안 나는지.
+
+    되돌리기가 세션에 값을 대입하므로 `value=` 를 함께 넘기면 Streamlit 이
+    "default value 로 만들었는데 Session State API 로도 값을 넣었다"고 경고하며
+    스택까지 찍는다. 화면에는 안 뜨지만 시연 중 터미널에 나오면 결함처럼 보인다.
+    그래서 세션에 값이 있으면 `value=` 를 넘기지 않는데, 그 분기가 두 경로를 만든다.
+
+        세션에 값 없음   value=추천금액 으로 생성 (첫 진입 · 퍼지 후 복귀)
+        세션에 값 있음   value= 없이 생성        (굴린 뒤 · 되돌린 뒤)
+
+    value 만 갈리고 min·max·step 은 같아야 한다.
+    """
+    with _streamlit_warnings() as warned:
+        at = _fresh_app()
+        while at.session_state["step"] < app.S_GOALS:
+            _advance(at)
+        _to_results(at)
+        sliders = _loan_sliders(at)
+        if not sliders:
+            print("   (융자 슬라이더가 있는 카드 없음 — 스킵)")
+            return
+
+        key = sliders[0].key
+        base = sliders[0].value
+        first = sliders[0].proto            # 경로 A — value= 로 생성
+        assert _card_loan_amount(at) == base, "첫 진입부터 슬라이더와 카드가 다르다"
+
+        def slider_of(at):
+            return [s for s in _loan_sliders(at) if s.key == key][0]
+
+        slider_of(at).set_value(base + 300)
+        at.run(timeout=120)
+        at.button(key=f"reset_{key}").click()
+        at.run(timeout=120)
+        second = slider_of(at).proto        # 경로 B — 세션 값으로 생성
+        assert slider_of(at).value == base
+
+        assert (first.min, first.max, first.step) == (second.min, second.max, second.step), (
+            f"두 경로의 min·max·step 이 다르다\n"
+            f"  value= 경로: {first.min}~{first.max} step {first.step}\n"
+            f"  세션  경로: {second.min}~{second.max} step {second.step}"
+        )
+
+        # 퍼지 후 복귀 — 세션이 비므로 다시 value= 경로. 새 계산값으로 시작해야 한다.
+        _back(at)
+        assert not [k for k in at.session_state.filtered_state if str(k).startswith("loan_")]
+        _advance(at)
+        assert slider_of(at).value == base, "복귀 후 추천 금액으로 시작하지 않는다"
+
+        # 목표를 바꾸면 추천 금액 자체가 달라진다. 옛 값이 남으면 안 된다.
+        slider_of(at).set_value(base + 400)
+        at.run(timeout=120)
+        while at.session_state["step"] > app.S_GOALS:
+            _back(at)
+        at.slider(key="goal_months_w").set_value(30)
+        at.run(timeout=120)
+        _to_results(at)
+        after_goal = _loan_sliders(at)[0]
+        assert after_goal.value != base + 400, "목표를 바꿨는데 굴린 값이 남았다"
+        assert _card_loan_amount(at) == after_goal.value
+
+    session_warnings = [w for w in warned if "Session State API" in w]
+    assert not session_warnings, (
+        "Streamlit 이 세션 대입 경고를 냈다 — 세션에 값이 있을 때 value= 를 넘기는지 "
+        f"확인하라\n  {session_warnings[0]}"
+    )
+    print(
+        f"   슬라이더 두 경로 일치({first.min}~{first.max} step {first.step}) · "
+        f"목표 변경 후 {after_goal.value} · Streamlit 경고 0건 ✓"
     )
 
 
@@ -931,6 +1053,7 @@ def main() -> None:
     test_slider_resets_when_inputs_change()
     test_slider_does_not_leak_across_scenarios()
     test_reset_button_restores_only_its_card()
+    test_slider_init_paths_and_no_warning()
     test_reset_button_only_where_slider_exists()
     print("\n전부 통과")
 
