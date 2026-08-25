@@ -1,3 +1,6 @@
+﻿# 이 파일은 UTF-8 BOM 으로 저장한다. pip 은 BOM 이 없으면 OS 로케일 코덱으로 읽는데,
+# 한국어 Windows(cp949)에서는 아래 한글·괘선 때문에 UnicodeDecodeError 로 설치가
+# 통째로 실패한다. BOM 을 지우지 마라.
 # ─── 코어 (지금 당장 필요) ───
 # 표준 라이브러리만으로 동작하므로 시뮬레이터 단계에서는 설치 불필요
 
@@ -11,6 +14,15 @@ pandas>=2.2
 # ─── LLM 에이전트 ───
 anthropic>=0.40
 python-dotenv>=1.0
+
+# anthropic 1.x 는 httpx2 를 쓰는데, httpx2 의 brotli 디코더가
+# Decompressor.process(data, output_buffer_limit=...) 로 호출한다.
+# 1.1.0 이하의 process() 는 키워드 인자를 안 받아 TypeError 가 나고, SDK 가 그것을
+# APIConnectionError 로 감싸 던진다 — 표면 메시지가 원인과 전혀 다르다.
+# 1.1.0·1.2.0 을 각각 깔아 실측했다(1.1.0 거부 · 1.2.0 허용).
+# **이 줄의 버전을 내리지 마라.**
+# (core/agent.py 는 Accept-Encoding 에서 brotli 를 빼 두 겹으로 막는다.)
+Brotli>=1.2.0
 
 # ─── 개발 (선택) ───
 # pytest>=8.0

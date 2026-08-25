@@ -606,24 +606,78 @@ def to_prompt_text(
     # 전문은 아래에 한 번만 싣는다.
     confirm_defs: dict[str, int] = {}
 
-    for group in groups:
+    # ── 1번 후보 대비 차이를 코드가 계산해 넣는다 ──
+    # 후보들이 몰려 있으면(데모 B 는 생존이 전부 같고 부채가 27만원 차이) LLM 이 구별해
+    # 설명하려고 직접 뺄셈을 하는데, 그 값은 프롬프트에 없어 숫자 검증이 응답을 통째로
+    # 버린다(실측 3회 연속). 차이를 미리 주면 뺄 이유가 없어진다.
+    #
+    # 기준은 **맨 위 후보**다. 레이어 1에 그룹이 여럿일 수 있어 '레이어 1 대비'는
+    # 모호하고, '바로 위 대비'는 사슬이 돼 읽기 어렵다.
+    # **부호 대신 말로 쓴다** — '+448만원'은 많다는 뜻인지 적다는 뜻인지 갈리고,
+    # LLM 이 방향을 뒤집어 써도 숫자 검증은 못 잡는다.
+    # **표시되는 반올림값끼리 뺀다.** 원값으로 빼서 반올림하면 화면의 두 수를 빼도
+    # 그 값이 안 나온다.
+    base = groups[0] if groups else None
+    base_debt = round(base.debt_at_exit / MAN) if base else 0
+    base_total = (
+        round(base.members[0].result.total_payment / MAN)
+        if base and base.members else 0
+    )
+    base_member = base.members[0] if base and base.members else None
+
+    def _compare(delta: int, unit: str, more: str, less: str) -> str:
+        if delta == 0:
+            return "동일"
+        return f"{abs(delta):,}{unit} {more if delta > 0 else less}"
+
+    # 생존이 전부 같으면 줄마다 '생존 동일'을 반복하지 않고 목록 위에 한 번만 적는다.
+    # 다섯 줄에 같은 말이 반복되면 정보가 아니라 잡음이 되고, 무엇으로 구별해야 하는지도
+    # 흐려진다.
+    same_survival = len({g.survival_months for g in groups}) == 1 and len(groups) > 1
+    if same_survival:
         lines.append(
+            f"※ 후보 {len(groups)}개의 생존 개월수가 모두 {groups[0].survival_months}개월로 "
+            "같다. 생존 축으로는 구별되지 않으므로 종료 시점 부채와 상환 부담으로 판단할 것."
+        )
+        lines.append("")
+
+    for group in groups:
+        head = (
             f"[레이어 {group.layer}] 생존 {group.survival_months}개월"
             f"(생존 축 {group.survival_rank}위) · "
-            f"종료 시점 부채 {group.debt_at_exit / MAN:,.0f}만원"
+            f"종료 시점 부채 {round(group.debt_at_exit / MAN):,}만원"
             f"(부채 축 {group.debt_rank}위)"
         )
+        if group is base:
+            head += "  ← 아래 '1번 대비'의 기준"
+        else:
+            parts = []
+            if not same_survival:
+                parts.append("생존 " + _compare(
+                    group.survival_months - base.survival_months,
+                    "개월", "더 버팀", "덜 버팀",
+                ))
+            parts.append("부채 " + _compare(
+                round(group.debt_at_exit / MAN) - base_debt, "만원", "많음", "적음"
+            ))
+            head += "  [1번 대비] " + " · ".join(parts)
+        lines.append(head)
         for member in group.members:
             report = reports[member.label]
             lines.append(f"  - {member.label}")
             # 총 상환액은 축이 아니라 정보다. 두 축이 동점인 조합들의 이자 부담
             # 차이가 여기서만 드러난다(거치 중 파산하면 종료 시점 부채가 같아짐).
             # 생존 개월수와 함께 읽어야 한다 — 일찍 죽으면 낼 것이 없어 작아진다.
-            lines.append(
-                f"      36개월간 낸 원리금 총액 "
-                f"{member.result.total_payment / MAN:,.0f}만원 "
+            total_man = round(member.result.total_payment / MAN)
+            total_line = (
+                f"      36개월간 낸 원리금 총액 {total_man:,}만원 "
                 f"(월평균 {member.result.monthly_payment_avg / MAN:,.0f}만원)"
             )
+            if member is not base_member:
+                total_line += " · 1번 대비 " + _compare(
+                    total_man - base_total, "만원", "많음", "적음"
+                )
+            lines.append(total_line)
             # ── 주의 문구 ──
             # 성격이 다른 셋을 각각 출력한다.
             #   안내문구       제도가 정한 사실 (JSON 정책 레벨)

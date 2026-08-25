@@ -33,16 +33,41 @@ import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Sequence
 
-MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 2000
+MODEL = "claude-sonnet-5"
+"""$2/$10 per MTok. 이 작업은 판단과 서술이라 소넷 급이면 충분하다.
+(Sonnet 3.5 는 2025-10-28 에 은퇴해 쓸 수 없다.)
 
-TEMPERATURE = 0.0
-"""선정은 창작이 아니라 판단이다. 재현성이 심사에서 중요해 온도를 0으로 둔다
-(기획서 1003행). **0이어도 완전 결정적이지는 않아** 재현성은 따로 실측한다."""
+**모델을 바꿀 때 고치는 곳은 이 파일의 상수 넷뿐이다** — MODEL · MAX_TOKENS ·
+THINKING · TEMPERATURE. 프롬프트는 손대지 않는다.
+재현성이 부족하면 claude-sonnet-4-6($3/$15)이 대안이다. temperature 를 받고
+thinking 이 기본 꺼짐이라 재현성만 놓고 보면 유리하다."""
+
+MAX_TOKENS = 8000
+"""잘림을 먼저 없애고 실제 output_tokens 를 보고 낮춘다. 잘리면 파싱 실패로 폴백된다."""
+
+THINKING: dict | None = {"type": "disabled"}
+"""끈다. 코드가 계산·판정·정렬을 끝냈고 LLM 은 고르고 서술만 한다.
+켜면 사고 토큰이 max_tokens 를 먹어 JSON 이 잘리고 출력 비용도 늘어난다.
+None 이면 인자를 넘기지 않는다(모델 기본값)."""
+
+TEMPERATURE: float | None = None
+"""Sonnet 5 는 샘플링 파라미터(temperature·top_p·top_k)를 받지 않고 400 을 낸다.
+기획서 1003행의 재현성 장치 중 '온도 낮춤'이 빠지므로 30회 실측으로 확인한다
+(데모 프리셋 고정은 그대로 유효하다).
+temperature 를 받는 모델(claude-sonnet-4-6 · claude-haiku-4-5)로 바꾸면 0.0 을 넣는다."""
 
 TIMEOUT_SECONDS = 60.0
+
+RESPONSE_ENCODING = {"Accept-Encoding": "gzip, deflate"}
+"""응답 압축에서 brotli 를 뺀다. Brotli 1.1.0 이하의 Decompressor.process() 는 httpx2 가
+넘기는 output_buffer_limit 인자를 받지 않아 TypeError 가 나고, 그게 SDK 안에서
+APIConnectionError 로 감싸여 나온다 — 표면 메시지가 원인과 전혀 다르다.
+requirements.txt 에 Brotli>=1.2.0 을 못박았지만, 남의 환경에서 옛 버전이 깔려도
+brotli 를 안 받으면 걸리지 않는다(1.1.0 에서 이 헤더로 성공하는 것을 실측했다).
+gzip 은 그대로 쓰므로 전송량 손해는 작다."""
 
 
 class Failure(str, Enum):
@@ -115,6 +140,9 @@ SYSTEM_PROMPT = """당신은 서울 소상공인에게 정책 조합을 추천�
 
 1. 국면 맥락으로 **어느 축을 중시할지** 판단한다.
 2. 후보 중 **최종 3개**를 고른다. 레이어 1부터 고를 필요는 없다 — 위 기준으로 판단한다.
+   **후보가 3개 이상이면 반드시 3개를 채운다.** 함정이 있는 조합도 3위에 넣을 수 있다 —
+   함정은 제외 사유가 아니라 trap_note 로 알릴 사항이다. 판단은 사용자가 한다.
+   2개만 고르고 나머지를 excluded 로 보내지 마라.
 3. 함정 경고([경고] 줄)를 **사용자의 말로** 풀어 쓴다. '함정 판정 — 4종 모두 해당 없음'
    이라고 적힌 조합은 걸린 함정이 없다는 뜻이다.
 4. 자격은 되지만 **추천에서 뺀 이유**를 쓴다.
@@ -146,7 +174,8 @@ JSON 하나만 출력한다. 설명이나 코드블록 표시를 붙이지 마�
   "excluded": [{"label": "...", "reason": "자격은 되지만 뺀 이유 한 문장"}]
 }
 
-picks 는 정확히 3개다. 후보가 3개보다 적으면 있는 만큼만 고른다.
+picks 는 **정확히 3개**다. 후보가 3개보다 적을 때만 있는 만큼 고른다.
+후보가 3개 이상인데 2개만 넣으면 잘못된 응답이다.
 steps 는 순서가 실제로 중요한 조합에서만 채우고, 아니면 빈 배열로 둔다."""
 
 
@@ -184,9 +213,53 @@ def _unknown_numbers(text: str | None, allowed: set[str]) -> list[str]:
     return sorted(_numbers_in(text) - allowed)
 
 
+_YEARS = re.compile(r"(\d+)\s*년")
+
+
+def _year_months(labels: Sequence[str]) -> set[str]:
+    """조합 이름의 'N년'을 개월로 환산한 값. 허용 목록에 더한다.
+
+    '1년거치 4년 균분상환'을 LLM 이 '12개월 거치'로 풀어 쓰면 프롬프트에 없는 숫자가 되어
+    응답이 통째로 버려졌다(실측: A 는 48, B 는 12). 사용자에게 친절한 표기라 막을 이유가
+    없다. 반면 뺄셈 같은 **파생 계산은 그대로 막는다** — 그쪽은 optimizer 가 차이값을
+    프롬프트에 실어 해결했다('1번 대비 448만원 적음').
+
+    **조합 이름에서만 찾는다.** 프롬프트 전체를 훑으면 자격 문구의 '3년 내' 같은 것까지
+    걸려 허용 목록이 넓어지고, 그만큼 환각이 통과할 자리가 생긴다.
+    연->개월(x12) 하나만 연다. 만원<->원 같은 다른 변환은 지금 문제가 아니고, 넓게 열면
+    검증이 무력해진다. 필요해지면 그때 추가한다.
+    """
+    out: set[str] = set()
+    for label in labels:
+        for hit in _YEARS.finditer(label):
+            out.add(str(int(hit.group(1)) * 12))
+    return out
+
+
 # ══════════════════════════════════════════════════════════
 # 호출
 # ══════════════════════════════════════════════════════════
+
+
+_dotenv_loaded = False
+
+
+def _load_dotenv_once() -> None:
+    """프로젝트 루트의 .env 를 환경변수로 올린다. 한 번만.
+
+    이게 없어서 .env 에 키를 넣어도 앱이 못 읽었다. 이미 환경에 있는 값은 덮지 않는다
+    (배포 환경의 설정이 로컬 파일에 밀리면 안 된다).
+    import 시점이 아니라 첫 호출에 읽는다 — 모듈을 불러오는 것만으로 파일을 건드리지 않는다.
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    _dotenv_loaded = True
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return  # 배포(Streamlit Cloud)는 secrets 를 쓰므로 없어도 된다
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 
 def _api_key() -> str | None:
@@ -195,6 +268,7 @@ def _api_key() -> str | None:
     로컬은 .env(gitignore 됨), 배포는 Streamlit Cloud 의 secrets UI 를 쓴다.
     st.secrets 접근은 Streamlit 밖(테스트·스크립트)에서 예외가 나므로 감싼다.
     """
+    _load_dotenv_once()
     key = os.getenv("ANTHROPIC_API_KEY")
     if key:
         return key
@@ -237,13 +311,22 @@ def select_final_three(
         if client is None:
             import anthropic
 
-            client = anthropic.Anthropic(api_key=key, timeout=TIMEOUT_SECONDS)
+            client = anthropic.Anthropic(
+                api_key=key, timeout=TIMEOUT_SECONDS, default_headers=RESPONSE_ENCODING
+            )
+        # 모델마다 받는 인자가 다르다. None 인 상수는 아예 안 넘긴다 —
+        # Sonnet 5 에 temperature 를 넘기면 400 이다.
+        extra: dict = {}
+        if THINKING is not None:
+            extra["thinking"] = THINKING
+        if TEMPERATURE is not None:
+            extra["temperature"] = TEMPERATURE
         response = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt_text}],
+            **extra,
         )
     except Exception as error:  # 네트워크·인증·한도 등
         name = type(error).__name__.lower()
@@ -280,7 +363,7 @@ def build_advice(
 ) -> Advice:
     """파싱된 JSON 을 검증해 Advice 로. 검증 규칙이 한곳에 모여 테스트하기 쉽다."""
     usage = usage or {}
-    allowed = _numbers_in(prompt_text)
+    allowed = _numbers_in(prompt_text) | _year_months(labels)
     known = set(labels)
 
     picks_raw = data.get("picks")
