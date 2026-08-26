@@ -87,24 +87,38 @@ sosang-navigator/
 
 ## 실행
 
-의존성 없이 표준 라이브러리만으로 동작한다 (시뮬레이터 단계).
-
-```bash
-# 정책 데이터 요약
-python -m core.loader
-
-# 현금흐름 엔진 검증
-python -m tests.test_cashflow
-```
-
-Streamlit UI 단계로 넘어가면:
+**앱 전체**
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env      # API 키 입력
+cp .env.example .env      # ANTHROPIC_API_KEY 입력
 streamlit run app.py
 ```
+
+키가 없어도 화면은 뜬다. AI 추천 대신 시뮬레이션 결과가 나오고, 배너가 그 사실을 알린다.
+
+`core/` 와 `tests/` 는 표준 라이브러리만으로 동작해 설치 없이 돌릴 수 있다.
+
+```bash
+python -m core.loader          # 정책 데이터 요약
+python -m tests.test_cashflow  # 현금흐름 엔진 검증
+```
+
+Windows 에서 한글 출력이 깨지면 `PYTHONUTF8=1` 을 붙인다.
+
+**테스트는 실제 LLM 을 부르지 않는다.** 고정 응답으로 돌아서 결과가 항상 같고 돈도 안 든다.
+프롬프트가 제대로 나가는지, JSON 이 파싱되는지는 실제로 불러 봐야 확인된다. 그래서 별도
+명령으로 뒀다. 시스템 프롬프트나 `to_prompt_text()` 를 고친 뒤, 그리고 배포 전에 돌린다
+(호출당 약 $0.03).
+
+```bash
+SOSANG_LLM_LIVE=1 python -m tests.test_llm_live
+```
+
+> `requirements.txt` 는 **UTF-8 BOM** 으로 저장돼 있다. pip 은 BOM 이 없으면 OS 로케일
+> 코덱으로 읽어, 한국어 Windows(cp949)에서는 파일 안의 한글 때문에 설치가 통째로
+> 실패한다. BOM 을 지우지 마라.
 
 ---
 

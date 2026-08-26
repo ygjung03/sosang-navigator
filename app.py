@@ -264,11 +264,17 @@ def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     """LLM 최종 선정. **같은 프롬프트면 한 번만 호출**하고 세션에 캐시한다.
 
     슬라이더는 카드 안의 what-if 라 순위를 다시 뽑지 않는다 — 재호출하지 않는다.
-    입력을 고쳐 프롬프트가 달라지면 자동으로 다시 부른다(캐시 키가 프롬프트 해시다).
+    입력을 고쳐 프롬프트가 달라지면 자동으로 다시 부른다.
     실패했을 때만 '다시 시도' 버튼이 이 캐시를 비운다 — 성공한 답을 다시 부르면
     같은 입력에 다른 답이 나와 신뢰를 잃는다.
+
+    **키에 시스템 프롬프트와 모델명도 넣는다.** 사용자 프롬프트만 해싱하면 시스템
+    프롬프트를 고쳐도 키가 그대로라 옛 응답이 재사용된다(실제로 '3개를 채워라' 지시가
+    반영되지 않았다). 모델을 바꿀 때도 마찬가지다.
     """
-    key = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+    key = hashlib.sha256(
+        "\x00".join((prompt_text, agent.SYSTEM_PROMPT, agent.MODEL)).encode("utf-8")
+    ).hexdigest()[:16]
     cached = st.session_state.get("_advice")
     if cached and cached[0] == key:
         return cached[1]
@@ -278,19 +284,9 @@ def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     return advice
 
 
-def order_by_advice(
-    groups: list[CandidateGroup], advice: agent.Advice
-) -> list[CandidateGroup]:
-    """LLM 이 고른 순서로 그룹을 재배열한다. 고르지 않은 그룹은 뒤에 원래 순서대로.
-
-    그룹을 새로 만들지 않고 **순서만** 바꾼다 — 계산 결과는 코드의 것이고 LLM 은
-    고르기만 했다.
-    """
-    order = {pick.label: i for i, pick in enumerate(advice.picks)}
-    chosen = [g for g in groups if g.members[0].label in order]
-    chosen.sort(key=lambda g: order[g.members[0].label])
-    rest = [g for g in groups if g.members[0].label not in order]
-    return chosen + rest
+# order_by_advice() 는 지웠다. 그룹 단위로 재배열하면서 `g.members[0].label` 로 조회해,
+# LLM 이 대표 아닌 멤버를 고르면 그 pick 이 갈 자리가 없어 통째로 사라졌다.
+# render_results 가 picks 를 돌며 label 로 조합을 직접 찾는다.
 
 
 # ══════════════════════════════════════════════════════════
@@ -535,7 +531,7 @@ def confirm_questions(pool) -> list[dict]:
 def excluded_by_confirm(questions: list[dict], answers: dict) -> set[str]:
     """확인 질문의 답으로 **제외되는 후보 id**.
 
-    기획서 932~935행 — **'아니오'와 '잘 모르겠어요'는 똑같이 제외한다.** 확인하지 못한
+    기획서 5.2.5 ⑥ — **'아니오'와 '잘 모르겠어요'는 똑같이 제외한다.** 확인하지 못한
     자격을 있다고 가정하면 신청했다가 거절당한다. '모름'을 통과시키면 안 된다.
     답하지 않은 질문도 아직 확인되지 않은 것이라 같이 제외한다.
 
@@ -755,26 +751,23 @@ def render_flow_chart(
     st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def render_support_detail(evaluated: Evaluated, baseline_first_payment: float) -> None:
+def render_support_detail(evaluated: Evaluated) -> None:
     """지원 내역 — '무엇을 얼마나 받는지'. 둥근 테두리 박스로 감싼다.
 
     simulate가 만든 문장(result.notes)은 원 단위라, 표시 직전에 money_to_man 으로
     만원 단위로 바꾼다(계산은 그대로 원 단위, 화면 표기만 변환).
+
+    '현금 유입'과 '첫 달 상환 부담'은 두지 않는다 — 유입은 아래 카드의 보조금(확정)·
+    융자(조정)이 이미 나눠 보여주고, 첫 달 상환액은 상환 스케줄 표에 있다.
+    감면액은 남긴다. 네 칸 어디에도 없는 값이다.
     """
     result = evaluated.result
     with st.container(border=True):
         st.markdown("**지원 내역**")
         for note in result.notes:
             st.markdown(f"- {money_to_man(note)}")
-
-        inflow = evaluated.combo.total_inflow
-        forgiven = result.forgiven
-        delta_payment = result.payment_during[0] - baseline_first_payment
-        parts = [f"현금 유입 {fmt_man(inflow)}"]
-        if forgiven > 0:
-            parts.append(f"부채 감소 {fmt_man(forgiven)} (추정치)")
-        parts.append(f"첫 달 상환 부담 {delta_payment / MAN:+,.0f}만원")
-        st.caption(" · ".join(parts))
+        if result.forgiven > 0:
+            st.caption(f"부채 감소 {fmt_man(result.forgiven)} (추정치)")
 
 
 def render_traps(report) -> None:
@@ -1058,29 +1051,32 @@ def render_schedule_table(result) -> None:
 
 
 def render_group_card(
-    idx: int,
+    rank: int | None,
     group: CandidateGroup,
+    member: Evaluated,
     reports: dict,
     profile: UserProfile,
     ctx: UserContext,
-    baseline_first_payment: float,
     baseline_survival: int,
     expanded: bool,
     pick: agent.Pick | None = None,
-    ranked: bool = False,
 ) -> None:
-    """후보 그룹 하나를 카드로 그린다.
+    """조합 하나를 카드로 그린다.
 
-    ranked — LLM 이 고른 카드일 때만 True. 그때만 제목이 'N위'다. 폴백일 때 번호는
-    계산 순서일 뿐이고, LLM 이 성공해도 고른 3개 밖의 카드는 순위에 든 게 아니다.
+    **그룹이 아니라 조합(member)을 받는다.** 그룹의 대표를 정해 그리던 옛 구조에서는
+    LLM 이 대표 아닌 멤버를 고르면 그 pick 이 갈 자리가 없어 통째로 사라졌다.
+    같은 좌표라도 상환 방식이 다르면 그래프·상환 스케줄·총 원리금·함정 판정이 갈리므로
+    LLM 이 고른 그 조합을 그대로 그려야 한다.
+
+    rank — LLM 이 고른 순위. 폴백이면 None 이고 제목이 '후보'가 된다. 폴백의 순서는
+    계산 순서일 뿐이라 순위로 쓰지 않는다.
     """
-    member = group.members[0]  # 대표. 같은 좌표라 2축 성능은 동일하다.
     trap_icon = " ⚠" if group.has_trap else ""
-    # 제목: N위(또는 후보 N) │ 정책명(파랑) │ 성과.
+    # 제목: N위 │ 정책명(파랑) │ 성과.
     # st.expander 라벨의 마크다운 색상 지시자(:blue[…])는 Streamlit 1.62 문서상 지원되나
     # 렌더링은 브라우저에서 확인해야 한다. 안 먹으면 색 대신 다른 방식으로 바꾼다.
     perf = f"생존 {months_label(group.survival_months)} · 종료 시점 부채 {fmt_man(group.debt_at_exit)}"
-    head = f"**{idx}위**" if ranked else f"**후보 {idx}**"
+    head = f"**{rank}위**" if rank is not None else "**후보**"
     title = f"{head}  │  :blue[{member.label}]{trap_icon}  │  {perf}"
     with st.expander(title, expanded=expanded):
         # '레이어 N'(내부 용어) 을 지운 자리에 **LLM 이 고른 이유**가 들어간다.
@@ -1097,10 +1093,8 @@ def render_group_card(
                 unsafe_allow_html=True,
             )
 
-        # 같은 성능의 다른 상환조건 멤버가 있으면 함께 보인다
-        if len(group.members) > 1:
-            others = " / ".join(m.label for m in group.members[1:])
-            st.caption(f"같은 성능의 다른 조합: {others}")
+        # '같은 성능의 다른 조합' 줄은 두지 않는다 — 아래 '추천에서 배제한 조합과 이유'가
+        # 같은 내용을 이유와 함께 다루고, 카드 안에 긴 정책명이 두 줄씩 반복돼 읽기 어렵다.
 
         # 지원 전후 대비 — 이 서비스가 하는 일을 한 줄로. 카드마다 오른쪽 값이 다르다
         # (조합이 다르므로). 왼쪽은 무지원 기준이라 모든 카드에서 같다.
@@ -1118,7 +1112,7 @@ def render_group_card(
             unsafe_allow_html=True,
         )
 
-        render_support_detail(member, baseline_first_payment)
+        render_support_detail(member)
 
         # ── 슬라이더로 다시 계산되는 영역 ──
         # 위쪽(대비 줄·지원 내역)은 **추천된 원래 조합** 기준이라 슬라이더를 움직여도
@@ -1272,12 +1266,6 @@ def render_results(
                 "정책 한도로도 채우기 어렵습니다."
             )
 
-    # LLM 이 고른 카드만 'N위'가 된다(render_group_card 의 ranked). 폴백이면 전부
-    # '후보 N' 이라 옛 문구("번호는 순위가 아닙니다")는 필요 없다.
-    picks_by_label = (
-        {p.label: p for p in advice.picks} if advice is not None and advice.ok else {}
-    )
-
     # 후보가 하나도 없을 때. **원인에 따라 할 수 있는 일이 다르다.**
     # ⚠ "폐업 여부를 바꿔 보세요" 같은 안내는 쓰지 않는다 — 자격을 얻으려고 상황을
     #   다르게 적으라는 뜻으로 읽힌다. 잘못 입력한 값을 바로잡으라는 것과는 다르다.
@@ -1307,14 +1295,31 @@ def render_results(
     # 하늘색 상자 안에 둔다(render_group_card). 상단 안내가 네 겹이 되면 카드까지
     # 내려가기 전에 지친다.
 
-    baseline_first_payment = simulate(profile, []).payment_during[0]
-    for idx, group in enumerate(groups, start=1):
-        pick = picks_by_label.get(group.members[0].label)
+    # ── 카드는 **LLM 이 고른 조합**만 그린다 ──
+    # 옛 구조는 그룹을 돌며 "이 그룹의 대표가 뽑혔나"를 물었다. 그러려면 그룹을 대표할
+    # 이름을 정해야 하는데 members[0] 에는 근거가 없고(prune 뒤 조합 생성 순서상 첫째일
+    # 뿐), LLM 이 대표 아닌 멤버를 고르면 그 pick 이 갈 자리가 없어 통째로 사라졌다.
+    # 방향을 뒤집어 pick 의 label 로 조합을 직접 찾는다.
+    by_label = {m.label: (g, m) for g in groups for m in g.members}
+    if advice is not None and advice.ok and advice.picks:
+        # 순위가 있는 셋만 그린다. 순위 없는 '후보' 카드를 섞으면 번호가 이어져 몇 위인지
+        # 헷갈리고, 그 카드의 조합을 고를 근거도 없다.
+        chosen = [
+            (*by_label[p.label], p) for p in advice.picks if p.label in by_label
+        ]
+    else:
+        # 폴백 — 상위 그룹 셋을 members[0] 으로 그린다.
+        # members[0] 에 근거가 없다는 것을 알고 남긴다. 고른 주체가 없으니 대표를 정할
+        # 수밖에 없고, 순위를 안 붙이므로(rank=None -> '후보') 잘못된 순위를 주장하지
+        # 않는다. 같은 좌표의 다른 멤버를 골랐어야 할 근거도 없다.
+        chosen = [(g, g.members[0], None) for g in groups[:3]]
+
+    for rank, (group, member, pick) in enumerate(chosen, start=1):
         render_group_card(
-            idx, group, reports, profile, ctx,
-            baseline_first_payment, baseline_survival,
-            expanded=(idx == 1),  # 1순위 기본 펼침
-            pick=pick, ranked=pick is not None,
+            rank if pick is not None else None,
+            group, member, reports, profile, ctx, baseline_survival,
+            expanded=(rank == 1),  # 1위 기본 펼침
+            pick=pick,
         )
 
     # 부가 추천 (컨설팅·법률자문 등)
@@ -1324,10 +1329,12 @@ def render_results(
             note = cand.get("_순위제외근거") or cand.get("조건") or ""
             st.markdown(f"- {cand}" + (f" — {note[:80]}" if note else ""))
 
-    # 추천하지 않은 조합과 이유 — 자격은 되지만 뺀 것들(기획서 897·979).
+    # 추천에서 배제한 조합과 이유 — 자격은 되지만 뺀 것들(기획서 5.3).
     # 목록 맨 아래 접힘에 둔다. 궁금한 사람만 열어 보면 되는 정보라 카드를 밀어내면 안 된다.
+    # 화면에는 3개만 뜨므로 여기 처음 보는 조합 이름이 나온다 — 접힘을 여는 사람은
+    # "뭘 안 골랐나"가 궁금해서 여는 것이라 그게 맞다.
     if advice is not None and advice.ok and advice.excluded:
-        with st.expander("추천하지 않은 조합과 이유"):
+        with st.expander("추천에서 배제한 조합과 이유"):
             for item in advice.excluded:
                 st.markdown(f"- **{item.get('label', '')}** — {item.get('reason', '')}")
 
@@ -1672,7 +1679,7 @@ DEMO_PRESETS: dict[str, dict] = {
     # `confirm_yes` — 자격 확인 질문에 '예'로 답한 상태로 시작할 **후보 id** 목록.
     #
     # 데모는 **자격 요건이 충족된 사용자**를 전제한다. 일반 사용자의 기본값은 여전히
-    # '잘 모르겠어요'이고(모름을 통과시키면 신청했다가 거절당한다 — 기획서 932~935),
+    # '잘 모르겠어요'이고(모름을 통과시키면 신청했다가 거절당한다 — 기획서 5.2.5 ⑥),
     # 판정 규칙도 그대로다. 프리셋은 그 질문에 대한 **답만** 미리 채운다.
     # 재무값을 미리 넣는 것과 성격이 같고, 화면(⑥ 단계)에 라디오로 그대로 보이며
     # 사용자가 바꿀 수 있다. 시연 중에 '아니오'로 바꾸면 그 정책이 빠지는 것도 보인다.
@@ -2504,7 +2511,7 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
         _num("최근 5년 정책자금 지원 횟수", "cond_loan_count", 0, min_value=0, step=1)
 
     # ── 자격 확인 ──
-    # '아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 제외한다(기획서 932~935).
+    # '아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 제외한다(기획서 5.2.5 ⑥).
     # 확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다.
     for item in questions or []:
         st.markdown("---")
@@ -2572,9 +2579,9 @@ def render_results_step(
             rejected=rejected,
         )
 
+    # 순서 재배열은 하지 않는다 — render_results 가 picks 를 돌며 조합을 직접 찾는다.
+    # 그룹 단위로 재배열하던 옛 방식은 한 그룹에서 두 개를 고르면 하나를 잃었다.
     advice = get_advice(prompt_text, [m.label for g in groups for m in g.members])
-    if advice.ok and advice.picks:
-        groups = order_by_advice(groups, advice)
 
     render_results(
         groups, reports, extras, profile, ctx,

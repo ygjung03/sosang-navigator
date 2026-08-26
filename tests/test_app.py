@@ -17,6 +17,7 @@ import re
 import streamlit
 
 import app
+from core import agent
 from core.cashflow import SIM_MONTHS
 
 
@@ -94,12 +95,58 @@ def test_no_direct_widget_calls():
 # ── AppTest — 실제 Streamlit 세션으로 배선을 검증한다(헤드리스 프로필 조립을 안 탄다) ──
 
 
+def _stub_llm() -> None:
+    """테스트는 **실제 LLM 을 부르지 않는다.** 폴백 응답으로 고정한다.
+
+    `agent._api_key()` 가 .env 를 읽게 되면서 테스트가 실제 API 를 호출하기 시작했고,
+    세 가지가 한꺼번에 나빠졌다.
+      · 돌릴 때마다 돈이 나간다(호출당 약 $0.03, 한 번 돌리면 수십 회).
+      · 같은 코드인데 통과했다 실패했다 한다. LLM 이 매번 다른 조합을 골라 카드 구성이
+        달라지고 `_loan_sliders(at)[0]` 이 다른 조합을 가리킨다(A→B→A 왕복이 이걸로 깨졌다).
+      · 느리다. 한 번에 몇 분씩 걸렸다.
+
+    LLM 응답이 필요한 테스트는 각자 고정 응답으로 갈아끼운다(test_every_pick_gets_a_card).
+    실제 호출은 `tests/test_llm_live.py` 에서 환경변수로 명시할 때만 한다.
+    """
+    agent.select_final_three = lambda p, l, c=None: agent.Advice(
+        ok=False, failure=agent.Failure.NO_KEY, detail="테스트 — LLM 을 부르지 않는다"
+    )
+
+
 def _fresh_app():
     from streamlit.testing.v1 import AppTest
 
+    _stub_llm()
     at = AppTest.from_file(app.__file__)  # 절대경로 (상대경로는 tests/ 기준으로 풀린다)
     at.run(timeout=120)
     return at
+
+
+def test_no_live_api_call_by_default():
+    """기본 경로에서 실제 API 호출이 안 나가는지 — 카나리아.
+
+    anthropic 클라이언트 생성 자체를 막아 두고 결과 화면까지 간다. `_stub_llm()` 이
+    풀리거나 누가 우회 경로를 만들면 여기서 즉시 걸린다. 조용히 다시 새는 것을 막는
+    것이 목적이라, 통과해도 아무 일이 없는 게 정상이다.
+    """
+    import anthropic
+
+    real = anthropic.Anthropic
+
+    def blocked(*a, **k):
+        raise AssertionError(
+            "테스트가 실제 Anthropic API 를 부르려 했다. _stub_llm() 이 풀렸는지, "
+            "또는 select_final_three 를 우회하는 경로가 생겼는지 확인하라."
+        )
+
+    anthropic.Anthropic = blocked
+    try:
+        at = _fresh_app()
+        _to_results(at)
+        assert not at.exception, f"예외 발생: {[str(e.value)[:120] for e in at.exception]}"
+    finally:
+        anthropic.Anthropic = real
+    print("   기본 경로에서 실제 API 호출 없음 ✓")
 
 
 def _ans(at) -> dict:
@@ -813,6 +860,89 @@ def test_reset_button_restores_only_its_card():
     )
 
 
+def test_every_pick_gets_a_card():
+    """LLM 이 **어느 조합을 골랐든** 카드와 순위가 붙는지.
+
+    ⚠ 옛 구조는 그룹을 돌며 `group.members[0].label` 이 picks 에 있는지 물었다.
+    그래서 LLM 이 대표 아닌 멤버를 고르면 그 pick 이 갈 자리가 없어 통째로 사라졌다
+    (why·trap_note 까지). 화면에는 순위가 하나 빠진 것처럼만 보여 눈치채기 어렵다.
+
+    멤버가 여럿인 그룹은 드물다 — A·B·C 15개 그룹 중 2개뿐이고(A 의 L2 가 2개,
+    B 의 L3 가 3개) 나머지는 전부 1개다. 그래서 이 버그가 오래 안 보였다.
+    **그 두 경우를 콕 집어** 대표가 아닌 멤버를 고르게 하고 카드가 나오는지 본다.
+    """
+    from core import optimizer
+
+    captured: dict = {}
+    real_prompt = optimizer.to_prompt_text
+    real_select = agent.select_final_three
+
+    def spy_prompt(groups, *a, _c=captured, **k):
+        _c["groups"] = groups
+        return real_prompt(groups, *a, **k)
+
+    # app.py 가 `from core.optimizer import to_prompt_text` 로 이름을 묶으므로
+    # **앱을 만들기 전에** 갈아끼워야 한다.
+    optimizer.to_prompt_text = spy_prompt
+    try:
+        for scenario in ("A", "B"):
+            captured.clear()
+            agent.select_final_three = lambda p, l, c=None: agent.Advice(
+                ok=False, failure=agent.Failure.NO_KEY, detail="탐색용"
+            )
+            at = _fresh_app()
+            while at.session_state["step"] < app.S_REVENUE:
+                _advance(at)
+            at.selectbox(key="scenario_key_w").set_value(scenario)
+            at.run(timeout=120)
+            _to_results(at)
+
+            groups = captured.get("groups") or []
+            multi = next((g for g in groups if len(g.members) > 1), None)
+            assert multi is not None, (
+                f"[{scenario}] 멤버가 여럿인 그룹이 없다 — 이 테스트가 짚으려는 경우가 "
+                "사라졌다. 조합 생성이 바뀌었는지 확인하라"
+            )
+            # 대표가 **아닌** 멤버를 1위로. 이게 옛 구조에서 사라지던 pick 이다.
+            others = [g for g in groups if g is not multi][:2]
+            chosen = [multi.members[-1].label] + [g.members[0].label for g in others]
+
+            def fake(prompt_text, labels, client=None, _picked=chosen):
+                assert all(x in labels for x in _picked), "고른 label 이 목록에 없다"
+                return agent.Advice(
+                    ok=True, phase_reading="검증용", excluded=[],
+                    picks=[
+                        agent.Pick(label=x, axis_focus="부채", why=f"검증용 {i}",
+                                   trap_note=None, steps=[], before_apply=None)
+                        for i, x in enumerate(_picked, 1)
+                    ],
+                )
+
+            agent.select_final_three = fake
+            # 캐시를 비운다 — 프롬프트가 그대로면 앞서 캐시된 실패 응답이 재사용된다.
+            at.session_state["_advice"] = None
+            while at.session_state["step"] > app.S_REVENUE:
+                _back(at)
+            _to_results(at)
+
+            titles = [e.label for e in at.expander if "│" in e.label]
+            ranked = [t for t in titles if "위**" in t]
+            assert len(ranked) == 3, (
+                f"[{scenario}] 고른 3개 중 {len(ranked)}개만 순위가 붙었다\n  "
+                + "\n  ".join(titles)
+            )
+            for want, title in zip(chosen, ranked):
+                assert want in title, (
+                    f"[{scenario}] 고른 조합이 카드에 안 나왔다\n"
+                    f"  고른 것: {want}\n  카드: {title}"
+                )
+            print(f"   [{scenario}] 멤버 {len(multi.members)}개 그룹의 대표 아닌 멤버를 "
+                  f"골라도 카드 3개에 순위가 붙는다 ✓")
+    finally:
+        optimizer.to_prompt_text = real_prompt
+        agent.select_final_three = real_select
+
+
 def test_slider_init_paths_and_no_warning():
     """슬라이더 초기화 두 경로가 어긋나지 않고, Streamlit 경고가 안 나는지.
 
@@ -1030,6 +1160,7 @@ def main() -> None:
     print("app.py UI 헬퍼·배선 검증")
     print("=" * 50)
     test_money_to_man()
+    test_no_live_api_call_by_default()
     test_months_label()
     test_no_direct_widget_calls()
     test_demo_goal_above_baseline()
@@ -1052,6 +1183,7 @@ def main() -> None:
     test_slider_does_not_leak()
     test_slider_resets_when_inputs_change()
     test_slider_does_not_leak_across_scenarios()
+    test_every_pick_gets_a_card()
     test_reset_button_restores_only_its_card()
     test_slider_init_paths_and_no_warning()
     test_reset_button_only_where_slider_exists()
