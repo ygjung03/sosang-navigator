@@ -20,6 +20,16 @@ from tests.test_app import _fresh_app, _to_results, _advance, _back
 IN_RATE, OUT_RATE = 2.00, 10.00   # $/MTok (claude-sonnet-5)
 ENV_FLAG = "SOSANG_LLM_LIVE"
 
+WARNINGS: list[str] = []
+"""단언이 아니라 경고로 남길 것들. 지금은 그룹 겹침뿐이다.
+
+**나중에 코드로 거르기로 한다면**(재현성 30회에서 빈도를 보고 정한다) 규정은
+"코드가 LLM 을 뒤집는다"가 아니라 **"같은 좌표 중복을 코드가 거른다"** 다 — 두 축이
+같은 조합을 둘 보여주는 것은 정보가 아니기 때문이다.
+다만 **버린 자리를 무엇으로 채울지가 남는다.** 안 뽑힌 그룹 중 위엣것으로 채우면 LLM 이
+고르지 않은 것을 3위로 올리는 셈이라 근거가 없다. 채우지 않고 2개만 보여주는 쪽도
+선택지다. 그때 정한다."""
+
 
 def run_live() -> None:
     """A·B·C 를 한 번씩 실제 호출해 응답이 쓸 만한지 본다."""
@@ -66,11 +76,28 @@ def run_live() -> None:
         )
         assert len(advice.picks) == 3, f"[{scenario}] picks {len(advice.picks)}개"
 
-        # 서로 다른 그룹에서 골랐는지
         gid = {m.label: i for i, g in enumerate(groups, 1) for m in g.members}
         picked = [gid.get(p.label, 0) for p in advice.picks]
         assert 0 not in picked, f"[{scenario}] 후보에 없는 label 을 골랐다: {picked}"
-        assert len(set(picked)) == 3, f"[{scenario}] 한 그룹에서 둘 이상 골랐다: {picked}"
+
+        # ── 그룹 분산은 **경고**로만 남긴다 ──
+        # "서로 다른 그룹에서 고르라"는 지시가 확률적으로 무시된다. 단언으로 두면
+        # 게이트가 확률적으로 실패해 신호가 못 된다 — 코드가 깨진 것인지 LLM 이 다르게
+        # 답한 것인지 구분이 안 되기 때문이다. 횟수를 세어 재현성 30회에서 쓴다.
+        if len(set(picked)) != 3:
+            dup = sorted({g for g in picked if picked.count(g) > 1})
+            # 축 최상위가 화면에서 사라졌는지 — 이쪽은 심각도가 다르다.
+            best_survival = max(range(len(groups)), key=lambda i: groups[i].survival_months) + 1
+            best_debt = min(range(len(groups)), key=lambda i: groups[i].debt_at_exit) + 1
+            lost = [
+                name for name, top in (("생존", best_survival), ("부채", best_debt))
+                if top not in picked
+            ]
+            WARNINGS.append(
+                f"[{scenario}] 그룹 겹침 {picked} (겹친 그룹 {dup})"
+                + (f" · 축 최상위 누락: {', '.join(lost)}" if lost else " · 축 최상위는 살아 있다")
+            )
+            print(f"  ⚠ {WARNINGS[-1]}")
 
         # 내부 표기가 사용자 문장에 새지 않았는지
         texts = [advice.phase_reading or ""]
@@ -85,6 +112,9 @@ def run_live() -> None:
 
     print(f"\n3회 합계 ${total:.4f} · 호출당 평균 ${total / 3:.4f} "
           f"· 시연 100회 ${total / 3 * 100:.2f}")
+    print(f"그룹 겹침 {len(WARNINGS)}/3")
+    for line in WARNINGS:
+        print(f"  ⚠ {line}")
 
 
 def main() -> None:
