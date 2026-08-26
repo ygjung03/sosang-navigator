@@ -260,6 +260,34 @@ def _render_advice_banner(advice: agent.Advice | None) -> None:
             st.rerun()
 
 
+_LOADING_HTML = """
+<style>
+@keyframes sn-flip { 0%,45% {transform:rotate(0deg);} 55%,100% {transform:rotate(180deg);} }
+@keyframes sn-sand { 0% {height:0;} 100% {height:11px;} }
+.sn-load {
+  display:flex; align-items:center; justify-content:center; gap:16px;
+  background:#EAF3FC; border:1px solid #b6d4f2; border-radius:8px;
+  padding:26px 20px; margin:10px 0;
+}
+.sn-glass { animation: sn-flip 2.4s ease-in-out infinite; transform-origin:50% 50%; }
+.sn-glass .sn-fill { animation: sn-sand 1.2s linear infinite; }
+.sn-text { font-size:1.15rem; font-weight:700; color:#1F2933; line-height:1.5; }
+.sn-sub  { font-size:0.9rem; font-weight:400; color:#4a5568; }
+</style>
+<div class="sn-load">
+  <svg class="sn-glass" width="40" height="52" viewBox="0 0 30 40" aria-hidden="true">
+    <path d="M5 3 h20 M5 37 h20" stroke="#2b6cb0" stroke-width="3" stroke-linecap="round"/>
+    <path d="M7 4 L7 12 Q7 17 15 20 Q23 17 23 12 L23 4 Z" fill="#2b6cb0" opacity="0.75"/>
+    <path d="M7 36 L7 28 Q7 23 15 20 Q23 23 23 28 L23 36 Z" fill="none"
+          stroke="#2b6cb0" stroke-width="1.5"/>
+    <rect class="sn-fill" x="9" y="25" width="12" height="11" fill="#2b6cb0" opacity="0.55"/>
+  </svg>
+  <div class="sn-text">AI가 최종 3개를 고르는 중입니다<br>
+    <span class="sn-sub">1~2분 정도 소요됩니다. 창을 닫지 마세요.</span></div>
+</div>
+"""
+
+
 def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     """LLM 최종 선정. **같은 프롬프트면 한 번만 호출**하고 세션에 캐시한다.
 
@@ -278,8 +306,15 @@ def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     cached = st.session_state.get("_advice")
     if cached and cached[0] == key:
         return cached[1]
-    with st.spinner("AI가 최종 3개를 고르는 중..."):
+    # 1~2분 걸린다. 기본 st.spinner 는 작은 글씨 한 줄이라 멈춘 줄 안다.
+    # placeholder 를 쓰는 이유 — st.spinner 는 문구와 크기를 못 바꾼다. 직접 그리고
+    # 끝나면 비운다.
+    slot = st.empty()
+    slot.markdown(_LOADING_HTML, unsafe_allow_html=True)
+    try:
         advice = agent.select_final_three(prompt_text, labels)
+    finally:
+        slot.empty()
     st.session_state["_advice"] = (key, advice)
     return advice
 
@@ -491,6 +526,40 @@ def confirm_key_of(db: PolicyDB, candidate_id: str) -> str | None:
             if text := cand.get(field_name):
                 return confirm_key(text)
     return None
+
+
+_CIRCLED = "①②③④⑤⑥⑦⑧⑨"
+_LEAD_END = re.compile(r"[.?]\s*(?=[" + _CIRCLED + r"])")
+
+
+def confirm_question_lines(question: str) -> list[str]:
+    """자격 확인 질문을 화면에 그릴 줄들로 쪼갠다. JSON 원문은 건드리지 않는다.
+
+    원문은 한 문단에 '앞말 + ①②③' 이 이어 붙어 있어 읽히지 않는다. 앞말은 버리고
+    (화면이 '해당사항이 있는지 체크해주세요.' 를 대신 쓴다) 번호마다 줄을 나눈다.
+
+    ①의 나열은 15개가 넘어 한 줄로도 길다. 굵은 표제와 나열을 갈라 두 줄로 만들고,
+    나열은 가운뎃점을 쉼표로 바꿔 눈이 끊어 읽게 한다.
+    """
+    body = question.strip()
+    if head := _LEAD_END.search(body):          # '…해당하시나요?' 같은 앞말 제거
+        body = body[head.end():].strip()
+    if not any(c in body for c in _CIRCLED):    # 번호가 없으면 한 줄짜리 질문이다
+        return [body]
+
+    lines: list[str] = []
+    parts = re.split(r"(?=[" + _CIRCLED + r"])", body)
+    for part in (p.strip() for p in parts):
+        if not part:
+            continue
+        # '① **표제** — 나열' 을 표제 줄과 나열 줄로 가른다
+        if " — " in part and part.count("·") >= 3:
+            label, rest = part.split(" — ", 1)
+            lines.append(f"- {label}")
+            lines.append(f"    {rest.replace('·', ', ')}")
+        else:
+            lines.append(f"- {part}")
+    return lines
 
 
 def confirm_questions(pool) -> list[dict]:
@@ -1456,6 +1525,22 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
         }
         /* ①게이지·②버퍼 열 묶음도 다른 카드와 같은 간격(12px)을 갖게. */
         .st-key-diag_row { margin-top: 12px; }
+
+        /* 접힘 제목 오른쪽 끝에 '펼쳐보기 / 접기'. 왼쪽 화살표만으로는 펼칠 수 있다는
+           것이 잘 안 보인다. details[open] 로 갈라 쓰므로 펼침 상태를 따로 추적하지
+           않는다 — Streamlit 이 다시 그려도 CSS 가 알아서 맞춘다.
+           제목이 길어 글자가 라벨 아래로 지나가지 않도록 오른쪽 여백을 준다.
+           ⚠ stExpander 도 navbar 와 같은 내부 구조 의존이다. */
+        /* ⚠ `details[open] summary` 로 쓰면 안 된다. 후손을 다 잡아서, 카드 접힘이
+           펼쳐진 순간 그 안의 상환 스케줄 접힘까지 '접기'가 된다(닫혀 있어도).
+           자식 선택자 `>` 로 자기 summary 만 잡는다. */
+        [data-testid="stExpander"] details > summary { position: relative; padding-right: 68px; }
+        [data-testid="stExpander"] details > summary::after {
+            content: "펼쳐보기";
+            position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+            font-size: 0.82rem; color: #2b6cb0; white-space: nowrap;
+        }
+        [data-testid="stExpander"] details[open] > summary::after { content: "접기"; }
 
         /* AI 실패 배너 — 배경색만 있어 경계가 흐리고 그냥 지나친다.
            **색은 노랑 그대로 둔다.** 주황으로 올리면 아래 함정 경고(노랑)보다 세져
@@ -2513,15 +2598,14 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
     # ── 자격 확인 ──
     # '아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 제외한다(기획서 5.2.5 ⑥).
     # 확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다.
+    #
+    # 답에 따른 결과는 적지 않는다. "'아니오'를 고르면 제외합니다"는 협박처럼 읽히고,
+    # 사실대로 답하는 것 말고 다른 선택지가 있는 것처럼 보인다.
     for item in questions or []:
         st.markdown("---")
-        st.markdown(item["question"])
-        tail = (
-            "지금 못 하셨어도 신청 전에 하시면 됩니다."
-            if item["now_possible"]
-            else "'아니오'나 '잘 모르겠어요'를 고르시면 그 정책은 추천에서 제외합니다."
-        )
-        st.caption(tail)
+        st.markdown("**해당사항이 있는지 체크해주세요.**")
+        for line in confirm_question_lines(item["question"]):
+            st.markdown(line)
         _radio(
             "해당하시나요?", item["key"],
             (CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE), CONFIRM_UNSURE,

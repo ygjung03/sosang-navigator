@@ -416,37 +416,18 @@ def _caveats(items: Sequence[Any], context: Any = None) -> list[str]:
                 else "변동금리입니다. 현재 금리로 계산했으나 실제 상환액이 달라질 수 있습니다."
             )
         add(cand.get("_계산전제"))
-        # 사용자에게 확인해야 자격이 확정되는 항목.
-        # 우리가 판정할 수 없는 사실(교육 이수·선정 이력·성실상환 등)이라
-        # LLM이 되물어야 한다. 답이 "해당 없음"이면 그 후보를 빼고 다시 고른다.
-        # "모름"이면 남기되 확인을 권한다.
-        if confirm := cand.get("_확인필요_자격"):
-            # 지금 할 수 있는 일(교육 이수 등)이면 "아니오"여도 후보에 남긴다.
-            # 지금 바꿀 수 없는 사실이면 "아니오"·"모름" 모두 제외한다.
-            tail = (
-                " (미충족이어도 신청 전에 하면 됩니다)"
-                if cand.get("_확인필요_자격_지금가능")
-                else " (해당 없거나 모르시면 이 조합은 제외합니다)"
-            )
-            add(f"자격 확인 필요 — {confirm}{tail}")
-        # 택1요건 중 우리가 판정하는 갈래를 충족하지 못했을 때만 묻는다.
-        # 하나만 해당하면 되므로, 충족했으면 나머지를 물을 필요가 없다.
-        if alt := cand.get("_확인필요_자격_매출미달시"):
-            if not _meets_revenue_rule(cand, context):
-                add(f"자격 확인 필요 — {alt}")
+        # `_확인필요_자격`·`_확인필요_자격_매출미달시` 는 **여기서 내지 않는다.**
+        # 되묻기를 코드가 ⑥ 단계에서 하므로(app.py), 여기까지 온 후보는 셋 중 하나다.
+        #   '예' 로 답해 확인이 끝났다       -> 경고할 대상이 아니다
+        #   '아니오/모름' + 지금가능         -> 남기고 prerequisites() 가 따로 안내한다
+        #   '아니오/모름' + 지금불가         -> 풀에서 빠져 여기 오지 않는다
+        # 이 줄을 되살리면 확인이 끝난 사용자에게 "해당 없으면 제외합니다"가 다시 뜬다.
+        # 프롬프트도 같은 함수를 쓰므로 LLM 이 그것을 before_apply 에 옮겨 적는다(실측).
     return notes
 
 
-_CONFIRM_PREFIX = "자격 확인 필요 — "
-
-
-def _confirm_tag(note: str, defs: dict[str, int]) -> str:
-    """자격 확인 문구를 [확인 N] 딱지로 줄이고 전문은 defs 에 모은다."""
-    if not note.startswith(_CONFIRM_PREFIX):
-        return note
-    body = note[len(_CONFIRM_PREFIX):]
-    number = defs.setdefault(body, len(defs) + 1)
-    return f"자격 확인 필요 [확인 {number}]"
+# _confirm_tag() 는 지웠다. 자격 확인 문구를 [확인 N] 딱지로 줄여 프롬프트 길이를
+# 아끼던 함수인데, `_caveats()` 가 그 문구를 더 이상 내지 않아 줄일 것이 없다.
 
 
 def _situation_lines(context: Any, profile: Any = None) -> list[str]:
@@ -601,10 +582,6 @@ def to_prompt_text(
         "어느 축을 중시할지는 국면에 따라 판단할 것."
     )
     lines.append("")
-    # 같은 자격 확인 문구가 조합마다 반복되면(실측 6회, 1,200자) 프롬프트의 3분의 1을
-    # 차지해 비용도 늘고 정작 중요한 정보가 묻힌다. 본문에는 [확인 N] 딱지만 달고
-    # 전문은 아래에 한 번만 싣는다.
-    confirm_defs: dict[str, int] = {}
 
     # ── 1번 후보 대비 차이를 코드가 계산해 넣는다 ──
     # 후보들이 몰려 있으면(데모 B 는 생존이 전부 같고 부채가 27만원 차이) LLM 이 구별해
@@ -691,7 +668,7 @@ def to_prompt_text(
             #   _계산전제      계산 전제가 실제와 다를 수 있는 후보의 사정
             # 섞으면 "제도 얘기인지 우리 계산의 한계인지"를 LLM이 구분하지 못한다.
             for note in _caveats(member.combo.items, context):
-                lines.append(f"      ※ {_confirm_tag(note, confirm_defs)}")
+                lines.append(f"      ※ {note}")
 
 
             # 창 밖 만기 일시상환. 두 축이 못 잡는 정보다.
@@ -742,24 +719,9 @@ def to_prompt_text(
     # "왜 이건 안 골랐나"(기획서 5.3)는 **선정 그룹 중 안 고른 것들**로 답한다.
     # 후보 그룹이 적은 입력에서는 배제 설명이 빌 수 있다 — planning.md '알려진 한계' 참조.
 
-    if confirm_defs:
-        lines.append("")
-        lines.append("[확인 문구 전문]")
-        for body, number in sorted(confirm_defs.items(), key=lambda kv: kv[1]):
-            lines.append(f"  [확인 {number}] {body}")
-
-    if any("자격 확인 필요" in ln for ln in lines):
-        lines.append("")
-        lines.append(
-            "[자격 확인 안내] '자격 확인 필요'가 붙은 조합은 우리가 판정할 수 없는 "
-            "요건이 남아 있다. 최종 추천 전에 사용자에게 묻고, 선택지에 "
-            "**'예 / 아니오 / 잘 모르겠어요'** 를 준다. "
-            "**'아니오'와 '잘 모르겠어요'는 똑같이 그 조합을 빼고 다시 고른다** — "
-            "확인하지 못한 자격을 있다고 가정하면 신청했다가 거절당한다. "
-            "단, '지금 이수하면 되는 것'(신용관리 교육 등)은 예외로 남긴다. "
-            "그 조합을 **최종 3개에 넣었다면 '신청 전에 이수하셔야 합니다'를 "
-            "반드시 안내에 포함할 것.**"
-        )
+    # [확인 문구 전문]·[자격 확인 안내] 두 절도 함께 뺐다. `_caveats()` 가 확인 문구를
+    # 안 내므로 실을 내용이 없고, 안내 절만 남기면 LLM 이 "자격 확인이 필요하다"를
+    # before_apply 에 계속 옮겨 적는다. 되묻기는 코드가 ⑥ 단계에서 끝낸다.
 
     return "\n".join(lines)
 
