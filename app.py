@@ -1026,11 +1026,13 @@ def render_loan_slider(member: Evaluated, profile: UserProfile, key: str) -> Eva
 
 
 def schedule_rows(result) -> list[dict]:
-    """상환 스케줄 행들(만원). **기존 부채 / 신규 융자로 나눠** 각각 원금·이자·잔액.
+    """상환 스케줄 행들(만원). **기존 부채 / 신규 상환으로 나눠** 각각 원금·이자·잔액.
 
     나누는 이유: 합계만 보이면 "1년 거치인데 왜 1회차부터 원금이 나가지?"에 답이 없다.
-    그 원금은 기존 부채분이고 신규 융자는 거치 중이라 0이다. 나눠 놓으면 신규 원금이
+    그 원금은 기존 부채분이고 신규 상환은 거치 중이라 0이다. 나눠 놓으면 신규 원금이
     0 → 76 으로 바뀌는 자리가 그대로 거치 절벽의 근거가 된다.
+    metrics.find_cliff_at 이 같은 전환을 보고 절벽 시점을 찾는다 — 표와 판정이 한 근거를
+    쓴다.
 
     원금과 이자를 합치지 않는다. 합치면 7.6 → 83.8 로 숫자만 커져 거치가 안 보인다.
     합계 열(옛 '상환원리금')도 두지 않는다 — 옆을 더하면 나오는 값이라 정보가 없고,
@@ -1085,8 +1087,12 @@ def render_schedule_table(result) -> None:
         "<thead>"
         f"<tr style='background:#eef1f5;'>"
         f"<th rowspan='2' style='border:{thin};padding:6px 8px;{center}'>회차</th>"
+        # '신규 융자'가 아니라 **'신규 상환'** 이다. 이 열은 융자만이 아니라 조합 때문에
+        # 생기거나 달라진 상환 전체를 담는다(대환·채무조정·이자조정·상환연장 포함).
+        # 왼쪽은 '기존 상환'으로 대칭을 맞추지 않는다 — ④ 단계에서 사용자가 입력한
+        # '기존 부채'와 같은 말이어야 연결이 끊기지 않는다.
         f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;{center}'>기존 부채</th>"
-        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;{center}'>신규 융자</th></tr>"
+        f"<th colspan='3' style='border:{thin};{div}padding:6px 8px;{center}'>신규 상환</th></tr>"
         f"<tr style='background:#f6f8fa;'>"
         + "".join(
             f"<th style='border:{thin};{div if i % 3 == 0 else ''}padding:5px 8px;{center}'>{name}</th>"

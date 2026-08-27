@@ -698,17 +698,23 @@ class SimResult:
     existing_debt_at: list[float] = field(default_factory=list)
     """저량 — 기존 부채 잔액. 길이 horizon+1."""
 
+    # new_* 는 **이 조합으로 새로 생기거나 달라진 상환**을 다섯 갈래에서 누적한다 —
+    # 신규유입·대환전환·부채감면·이자조정·상환연장. existing_* 는 "이 조합을 안 받아도
+    # 계속 나갈 상환"이라 무지원 baseline 과 같다.
+    # 화면 열 제목은 '신규 상환'으로 고쳤다. 예전 '신규 융자'는 융자만 담는 것처럼 읽혔다.
     new_payment_during: list[float] = field(default_factory=list)
-    """유량 — 신규 융자(대환 포함)의 월 상환액(약정)."""
+    """유량 — 이 조합으로 새로 생기거나 달라진 월 상환액(약정)."""
 
     new_interest_during: list[float] = field(default_factory=list)
-    """유량 — 신규 융자 상환액 중 이자분."""
+    """유량 — 신규 상환액 중 이자분."""
 
     new_principal_during: list[float] = field(default_factory=list)
-    """유량 — 신규 융자 상환액 중 원금분. **거치 중에는 0** 이라, 화면에서 거치가 보인다."""
+    """유량 — 신규 상환액 중 원금분. **거치 중에는 0** 이라, 화면에서 거치가 보인다.
+
+    metrics.find_cliff_at 이 이 배열의 0 -> 양수 전환으로 거치 종료를 찾는다."""
 
     new_debt_at: list[float] = field(default_factory=list)
-    """저량 — 신규 융자 잔액. 길이 horizon+1."""
+    """저량 — 신규 상환분의 잔액. 길이 horizon+1."""
 
     @property
     def survival_label(self) -> str:

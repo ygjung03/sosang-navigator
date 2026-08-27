@@ -452,7 +452,19 @@ def _situation_lines(context: Any, profile: Any = None) -> list[str]:
     return out
 
 
-def _repayment_summary(result: Any, report: Any) -> list[str]:
+def _is_bullet(items: Sequence[Any]) -> bool:
+    """만기 일시상환 융자가 들어 있는가.
+
+    `SimResult.balloon_due_at` 으로는 판별할 수 없다 — 그 필드는 만기가 시뮬레이션 창
+    **밖**일 때만 채워진다(창 안이면 0). 데모 B 의 2년만기는 24개월차라 창 안이다.
+    """
+    return any(
+        it.candidate.is_loan and it.candidate.get("상환방식") == "만기일시"
+        for it in items
+    )
+
+
+def _repayment_summary(result: Any, report: Any, items: Sequence[Any] = ()) -> list[str]:
     """상환 부담을 판단할 **최소한의 값**. 각 값에 반드시 시점을 붙인다.
 
     스케줄 36행을 통째로 넣지 않는다 — 프롬프트가 배로 늘고 LLM이 그 숫자를 다 쓸 일도
@@ -485,8 +497,15 @@ def _repayment_summary(result: Any, report: Any) -> list[str]:
     last = result.survival_months if not result.survives_full_term else len(payments)
     if last <= 0 or not payments:
         return ["상환액 — 없음(갚을 것이 없다)"]
-    first = month_display(result, 1).total
-    out = [f"월 상환액 — 1개월차 {first:,}만원"]
+    # 1개월차 상환액은 **기존 부채분과 신규분을 나눠 적는다.** 합계만 주면 "이 조합을
+    # 받으면 월 N만원을 갚는다"로 읽히는데, 그 돈의 대부분이 조합과 무관하게 원래 나가던
+    # 것일 수 있다. 데모 C 는 100만원이 전액 기존 부채고 신규는 0이다.
+    # 반올림은 month_display 한 곳에서 한다 — 각자 반올림하면 덧셈이 안 맞는다.
+    cells = month_display(result, 1)
+    first = cells.total
+    ex = cells.existing_principal + cells.existing_interest
+    nw = cells.new_principal + cells.new_interest
+    out = [f"월 상환액 — 1개월차 {first:,}만원 (기존 부채 {ex:,} + 신규 {nw:,})"]
 
     cliff = getattr(report, "cliff_at", None)
     cliff_total = None
@@ -498,17 +517,48 @@ def _repayment_summary(result: Any, report: Any) -> list[str]:
     highest_so_far = max(first, cliff_total or 0)
     rises_later = peak_total > highest_so_far
 
+    # **'거치'라는 말을 쓰지 않는다.** find_cliff_at 이 찾는 것은 신규 상환의 원금이
+    # 0에서 양수로 바뀌는 시점, 즉 '원금 상환이 시작되는 시점'이지 거치가 아니다.
+    # 그 시점은 성격이 다른 셋에서 나온다 — 융자의 거치 종료, 만기 일시상환, 채무조정
+    # 확정 후 조정 스케줄 시작. new_principal_during 이 다섯 갈래를 누적하므로 앞으로
+    # 넷째·다섯째가 더 나올 수 있다.
+    #
+    # 만기 일시상환만 예외로 가른다. 부담이 질적으로 다르기 때문이다 — 분할은 매달,
+    # 일시는 한 번에다. '원금 상환 시작'이라고만 쓰면 매달 나가는 것으로 읽힌다.
+    bullet = _is_bullet(items)
+
     if cliff_total is not None:
-        out.append(f"거치 종료 후 — {cliff}개월차부터 {cliff_total:,}만원")
+        out.append(
+            f"만기 일시상환 — {cliff}개월차에 원금 전액 포함 {cliff_total:,}만원"
+            if bullet else
+            f"원금 상환 시작 — {cliff}개월차부터 {cliff_total:,}만원"
+        )
         out.append(
             f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원"
             if rises_later else "이후 변동 없음"
         )
+    elif cliff:
+        # 원금이 시작되는 시점이 **생존 기간 밖**이다. 예전에는 이 경우가 아래
+        # '거치 없음'으로 떨어져 사실과 반대로 나갔다. 라벨에 '2년거치'가 있어도 LLM 은
+        # 명시적인 이쪽을 따라 "거치 없이 상환이 시작된다"고 썼다(실측).
+        out.append(
+            f"만기 일시상환 — {cliff}개월차에 원금 전액. "
+            f"생존 {last}개월 안에 그 시점이 오지 않는다"
+            if bullet else
+            f"원금 상환 시작 — {cliff}개월차. "
+            f"생존 {last}개월 안에 그 시점이 오지 않는다"
+        )
+        # '이후 변동 없음'이라고 쓰면 안 된다 — 그 시점에 실제로 변한다. 생존 기간
+        # 안에서만 변동이 없다는 뜻을 밝힌다.
+        out.append(
+            f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원"
+            if rises_later else "생존 기간 안에는 상환액이 변하지 않는다"
+        )
     elif rises_later:
-        out.append("거치 없음")
+        out.append("신규 상환의 원금이 처음부터 나간다(거치 없음)")
         out.append(f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원")
     else:
-        out.append("거치 없음, 이후 변동 없음")
+        out.append("신규 상환의 원금이 처음부터 나간다(거치 없음), 이후 변동 없음")
     return out
 
 
@@ -686,7 +736,7 @@ def to_prompt_text(
                     lines.append(f"      [경고] {trap.message}")
             else:
                 lines.append("      함정 판정 — 4종 모두 해당 없음")
-            for line in _repayment_summary(member.result, report):
+            for line in _repayment_summary(member.result, report, member.combo.items):
                 lines.append(f"      {line}")
         if group.dropped:
             lines.append(
