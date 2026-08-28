@@ -17,6 +17,15 @@ plotly>=5.24,<7
 # ─── 데이터 처리 (POS 파싱) ───
 pandas>=2.2
 
+# ─── 매출 예측 (core/forecast.py) ───
+# 세 모델의 월별 중앙값. 요청마다 그 사용자의 POS 에 적합하므로 학습된 모델을
+# 배포하지 않는다. 메모리 실측: 앱 기본 102MB + 앙상블 88MB = 최대 229MB
+# (Streamlit Cloud 무료 한도 1GB). 적합 시간은 셋 합쳐 5초 안쪽이다.
+# prophet 은 cmdstanpy·holidays 를 함께 끌어온다.
+numpy>=1.26
+statsmodels>=0.14
+prophet>=1.1
+
 # ─── LLM 에이전트 ───
 anthropic>=0.40
 python-dotenv>=1.0

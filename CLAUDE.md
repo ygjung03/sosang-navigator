@@ -46,6 +46,7 @@ core/
   loader.py        policies_all.json 로더. 정책 → 후보 2계층
   combos.py        자격 필터 · 조합 생성 · 금액 역산
   cashflow.py      36개월 현금흐름 시뮬레이션
+  forecast.py      매출 예측. Prophet·ETS·선형회귀를 로그 공간에서 적합해 월별 중앙값
   metrics.py       함정 4종 판정 (상환절벽 · 회복불가 신규융자 등)
   optimizer.py     비지배 정렬 · 후보 선정 · LLM 프롬프트 생성
 
@@ -57,7 +58,7 @@ planning.md              기획서 (1,500줄). 설계 근거와 기각한 대안
 inquiries.md             기관 문의 관리. 해결 37건 · 미해결 4건
 ```
 
-**미구현** — `forecast.py`(매출 예측) · `agent.py`(LLM 연결) · `app.py`(Streamlit UI)
+**미구현** — 없다. `agent.py`·`app.py`·`forecast.py` 모두 붙었다.
 
 ---
 
@@ -128,7 +129,31 @@ text    = to_prompt_text(
 - ASCII 전용 파일명 (크로스플랫폼 Git 호환)
 - 스톡 변수는 `_at` (길이 horizon+1), 플로우 변수는 `_during` (길이 horizon)
 
-**변경 후 테스트를 돌린다.** `python -m tests.test_<모듈>` — 6개가 있다.
+**변경 후 테스트를 돌린다.** `python -m tests.test_<모듈>` — 7개가 있다.
+
+한국어 Windows 에서는 `PYTHONUTF8=1` 을 붙여야 한글 출력이 안 깨진다. **`test_forecast`
+하나만 예외로 붙이지 않는다.**
+
+```
+PYTHONUTF8=1 python -m tests.test_metrics     그 외 전부
+python -m tests.test_forecast                 예측만 (PYTHONUTF8 없이)
+```
+
+`PYTHONUTF8=1` 이면 이 기계에서 Prophet 초기화가 실패한다. `cmdstanpy` 가
+`where.exe tbb.dll` 을 돌려 그 출력을 읽는데, 한국어 Windows 는 cp949 로 내보내고
+`PYTHONUTF8=1` 은 UTF-8 로 읽게 만들어 `UnicodeDecodeError` 가 난다. Prophet 이
+그 예외를 삼켜서 표면에는 `AttributeError: 'Prophet' object has no attribute
+'stan_backend'` 로 나온다 — **원인과 메시지가 전혀 다르다.** Linux(배포 환경)는
+로케일이 UTF-8 이라 해당 없다.
+
+앙상블은 모델 하나가 실패해도 남은 둘로 값을 낸다. 그래서 이 문제가 있어도 나머지
+검사는 전부 통과하고 조용히 두 모델만 돈다. `test_prophet_actually_runs_here` 가
+그것만 따로 확인한다.
+
+같은 이유로 **`test_app` 은 `forecast.ENABLED = False` 로 두고 배선만 본다.** 그 파일은
+`PYTHONUTF8=1` 로 도는데, 그러면 두 모델짜리 앙상블을 검사하게 되어 배포(세 모델)와
+다른 것을 보게 된다. 앱 경로가 앙상블에 닿는지는 `test_forecast` 의
+`test_app_path_uses_the_ensemble` 이 세 모델이 다 도는 환경에서 확인한다.
 
 ---
 

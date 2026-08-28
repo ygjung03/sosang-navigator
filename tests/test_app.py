@@ -17,7 +17,7 @@ import re
 import streamlit
 
 import app
-from core import agent
+from core import agent, forecast
 from core.cashflow import SIM_MONTHS
 
 
@@ -1159,6 +1159,12 @@ def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
     print("=" * 50)
+    # 이 파일은 UI 배선을 본다. 매출 예측이 섞이면 두 가지가 어긋난다.
+    #   ① 이 파일은 PYTHONUTF8=1 로 돌리는데 그러면 Prophet 이 죽어(CLAUDE.md 참조)
+    #      두 모델짜리 앙상블을 검사하게 된다 — 배포는 세 모델이라 다른 것을 본다.
+    #   ② 배선 검사가 예측값에 흔들린다. 예측은 test_forecast 가 따로 본다.
+    # 앱 경로로 앙상블이 실제로 불리는지는 test_forecast 가 확인한다.
+    forecast.ENABLED = False
     test_money_to_man()
     test_no_live_api_call_by_default()
     test_months_label()

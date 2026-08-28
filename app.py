@@ -64,7 +64,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from core import agent, optimizer, pos
+from core import agent, forecast, optimizer, pos
 from core.cashflow import (
     SIM_MONTHS,
     Applied,
@@ -356,12 +356,20 @@ def needed_conditional_fields(phase: str, annual_revenue: int | None, include_lo
 
 
 def build_monthly_revenue(precise: bool, summary: pos.PosSummary | None, rough_revenue: int) -> list[int]:
-    """36개월 예상 매출선. forecast.py 가 없어 임시 추세선을 쓴다.
+    """36개월 예상 매출선.
 
-        정밀   POS 최근 3개월 평균을 현재값으로, 3개월 증감률을 월율로 환산해 외삽
+        정밀   POS 월별 매출로 앙상블 예측(forecast.py)
         간편   현 수준 유지(추세 없음)
+
+    앙상블이 None 을 주면(꺼져 있음·데이터 6개월 미만·세 모델 모두 실패) 추세선으로
+    돌아간다. 추세선은 3개월 증감률을 월율로 환산해 36개월 등비로 연장하는 것이라
+    최근 구간이 가파르면 폭주한다 — 반등 계열 실측에서 3년 뒤 현재의 25배가 나왔다.
+    그래서 되돌아갈 자리로만 두고 평소에는 앙상블을 쓴다.
     """
     if precise and summary is not None:
+        predicted = forecast.ensemble_revenue(summary.monthly_revenue)
+        if predicted is not None:
+            return predicted
         current = max(summary.recent_3m_avg, 1)
         # 3개월 증감률을 월율로: (1+change_3m)^(1/3) - 1
         monthly_change = (1 + summary.revenue_change_3m) ** (1 / 3) - 1
