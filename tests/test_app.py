@@ -18,7 +18,9 @@ import streamlit
 
 import app
 from core import agent, forecast
-from core.cashflow import SIM_MONTHS
+from core.cashflow import SIM_MONTHS, Applied, UserProfile, simulate, trend_revenue
+from core.combos import Combo, evaluate
+from core.metrics import detect_all
 
 
 def test_money_to_man():
@@ -413,35 +415,95 @@ def _demo_evals(key: str):
     return profile, evals, groups, reports
 
 
-def test_simresult_split_identity():
-    """SimResult 의 기존/신규 분해가 합계와 어긋나지 않는지.
+def _assert_split_identity(res, where: str) -> int:
+    """합계 == 기존 + 신규 를 생존 구간 전체에서 확인한다. 검사한 회차 수를 돌려준다.
 
     노출한 배열은 **약정 스케줄**이고 합계 배열은 **실제로 나간 돈**이라, 파산 후에는
     합계가 0으로 동결돼(가정 F1) 항등식이 깨진다. 그래서 **생존 구간만** 본다 —
-    화면 표도 그 범위까지만 그린다. 상환연장·대환이 기존분을 변형하는 조합에서도
-    성립해야 한다(비율 축소·구간 0 처리를 거친 값이 그대로 담기기 때문)."""
-    checked = adjusted = 0
+    화면 표도 그 범위까지만 그린다.
+    """
+    for m in range(1, res.survival_months + 1):
+        i = m - 1
+        for name, total, ex, nw in (
+            ("상환", res.payment_during, res.existing_payment_during, res.new_payment_during),
+            ("이자", res.interest_during, res.existing_interest_during, res.new_interest_during),
+            ("원금", res.principal_during, res.existing_principal_during, res.new_principal_during),
+        ):
+            assert abs(total[i] - (ex[i] + nw[i])) < 1.0, (
+                f"[{where}] {m}회차 {name}: 합계 {total[i]:,.0f} != "
+                f"기존 {ex[i]:,.0f} + 신규 {nw[i]:,.0f}"
+            )
+        assert abs(res.debt_at[m] - (res.existing_debt_at[m] + res.new_debt_at[m])) < 1.0, (
+            f"[{where}] {m}시점 부채: 합계 {res.debt_at[m]:,.0f} != "
+            f"기존 {res.existing_debt_at[m]:,.0f} + 신규 {res.new_debt_at[m]:,.0f}"
+        )
+    return res.survival_months
+
+
+def _profile_for_split(**over):
+    """항등식 검사용 프로필. 경로마다 필요한 값만 바꿔 쓴다."""
+    base = dict(
+        cash_on_hand=1_900 * 10_000,
+        monthly_revenue=trend_revenue(663 * 10_000, -0.01),
+        fixed_cost=435 * 10_000, variable_ratio=0.27,
+        existing_debt=5_000 * 10_000, existing_debt_payment=200 * 10_000,
+        existing_debt_rate=0.08, high_rate_debt=None, overdue_days=0,
+        policy_loan_balance=0,
+    )
+    base.update(over)
+    return UserProfile(**base)
+
+
+def test_simresult_split_identity():
+    """SimResult 의 기존/신규 분해가 합계와 어긋나지 않는지.
+
+    **기존분을 변형하는 경로를 각각 따로 단언한다.** 대환전환은 기존 스케줄을 비율로
+    축소하고, 상환연장은 축소한 뒤 늘어난 기간으로 새 스케줄을 붙인다. 서로 다른
+    변형이라 한쪽이 통과해도 다른 쪽은 모른다.
+
+    예전에는 데모 A·B·C 를 훑어 "그 경로를 타는 조합이 있으면 검사한다"는 구조였다.
+    두 문제가 있었다.
+      ① 프리셋 값이나 목표 개월수를 바꾸면 커버리지가 조용히 사라진다. 실제로 A 의
+         고정비를 올리자 대환 조합이 목표 필터에서 전부 탈락해 0개가 됐다.
+      ② 두 효과를 합집합으로 봐서 대환 하나만 있어도 통과했다. **상환연장 경로는
+         한 번도 검증된 적이 없다** — 데모 셋 다 policy_loan_balance 가 0이라
+         후보에 오르지 못하는데 아무도 눈치채지 못했다.
+    항등식은 계산 코드의 성질이지 데모의 성질이 아니므로 여기서 조합을 직접 만든다.
+    """
+    db = app.load_db()
+    conversion = next(c for c in db.candidates if c.effect == "대환전환")
+    extension = next(c for c in db.candidates if c.effect == "상환연장")
+
+    checked = 0
+    cases = [
+        # 대환: 고금리 부채가 있어야 자격이 선다
+        ("대환전환", _profile_for_split(high_rate_debt=5_000 * 10_000), [Applied(conversion)]),
+        # 상환연장: 소진공 직접대출 잔액이 있어야 대상이 잡힌다
+        ("상환연장", _profile_for_split(policy_loan_balance=2_000 * 10_000), [Applied(extension)]),
+        # 둘은 슬롯이 달라(융자 / 채무조정) 한 조합에 함께 들어갈 수 있다
+        ("대환전환+상환연장",
+         _profile_for_split(high_rate_debt=5_000 * 10_000,
+                            policy_loan_balance=2_000 * 10_000),
+         [Applied(conversion), Applied(extension)]),
+    ]
+    for label, profile, items in cases:
+        res = simulate(profile, items)
+        months = _assert_split_identity(res, label)
+        assert months > 0, f"[{label}] 생존이 0개월이라 검사할 구간이 없다"
+        checked += months
+
+    # 데모에도 있으면 함께 본다. 없다고 실패시키지 않는다 — 위에서 이미 각 경로를 봤다.
+    demo_checked = demo_adjusted = 0
     for key in ("A", "B", "C"):
         _, evals, _, _ = _demo_evals(key)
         for ev in evals:
-            res = ev.result
             if {"상환연장", "대환전환"} & {it.candidate.effect for it in ev.combo.items}:
-                adjusted += 1
-            for m in range(1, res.survival_months + 1):
-                i = m - 1
-                checked += 1
-                for name, total, ex, nw in (
-                    ("상환", res.payment_during, res.existing_payment_during, res.new_payment_during),
-                    ("이자", res.interest_during, res.existing_interest_during, res.new_interest_during),
-                    ("원금", res.principal_during, res.existing_principal_during, res.new_principal_during),
-                ):
-                    assert abs(total[i] - (ex[i] + nw[i])) < 1.0, (
-                        f"[{key}] {ev.label} {m}회차 {name}: 합계 {total[i]:,.0f} != "
-                        f"기존 {ex[i]:,.0f} + 신규 {nw[i]:,.0f}"
-                    )
-                assert abs(res.debt_at[m] - (res.existing_debt_at[m] + res.new_debt_at[m])) < 1.0
-    assert adjusted, "상환연장·대환이 든 조합이 하나도 없어 그 경로가 검증되지 않았다"
-    print(f"   합계 == 기존+신규 · 생존 구간 {checked:,}회차 (상환연장·대환 조합 {adjusted}개 포함) ✓")
+                demo_adjusted += 1
+            demo_checked += _assert_split_identity(ev.result, f"{key} {ev.label}")
+
+    print(f"   합계 == 기존+신규 · 경로별 자립 검사 {len(cases)}종 {checked}회차 "
+          f"(대환·상환연장 각각) + 데모 {demo_checked:,}회차"
+          f"{f' · 그중 변형 조합 {demo_adjusted}개' if demo_adjusted else ' · 데모에는 변형 조합 없음'} ✓")
 
 
 def test_month_display_sums():
@@ -468,42 +530,85 @@ def test_month_display_sums():
     print(f"   표시값 덧셈 일치 · {checked:,}회차 ✓")
 
 
+def _assert_cliff_message_matches_table(result, report, where: str) -> bool:
+    """절벽 경고 문장의 숫자가 상환 스케줄 표의 같은 회차와 맞는지. 검사했으면 True."""
+    import re as _re
+
+    if not report.cliff_at:
+        return False
+    cliff = next((t for t in report.traps if t.at == report.cliff_at), None)
+    if cliff is None:
+        return False
+    rows = app.schedule_rows(result)
+    assert len(rows) >= report.cliff_at, f"[{where}] 절벽 회차가 표 밖이면 나란히 볼 수 없다"
+    row = rows[report.cliff_at - 1]
+    total, principal, interest = (
+        int(_re.search(r"월 상환액 ([\d,]+)만원", cliff.message).group(1).replace(",", "")),
+        int(_re.search(r"원금 ([\d,]+)", cliff.message).group(1).replace(",", "")),
+        int(_re.search(r"이자 ([\d,]+)", cliff.message).group(1).replace(",", "")),
+    )
+    assert total == principal + interest, f"[{where}] 문장 덧셈 불일치: {cliff.message}"
+    assert principal == row["원금(기존)"] + row["원금(신규)"], (
+        f"[{where}] 문장 원금 {principal} != 표 {row['원금(기존)']}+{row['원금(신규)']}"
+    )
+    assert interest == row["이자(기존)"] + row["이자(신규)"], (
+        f"[{where}] 문장 이자 {interest} != 표 {row['이자(기존)']}+{row['이자(신규)']}"
+    )
+    return True
+
+
+def _cliff_case():
+    """절벽 함정이 반드시 걸리는 조합을 직접 만든다.
+
+    거치가 있는 융자를 붙이면 거치가 끝나는 달에 신규 상환의 원금이 0 -> 양수로
+    바뀐다(`find_cliff_at` 이 찾는 시점). 다만 **거치가 끝나는 것만으로는 함정이
+    걸리지 않는다** — 판정 기준이 `절벽 시점 <= 생존 < 36` 이라, 36개월을 다 버티면
+    절벽이 있어도 함정이 아니다(그 부담을 실제로 맞지 않는다).
+
+    그래서 현금을 절벽 시점보다 조금 더 버틸 만큼만 준다. 실측으로 고른 값이다:
+    2년거치(25회차 절벽) · 현금 3,000만 -> 생존 26개월. 25 <= 26 < 36 이라 걸린다.
+    """
+    db = app.load_db()
+    grace = next(
+        c for c in db.candidates
+        if c.is_loan and int(c.get("거치_개월", 0) or 0) == 24
+        and "직접대출" in c.label
+    )
+    profile = _profile_for_split(cash_on_hand=3_000 * 10_000)
+    combo = Combo(items=(Applied(grace, amount=3_000 * 10_000),))
+    evaluated = evaluate(profile, [combo])[0]
+    reports = detect_all(profile, [evaluated], "일시적자금난")
+    return evaluated, reports[evaluated.label], f"자립({grace.label[:24]})"
+
+
 def test_trap_message_matches_table():
     """함정 경고의 숫자와 상환 스케줄 표의 숫자가 **같은 회차에서 일치**하는지.
 
     문장과 표가 각자 반올림하면 같은 13회차인데 이자가 15 / 14 로 갈린다.
-    둘 다 month_display 를 거치게 해서 막는다."""
-    import re as _re
+    둘 다 month_display 를 거치게 해서 막는다.
+
+    **절벽이 있는 조합을 직접 만들어 검사한다.** 예전에는 데모 A·B·C 에 절벽이
+    있으면 검사하고 없으면 `assert seen` 으로 실패시켰는데, 프리셋을 만지면
+    커버리지가 조용히 사라지는 구조였다(같은 이유로
+    `test_simresult_split_identity` 를 자립시켰다). 데모 순회는 남기되 없다고
+    실패시키지 않는다.
+    """
+    evaluated, report, where = _cliff_case()
+    assert _assert_cliff_message_matches_table(evaluated.result, report, where), (
+        "자립 케이스에 절벽 함정이 안 걸렸다 — `절벽 시점 <= 생존 < 36` 을 만족하는지 "
+        "확인할 것(현금을 늘리면 36개월을 다 버텨 함정이 사라진다)"
+    )
 
     seen = 0
     for key in ("A", "B", "C"):
         _, _, groups, reports = _demo_evals(key)
         for group in groups:
             member = group.members[0]
-            report = reports[member.label]
-            if not report.cliff_at:
-                continue
-            cliff = next((t for t in report.traps if t.at == report.cliff_at), None)
-            if cliff is None:
-                continue
-            seen += 1
-            rows = app.schedule_rows(member.result)
-            assert len(rows) >= report.cliff_at, "절벽 회차가 표 밖이면 나란히 볼 수 없다"
-            row = rows[report.cliff_at - 1]
-            total, principal, interest = (
-                int(_re.search(r"월 상환액 ([\d,]+)만원", cliff.message).group(1).replace(",", "")),
-                int(_re.search(r"원금 ([\d,]+)", cliff.message).group(1).replace(",", "")),
-                int(_re.search(r"이자 ([\d,]+)", cliff.message).group(1).replace(",", "")),
-            )
-            assert total == principal + interest, f"문장 덧셈 불일치: {cliff.message}"
-            assert principal == row["원금(기존)"] + row["원금(신규)"], (
-                f"[{key}] 문장 원금 {principal} != 표 {row['원금(기존)']}+{row['원금(신규)']}"
-            )
-            assert interest == row["이자(기존)"] + row["이자(신규)"], (
-                f"[{key}] 문장 이자 {interest} != 표 {row['이자(기존)']}+{row['이자(신규)']}"
-            )
-    assert seen, "절벽 함정이 있는 조합이 없어 검증되지 않았다"
-    print(f"   함정 경고 ↔ 표 숫자 일치 · 절벽 조합 {seen}개 ✓")
+            if _assert_cliff_message_matches_table(
+                member.result, reports[member.label], f"{key} {member.label[:24]}"
+            ):
+                seen += 1
+    print(f"   함정 경고 ↔ 표 숫자 일치 · 자립 1개 + 데모 {seen}개 ✓")
 
 
 def test_schedule_stops_at_exhaustion():
