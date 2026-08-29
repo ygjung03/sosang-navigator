@@ -64,7 +64,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from core import agent, forecast, optimizer, pos
+from core import agent, forecast, future, optimizer, pos
 from core.cashflow import (
     SIM_MONTHS,
     Applied,
@@ -93,7 +93,8 @@ from core.combos import (
 )
 from core.loader import PolicyDB, load
 from core.metrics import TrapKind, detect_all, detect_traps
-from core.optimizer import CandidateGroup, apply_links, prerequisites, select, to_prompt_text
+from core.optimizer import (CandidateGroup, _dominates, apply_links, prerequisites,
+                            select, to_prompt_text)
 from core.phase import (
     SCORE_IMPROVABLE,
     SCORE_TEMPORARY,
@@ -681,6 +682,129 @@ def run_pipeline(
     reports = detect_all(profile, evals, ctx.phase)
     groups = select(evals, reports)
     return groups, reports, evals, extra_candidates(pool), baseline_survival, goal_satisfied, resolve_info
+
+
+# ══════════════════════════════════════════════════════════
+# 미래 자격 파이프라인 (기획서 5.2.3)
+# ══════════════════════════════════════════════════════════
+
+
+def run_future_pipeline(
+    db: PolicyDB,
+    profile: UserProfile,
+    ctx: UserContext,
+    summary: pos.PosSummary | None,
+    monthly_revenue: list[int],
+    shown_groups: list[CandidateGroup],
+    target_months: int | None = None,
+    drop_ids: set[str] | None = None,
+):
+    """미래 자격 조합. **본 결과와 완전히 분리된 두 번째 파이프라인이다.**
+
+    Returns:
+        (groups, reports, months) — 레이어 1 그룹 · 함정 리포트 · {후보id: N개월}
+        미래 후보가 없거나 공개 조건을 못 넘으면 ([], {}, {}).
+
+    본 결과의 파레토·함정·순위를 건드리지 않는 것이 핵심이다. 미래 후보를 현재
+    후보와 같은 풀에 넣으면 순위가 흔들리는데, 그건 "지금 신청할 수 있는 것들"의
+    비교를 "몇 달 뒤에나 되는 것"이 흔드는 셈이라 맞지 않는다.
+
+    Args:
+        shown_groups: **화면에 그려진 카드 셋**(LLM 이 고른 것). 파레토 순서의 앞
+            셋이 아니다 — `render_results` 가 `advice.picks` 로 그리므로 둘이 다를
+            수 있고, 사용자가 보고 있는 것과 비교해야 "기다릴 값어치"가 성립한다.
+
+    **공개 조건** — 그 카드 셋 **모두에게** 두 축에서 지배당하면 보여주지 않는다.
+    기다리는 비용이 있는데 얻는 게 없으면 안내가 아니라 소음이다. 판정은 이미 있는
+    `optimizer._dominates` 를 그대로 쓴다 — 새 기준을 만들지 않는다.
+
+    간편 모드(POS 없음)에서는 `summary` 가 None 이라 곧바로 빈 결과를 준다.
+    """
+    if summary is None or not monthly_revenue:
+        return [], {}, {}
+
+    past = [float(v) for v in summary.monthly_revenue.values]
+    months_by_id = future.future_candidates(
+        db, profile, ctx, past, monthly_revenue, ctx.is_closed
+    )
+    if drop_ids:
+        months_by_id = {k: v for k, v in months_by_id.items() if k not in drop_ids}
+    if not months_by_id:
+        return [], {}, {}
+
+    by_id = {c.candidate_id: c for c in db.candidates}
+    # 미래 후보는 그 시점으로 미룬 사본을 쓴다. 함께 묶이는 현재 후보는 그대로다 —
+    # 지금 신청할 수 있으니 자기 시점을 지킨다.
+    pool = [future.delayed(by_id[cid], n) for cid, n in months_by_id.items()]
+
+    # 조합에 함께 넣을 현재 후보. 융자는 뺀다 — 조합당 융자가 1개라 현재 융자를
+    # 넣으면 미래 후보가 빠진 조합(= 본 결과와 같은 것)이 다시 만들어진다.
+    now_pool = eligible_candidates(db, profile, ctx)
+    if drop_ids:
+        now_pool = [c for c in now_pool if c.candidate_id not in drop_ids]
+    pool += [c for c in now_pool if not c.is_loan and not c.is_extra]
+
+    latest = max(months_by_id.values())
+    pool = _with_extension_timings(pool, latest)
+
+    # 목표는 본 결과와 같은 값을 쓴다. 세션 상태를 읽지 않는다 — 그러면 테스트나
+    # 다른 호출부에서 조용히 기본값(6)으로 떨어져 융자 필요액이 0이 된다.
+    amounts = default_loan_amounts(
+        db, pool, profile, target_months or DEFAULT_TARGET_MONTHS)
+    amounts.update(fixed_amounts(profile, pool))
+    amounts.update(grant_amounts(db, pool, ctx))
+    combos = build_combos(db, pool, amounts)
+
+    future_ids = set(months_by_id)
+    combos = [c for c in combos
+              if any(i.candidate.candidate_id in future_ids for i in c.items)]
+    if not combos:
+        return [], {}, {}
+
+    evals = evaluate(profile, combos)
+    reports = detect_all(profile, evals, ctx.phase)
+    groups = [g for g in select(evals, reports) if g.layer == 1]
+    groups = [g for g in groups if _worth_waiting_for(g, shown_groups)]
+    return groups, reports, months_by_id
+
+
+def _with_extension_timings(pool, latest_month: int):
+    """상환연장이 풀에 있으면 **적용 시점을 여럿** 만들어 넣는다.
+
+    실측에서 상환연장은 시점에 따라 두 축이 갈렸다(조건 108개 중 25개). 생존이 짧으면
+    늦춘 시점에 도달하지 못해 "연장을 안 한 것"과 같아지는데, 그때 부채가 오히려 작게
+    잡히기도 한다. 어느 시점이 나은지 정량으로 못 고르므로 모두 후보로 넣고 두 축이
+    순위를 매기게 한다(기획서 5.5 "정량으로 고를 수 없으면 고르지 않는다").
+
+    범위는 **가장 이른 시점 ~ 미래 융자 시점**이다. 임의 상한이 아니라 조합 안의
+    사건이 정한다 — 일반 조합에서는 상환연장을 지금 신청하는 것으로 고정하고 있고,
+    늦출 이유가 생기는 것은 미래 융자가 t=N 에 오기 때문이라 범위도 거기까지다.
+    """
+    out, extras = [], []
+    for cand in pool:
+        out.append(cand)
+        if cand.effect != "상환연장":
+            continue
+        base = int(cand.get("적용시점_개월", 0) or 0)
+        for extra in range(1, latest_month + 1):
+            extras.append(future.delayed(cand, extra))
+    return out + extras
+
+
+def _worth_waiting_for(group: CandidateGroup, shown_groups) -> bool:
+    """**화면에 그려진 카드 셋 모두에게** 지배당하면 보여주지 않는다.
+
+    비교 대상은 파레토 순서의 앞 셋이 아니라 **LLM 이 고른 셋**이다. LLM 은 그룹
+    5개 중 앞 셋이 아닌 것을 고를 수 있어(`render_results` 의 `advice.picks`) 둘이
+    다르다. 사용자가 보고 있는 것과 비교해야 "기다릴 값어치가 있나"가 성립한다.
+
+    하나라도 안 지배당하면 남긴다 — 두 축 중 하나에서라도 나은 데가 있다는 뜻이다.
+    "2개월 기다렸는데 지금보다 나쁘다"를 보여줄 이유가 없다.
+    """
+    shown = list(shown_groups)[:3]
+    if not shown:
+        return True
+    return not all(_dominates(g, group) for g in shown)
 
 
 # ══════════════════════════════════════════════════════════
