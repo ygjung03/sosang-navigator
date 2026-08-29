@@ -21,38 +21,43 @@ def series(values: list[float]) -> pd.Series:
     return pd.Series([v * MAN for v in values], index=index)
 
 
-def decline_24() -> pd.Series:
-    """24개월 완만한 하락. 노이즈를 조금 섞어 직선이 되지 않게 한다."""
+# 길이는 12개월로 맞춘다. 앱이 정밀 모드에 넘기는 길이이고(app.py 의 시나리오 생성),
+# forecast.MIN_MONTHS 도 같은 값이다. 24개월로 재면 앱과 다른 것을 검사하게 된다.
+def decline_12() -> pd.Series:
+    """12개월 완만한 하락. 노이즈를 조금 섞어 직선이 되지 않게 한다."""
     rng = np.random.default_rng(7)
-    base = [800 * (0.97**m) for m in range(24)]
+    base = [800 * (0.97**m) for m in range(12)]
     return series([b * float(rng.normal(1.0, 0.04)) for b in base])
 
 
-def rebound_24() -> pd.Series:
-    """급락 후 최근 5개월 반등. 감쇠가 지키는 대상이다."""
-    base = [800 * (0.93**m) for m in range(19)]
-    base += [base[-1] * (1.07 ** (m + 1)) for m in range(5)]
+def rebound_12() -> pd.Series:
+    """급락 후 최근 4개월 반등. 진단은 매출감소가 작다고 보는데 예측선만 급락하면
+    화면끼리 어긋난다. 감쇠가 그 폭을 좁히는 대상이다."""
+    base = [800 * (0.93**m) for m in range(8)]
+    base += [base[-1] * (1.07 ** (m + 1)) for m in range(4)]
     return series(base)
 
 
 def test_no_negative_and_length() -> None:
     """36개월 전부 양수이고 길이가 맞는다. 로그 공간을 쓰는 이유가 이것이다."""
-    for name, data in (("하락", decline_24()), ("반등", rebound_24())):
+    for name, data in (("하락", decline_12()), ("반등", rebound_12())):
         out = forecast.ensemble_revenue(data)
         assert out is not None, name
         assert len(out) == forecast.SIM_MONTHS, (name, len(out))
         assert all(v >= forecast.FLOOR for v in out), (name, min(out))
-        print(f"  {name} 24개월 → 36개월 예측: "
+        print(f"  {name} 12개월 → 36개월 예측: "
               f"1개월 {out[0] / MAN:,.0f}만 · 36개월 {out[-1] / MAN:,.0f}만 · 전부 양수")
 
 
 def test_rebound_is_not_extrapolated_to_absurdity() -> None:
     """반등 계열에서 36개월 뒤가 현재의 3배를 넘지 않는다.
 
-    감쇠 없이 로그 공간만 쓰면 반등을 그대로 연장해 14배가 나왔다(실측).
-    3배는 그 폭주와 정상 예측을 가르는 자리로 두는 것이지 제도 근거가 아니다.
+    **이 경계가 지키는 대상은 앙상블이지 `trend_revenue` 가 아니다.** 같은 성격의
+    계열에서 `trend_revenue` 는 33배를 내는데, 그건 fallback 경로라 여기서 안 잡힌다.
+    앙상블 실측은 반등 계열에서 최대 1.37배였으므로 3배는 여유를 둔 자리다. 제도
+    근거가 있는 숫자가 아니라, 폭주와 정상 예측을 가르려고 둔 값이다.
     """
-    data = rebound_24()
+    data = rebound_12()
     current = float(data.iloc[-3:].mean())
     out = forecast.ensemble_revenue(data)
     assert out is not None
@@ -63,17 +68,18 @@ def test_rebound_is_not_extrapolated_to_absurdity() -> None:
 
 
 def test_short_history_returns_none() -> None:
-    """6개월 미만이면 예측하지 않는다. 호출부가 추세선으로 돌아간다."""
-    assert forecast.ensemble_revenue(series([800] * 5)) is None
-    assert forecast.ensemble_revenue(series([800] * 6)) is not None
-    print(f"  5개월 → None · 6개월(MIN_MONTHS) → 예측")
+    """MIN_MONTHS 미만이면 예측하지 않는다. 호출부가 추세선으로 돌아간다."""
+    n = forecast.MIN_MONTHS
+    assert forecast.ensemble_revenue(series([800] * (n - 1))) is None
+    assert forecast.ensemble_revenue(series([800] * n)) is not None
+    print(f"  {n - 1}개월 → None · {n}개월(MIN_MONTHS) → 예측")
 
 
 def test_disabled_switch() -> None:
     """ENABLED=False 면 None. 배포에서 코드를 되돌리지 않고 끌 수 있어야 한다."""
     forecast.ENABLED = False
     try:
-        assert forecast.ensemble_revenue(decline_24()) is None
+        assert forecast.ensemble_revenue(decline_12()) is None
     finally:
         forecast.ENABLED = True
     print("  ENABLED=False → None")
@@ -87,7 +93,7 @@ def test_survives_model_failure() -> None:
     original = forecast._prophet
     forecast._prophet = lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("일부러"))
     try:
-        out = forecast.ensemble_revenue(decline_24())
+        out = forecast.ensemble_revenue(decline_12())
     finally:
         forecast._prophet = original
     assert out is not None and len(out) == forecast.SIM_MONTHS
@@ -100,7 +106,7 @@ def test_prophet_actually_runs_here() -> None:
     실패해도 앙상블은 값을 내므로 위 검사들은 전부 통과한다. 그래서 조용히
     두 모델만 도는 상태가 될 수 있다. 여기서만 따로 확인한다.
     """
-    data = decline_24()
+    data = decline_12()
     try:
         out = forecast._prophet(data.index, np.asarray(data, dtype=float), 6)
         print(f"  Prophet 동작 확인 (6개월: {out[-1] / MAN:,.0f}만)")
@@ -120,7 +126,7 @@ def test_app_path_uses_the_ensemble() -> None:
     from core import pos
     from data.synthetic_pos import generate
 
-    summary = pos.summarize(pos.load(generate("A", months=24)))
+    summary = pos.summarize(pos.load(generate("A", months=12)))
     on = app.build_monthly_revenue(True, summary, 0)
     assert on == ensemble_revenue_of(summary), "앱 경로가 앙상블 결과와 다르다"
 
