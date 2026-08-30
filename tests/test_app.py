@@ -384,6 +384,40 @@ def test_reason_sentences_end_with_period():
     print(f"   근거 문장 {len(produced)}종 전부 마침표로 끝남 · ICR 적자 문장 채워짐 ✓")
 
 
+def _demo_pool(key: str):
+    """데모 하나의 자격 통과 후보. `_demo_evals` 와 같은 방식으로 조립한다."""
+    profile, ctx = _demo_profile_ctx(key)
+    return app.eligible_candidates(app.load_db(), profile, ctx)
+
+
+def _demo_profile_ctx(key: str):
+    """데모 하나의 (profile, ctx). 자격 필터에 필요한 것만 만든다."""
+    import datetime as _dt  # noqa: F401  (프리셋의 date 값 사용)
+
+    preset = app.DEMO_PRESETS[key]
+    summary = app.summarize_scenario(key, 12)
+    won = lambda man: int(man) * 10_000  # noqa: E731
+    finance = dict(
+        fixed_cost=won(preset["fixed_man"]), variable_cost=won(preset["var_man"]),
+        cash=won(preset["cash_man"]), debt=won(preset["debt_man"]),
+        debt_payment=won(preset["debt_pay_man"]), debt_rate=preset["rate_pct"] / 100,
+        high_rate_debt=None, overdue_days=preset["overdue_days"], policy_loan_balance=0,
+    )
+    profile = app.build_profile(
+        finance, app.build_monthly_revenue(True, summary, 0), summary.recent_3m_avg
+    )
+    phase = {"A": "일시적자금난", "B": "개선여지", "C": "회복불가"}[key]
+    ctx = app.build_context(
+        phase,
+        dict(region="서울", restart_status="안함", is_closed=preset.get("is_closed", False),
+             tax_delinquent=False, include_loans=True, credit_score=None),
+        dict(business_started=preset["cond_bstart"], store_area_pyeong=preset.get("cond_area"),
+             policy_loan_count_5y=0),
+        summary, summary.rolling_annual_revenue,
+    )
+    return profile, ctx
+
+
 def _demo_evals(key: str):
     """데모 시나리오 하나의 (profile, 전체 조합 평가, 그룹, 리포트)."""
     import datetime as _dt  # noqa: F401  (프리셋의 date 값 사용)
@@ -679,15 +713,22 @@ def test_confirm_excludes_unsure_like_no():
 
 
 def test_demo_confirm_presets_match_real_questions():
-    """데모 프리셋의 `confirm_yes` 후보 id 가 **실제 질문 key 로 옮겨지는지**.
+    """데모 프리셋의 `confirm_yes` 와 실제 확인 질문이 **양방향으로** 맞는지.
 
     프리셋에 해시를 박아 두면 정책 데이터의 질문 문구가 바뀌었을 때 조용히 어긋나
     시연 화면이 달라진다. id 로 적고 confirm_key_of 가 옮기게 했으니, 그 id 가
-    실제로 확인 질문을 가진 후보인지 여기서 확인한다."""
+    실제로 확인 질문을 가진 후보인지 확인한다.
+
+    **반대 방향도 본다.** 예전에는 "프리셋의 id 가 질문 key 로 해석되는지"만 봐서
+    질문에는 있는데 프리셋에 없는 id 를 못 잡았다. 실제로 `seoul_urgent_selfemp__1y4y__q`
+    가 A·B 프리셋에서 빠져 있었다 — 같은 질문이 후보 둘을 덮는데 한쪽만 적은 것이다.
+    답은 질문 key 에 붙으므로 동작은 같았지만, 프리셋 목록이 실제와 어긋난 채였다.
+    """
     db = app.load_db()
     checked = 0
     for key, preset in app.DEMO_PRESETS.items():
-        for candidate_id in preset.get("confirm_yes", ()):
+        listed = set(preset.get("confirm_yes", ()))
+        for candidate_id in listed:
             resolved = app.confirm_key_of(db, candidate_id)
             assert resolved, (
                 f"[{key}] 프리셋의 {candidate_id} 에 자격 확인 질문이 없다 — "
@@ -695,8 +736,16 @@ def test_demo_confirm_presets_match_real_questions():
             )
             assert resolved.startswith("confirm_")
             checked += 1
+
+        # 반대 방향 — 그 시나리오에서 실제로 뜨는 질문의 후보가 프리셋에 다 있는지
+        asked = {i for q in app.confirm_questions(_demo_pool(key)) for i in q["ids"]}
+        missing = sorted(asked - listed)
+        assert not missing, (
+            f"[{key}] 화면에 뜨는 질문의 후보 {missing} 가 프리셋 confirm_yes 에 없다 — "
+            "같은 질문이 후보 여럿을 덮으면 전부 적어야 목록이 실제와 맞는다."
+        )
     assert checked, "confirm_yes 를 가진 프리셋이 하나도 없다"
-    print(f"   프리셋 confirm_yes {checked}건이 실제 질문 key 로 해석됨 ✓")
+    print(f"   프리셋 confirm_yes {checked}건 · 양방향 일치 (A/B/C) ✓")
 
 
 def _drive(scenarios: list[str]) -> dict:

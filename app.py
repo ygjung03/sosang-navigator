@@ -698,6 +698,7 @@ def run_future_pipeline(
     shown_groups: list[CandidateGroup],
     target_months: int | None = None,
     drop_ids: set[str] | None = None,
+    confirm_answers: dict[str, str] | None = None,
 ):
     """미래 자격 조합. **본 결과와 완전히 분리된 두 번째 파이프라인이다.**
 
@@ -729,6 +730,7 @@ def run_future_pipeline(
     )
     if drop_ids:
         months_by_id = {k: v for k, v in months_by_id.items() if k not in drop_ids}
+    months_by_id = _drop_unconfirmed_future(db, months_by_id, confirm_answers)
     if not months_by_id:
         return [], {}, {}
 
@@ -768,6 +770,32 @@ def run_future_pipeline(
     return groups, reports, months_by_id
 
 
+def _drop_unconfirmed_future(
+    db: PolicyDB, months_by_id: dict[str, int], answers: dict[str, str] | None
+) -> dict[str, int]:
+    """자격 확인 질문에 '예'를 못 받은 미래 후보를 뺀다.
+
+    **순서 때문에 생기는 구멍을 막는다.** ⑥ 추가 확인은 **본 결과 후보**를 보고 질문을
+    만드는데, 미래 후보는 결과 화면에서 처음 계산된다. 미래 후보에만 붙은 질문은
+    물어볼 기회가 없어 답이 없는 채로 통과한다.
+
+    `_확인필요_자격` 은 "판정할 수 없어 통과시켜 둔 것"이지 "자격이 있다"가 아니다.
+    답을 못 받았으면 **'아니오'·'모름'과 똑같이 제외한다**(기획서 5.2.5 ⑥). 판정은
+    `excluded_by_confirm` 을 그대로 쓴다 — `_확인필요_자격_지금가능: true` 예외
+    (신청 전에 할 수 있는 일)도 함께 따라온다.
+
+    지금 데모에서는 걸리는 후보가 없다. A 의 미래 후보(긴급경영안정자금)에는 확인
+    질문이 없기 때문이다. 다만 재도전특별자금 세 후보에는 모두 붙어 있어, **회복불가
+    사용자에게는 실제로 열리는 구멍이다.**
+    """
+    if not months_by_id:
+        return months_by_id
+    by_id = {c.candidate_id: c for c in db.candidates}
+    cands = [by_id[cid] for cid in months_by_id if cid in by_id]
+    blocked = excluded_by_confirm(confirm_questions(cands), answers or {})
+    return {cid: n for cid, n in months_by_id.items() if cid not in blocked}
+
+
 def _with_extension_timings(pool, latest_month: int):
     """상환연장이 풀에 있으면 **적용 시점을 여럿** 만들어 넣는다.
 
@@ -789,6 +817,18 @@ def _with_extension_timings(pool, latest_month: int):
         for extra in range(1, latest_month + 1):
             extras.append(future.delayed(cand, extra))
     return out + extras
+
+
+def _months_until(member: Evaluated, months_by_id: dict[str, int]) -> int:
+    """이 조합을 신청할 수 있게 되는 시점. 조합 안 미래 후보들의 **가장 늦은** 달이다.
+
+    조합에 미래 후보가 둘 이상이면 전부 자격이 생겨야 그 조합을 신청할 수 있다.
+    미래 후보가 없으면(있을 수 없지만) 0 을 준다.
+    """
+    months = [months_by_id[i.candidate.candidate_id]
+              for i in member.combo.items
+              if i.candidate.candidate_id in months_by_id]
+    return max(months) if months else 0
 
 
 def _worth_waiting_for(group: CandidateGroup, shown_groups) -> bool:
@@ -1267,6 +1307,7 @@ def render_group_card(
     baseline_survival: int,
     expanded: bool,
     pick: agent.Pick | None = None,
+    future_months: int | None = None,
 ) -> None:
     """조합 하나를 카드로 그린다.
 
@@ -1277,15 +1318,39 @@ def render_group_card(
 
     rank — LLM 이 고른 순위. 폴백이면 None 이고 제목이 '후보'가 된다. 폴백의 순서는
     계산 순서일 뿐이라 순위로 쓰지 않는다.
+
+    future_months — 미래 자격 조합이면 **몇 개월 뒤 신청할 수 있는지**. 그때만
+    ⏳ 제목과 조건부 안내를 붙이고 순위를 매기지 않는다(rank 는 None 으로 온다).
+
+    위젯 key 도 `future_card` 네임스페이스로 가른다. label 이 겹칠 일은 지금 구조상
+    없다 — `run_future_pipeline` 이 미래 후보가 든 조합만 남기고, 미래 후보는 정의상
+    현재 자격이 없어 본 결과 조합에 들어갈 수 없다. 다만 그 보장이 두 단계 추론에
+    기대고 있어, key 를 갈라 한 단계로 만든다.
     """
     trap_icon = " ⚠" if group.has_trap else ""
     # 제목: N위 │ 정책명(파랑) │ 성과.
     # st.expander 라벨의 마크다운 색상 지시자(:blue[…])는 Streamlit 1.62 문서상 지원되나
     # 렌더링은 브라우저에서 확인해야 한다. 안 먹으면 색 대신 다른 방식으로 바꾼다.
     perf = f"생존 {months_label(group.survival_months)} · 종료 시점 부채 {fmt_man(group.debt_at_exit)}"
-    head = f"**{rank}위**" if rank is not None else "**후보**"
+    if future_months is not None:
+        head = f"**⏳ {future_months}개월 뒤**"
+    else:
+        head = f"**{rank}위**" if rank is not None else "**후보**"
     title = f"{head}  │  :blue[{member.label}]{trap_icon}  │  {perf}"
     with st.expander(title, expanded=expanded):
+        if future_months is not None:
+            # 조건부로 쓴다. 두 가지를 밝혀야 정직하다 —
+            #   ① 매출이 예측선대로 움직여야 성립한다
+            #   ② 자격은 **그 시점의 진단**으로 계산했다(국면이 바뀔 수 있다)
+            st.info(
+                f"지금은 자격이 안 되지만, 매출이 예측선대로 움직이면 "
+                f"**{future_months}개월 뒤** 신청 요건을 충족합니다. "
+                f"그 시점의 진단 결과로 자격을 계산했습니다."
+            )
+            st.caption(
+                "⚠ 예측이므로 실제와 다를 수 있습니다. 매출이 예측선과 달라지거나 "
+                "그 사이 상황이 바뀌면 자격도 달라집니다. 신청 전에 다시 진단해 보세요."
+            )
         # '레이어 N'(내부 용어) 을 지운 자리에 **LLM 이 고른 이유**가 들어간다.
         # axis_focus 는 앞에 배지로 — 어느 축을 보고 골랐는지가 한눈에 들어와야 한다.
         if pick is not None and pick.why:
@@ -1328,7 +1393,9 @@ def render_group_card(
         # 신청처·자격 확인 문구는 상자 밖이다 — 슬라이더로 바뀌지 않는다.
         # key 를 카드 번호(idx)가 아니라 **조합 이름**으로 잡는다. LLM 이 순서를 바꾸면
         # (재시도 등) idx 기준 key 는 슬라이더 값이 엉뚱한 조합에 붙는다.
-        card_id = stable_key("card", member.label)
+        card_id = stable_key(
+            "future_card" if future_months is not None else "card", member.label
+        )
         with st.container(key=f"adjust_{card_id}"):
             # 안내는 **모든 카드에** 같은 자리로. 카드를 펼치는 순서가 정해져 있지
             # 않아 첫 카드에만 두면 후보 3만 펼친 사람은 이 설명을 못 본다.
@@ -1361,6 +1428,18 @@ def render_group_card(
             if pick is not None and pick.trap_note and report.traps:
                 st.caption(f"↳ {pick.trap_note}")
 
+            # 창 밖 만기 일시상환 — **함정 경고 바로 아래, 같은 하늘색 상자 안**에 둔다.
+            # 예전에는 컨테이너 밖(8칸 들여쓰기)에 있어 상자 밖으로 튀어나왔다.
+            # 본 카드에서는 드러나지 않았다 — 데모 아홉 장 중 만기 일시상환이 있는
+            # 조합이 하나도 없었기 때문이다. 미래 카드(만기 30% 일시상환)에서 처음
+            # 보였다. 같은 성격의 경고 둘이 다른 자리에 뜨면 안 된다.
+            if shown.result.balloon_after_horizon > 0:
+                st.warning(
+                    f"⚠ {shown.result.balloon_due_at}개월차에 원금 "
+                    f"{fmt_man(shown.result.balloon_after_horizon)}이 일시상환으로 남습니다 "
+                    f"(36개월 시뮬레이션 밖)"
+                )
+
             # 상환 스케줄 표 — 그래프와 같은 시뮬레이션 결과(shown)를 쓴다.
             # 회차 수는 표와 같은 함수에서 세어 제목과 표가 어긋나지 않게 한다
             # (슬라이더로 금액이 바뀌면 소진 시점이 움직여 표 길이도 따라 바뀐다).
@@ -1374,14 +1453,6 @@ def render_group_card(
                 # 옛 문구('대출잔액은 기존 부채와 신규 융자를 합친 값입니다')는 지웠다 —
                 # 이제 잔액도 기존/신규로 나뉘어 있어 틀린 말이 된다.
                 render_schedule_table(shown.result)
-
-        # 창 밖 만기 일시상환
-        if shown.result.balloon_after_horizon > 0:
-            st.warning(
-                f"⚠ {shown.result.balloon_due_at}개월차에 원금 "
-                f"{fmt_man(shown.result.balloon_after_horizon)}이 일시상환으로 남습니다 "
-                f"(36개월 시뮬레이션 밖)"
-            )
 
         # 자격 확인 필요 · 계산 전제 등 주의 문구 (optimizer가 프롬프트에 쓰는 것과 동일)
         for note in optimizer._caveats(member.combo.items, ctx):
@@ -1426,6 +1497,9 @@ def render_results(
     precise: bool,
     advice: agent.Advice | None = None,
     dropped_by_confirm: bool = False,
+    future_groups: list[CandidateGroup] | None = None,
+    future_reports: dict | None = None,
+    future_months: dict[str, int] | None = None,
 ) -> None:
     """추천 조합 화면 — 카드·부가안내·심사용 프롬프트."""
     if not precise:
@@ -1528,6 +1602,25 @@ def render_results(
             expanded=(rank == 1),  # 1위 기본 펼침
             pick=pick,
         )
+
+    # ── 미래 자격 카드 — 순위 아래에 붙인다 ──
+    # 공개 조건(화면에 그려진 카드 셋 모두에게 지배당하면 숨김)은 run_future_pipeline
+    # 이 이미 걸렀다. 여기 온 것은 두 축 중 하나에서라도 나은 것들이다.
+    # 비교 대상으로 **방금 그린 카드의 그룹**을 넘긴다 — LLM 픽이든 폴백이든
+    # 사용자가 실제로 보고 있는 것과 비교해야 "기다릴 값어치"가 성립한다.
+    if future_groups:
+        st.markdown("---")
+        st.markdown("**⏳ 지금은 안 되지만 곧 신청할 수 있는 지원**")
+        for group in future_groups:
+            member = group.members[0]
+            render_group_card(
+                None, group, member, future_reports or {}, profile, ctx,
+                baseline_survival, expanded=False,
+                future_months=_months_until(member, future_months or {}),
+            )
+        # 미래 카드 묶음의 끝에도 같은 실선을 둔다. 위쪽 실선만 있으면 그 아래 오는
+        # 부가 추천·배제 목록이 미래 카드에 딸린 것처럼 읽힌다.
+        st.markdown("---")
 
     # 부가 추천 (컨설팅·법률자문 등)
     if extras:
@@ -1933,18 +2026,29 @@ DEMO_PRESETS: dict[str, dict] = {
     # 걸리는 규칙인데 A 가 유일한 발동처였다. 규칙 자체는 test_phase 가 검증한다.
     "A": dict(fixed_man=435, var_man=180, cash_man=1_900, debt_man=5_000, debt_pay_man=200,
               rate_known=True, rate_pct=8.0, overdue_days=0,
-              goal_months_on=True, goal_months=24,
+              # 목표 24 -> 18 (2026-08-31). 24 로 두면 역산이 거기서 멈춰 **다섯 그룹이
+              # 전부 생존 24 에 눌려 붙는다.** 두 축 중 하나가 상수가 되어 부채만으로
+              # 순위가 갈리고, 늦게 받는 융자는 구조적으로 항상 진다 — 같은 목표를
+              # 채우려면 그 사이 잔고가 더 마른 만큼 더 빌려야 하기 때문이다.
+              # 그래서 미래 자격 조합이 상위 3개에 전부 지배당해 화면에 못 떴다.
+              # 18 로 내리면 좌표가 (24, 5,000) · (19, 4,208) · (18, 4,160) 으로
+              # 흩어져 "더 오래 버티려면 빚이 는다"가 카드 사이에서 보이고, 미래
+              # 카드도 공개된다. baseline 9 의 두 배라 개선 폭도 읽힌다.
+              goal_months_on=True, goal_months=18,
               cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
               # A 는 이 답이 결과를 바꾸지 않는다(제외되는 두 후보가 상위 5위 밖).
               # 그래도 넣어 둔다 — 시나리오를 오갈 때 답이 남아 생기는 혼선을 막는다.
-              confirm_yes=("seoul_urgent_selfemp__1y4y", "fund_credit_weak__2y3y")),
+              # `__q` 는 같은 질문이 덮는 둘째 후보다. 질문 key 가 같아 답이 함께
+              # 붙지만, 프리셋에 한쪽만 적으면 목록이 실제 질문과 어긋난다.
+              confirm_yes=("seoul_urgent_selfemp__1y4y", "seoul_urgent_selfemp__1y4y__q",
+                           "fund_credit_weak__2y3y")),
     "B": dict(fixed_man=430, var_man=180, cash_man=1_500, debt_man=2_500, debt_pay_man=70,
               rate_known=True, rate_pct=5.0, overdue_days=0,
               goal_months_on=True, goal_months=18,
               cond_bstart_known=True, cond_bstart=datetime.date(2019, 3, 1),
               # 없으면 1위가 긴급자영업자금 -> 성장기반자금으로 바뀌고 부채가 219만 늘어난다.
-              confirm_yes=("seoul_urgent_selfemp__1y4y", "fund_credit_weak__2y3y",
-                           "seoul_standup__fund")),
+              confirm_yes=("seoul_urgent_selfemp__1y4y", "seoul_urgent_selfemp__1y4y__q",
+                           "fund_credit_weak__2y3y", "seoul_standup__fund")),
     # C 의 is_closed=True 는 의도적이다. **끄면 두 가지가 같이 사라진다.**
     #   ① 회복불가 국면의 폐업 지원 시연 — 끄면 pool 에 철거비·컨설팅·법률자문이 안 들어와
     #      생존 축이 baseline 6 = 최선 6 으로 죽는다. 그러면 두 축 중 하나가 상수라
@@ -2827,10 +2931,25 @@ def render_results_step(
     # 그룹 단위로 재배열하던 옛 방식은 한 그룹에서 두 개를 고르면 하나를 잃었다.
     advice = get_advice(prompt_text, [m.label for g in groups for m in g.members])
 
+    # 미래 자격 카드 — 화면에 **실제로 그려질 셋**을 비교 대상으로 넘긴다.
+    # LLM 픽이 있으면 그 셋, 없으면 폴백(groups[:3])이다. render_results 가 카드를
+    # 고르는 규칙과 같아야 "기다릴 값어치"가 사용자가 보는 것과 맞는다.
+    by_label = {m.label: g for g in groups for m in g.members}
+    if advice is not None and advice.ok and advice.picks:
+        shown = [by_label[p.label] for p in advice.picks if p.label in by_label]
+    else:
+        shown = groups[:3]
+    future_groups, future_reports, future_months = run_future_pipeline(
+        db, profile, ctx, revenue["summary"], profile.monthly_revenue, shown,
+        target_months, drop_ids, _answers(),
+    )
+
     render_results(
         groups, reports, extras, profile, ctx,
         baseline_survival, goal_satisfied, target_months, resolve_info,
         prompt_text, revenue["precise"], advice, bool(drop_ids),
+        future_groups=future_groups, future_reports=future_reports,
+        future_months=future_months,
     )
     st.divider()
     _nav(S_RESULTS, fields)  # ◀ 이전으로 돌아가 답을 고칠 수 있다

@@ -104,11 +104,15 @@ class Advice:
     detail: str = ""
 
     bad_numbers: list[str] = field(default_factory=list)
-    """검증에 걸린 숫자와 그 자리. 재현성 실측에서 **얼마나 자주, 어떤 숫자가** 걸리는지
-    보려고 남긴다. 자주 걸리면 폴백이 잦다는 뜻이라 프롬프트를 고쳐야 한다.
+    """검증에 걸린 **자리 · 숫자 · 그 문장**. `"picks[2].trap_note: 171 | <원문>"` 꼴이다.
+    재현성 실측에서 얼마나 자주, 어떤 숫자가 걸리는지 보려고 남긴다. 자주 걸리면
+    폴백이 잦다는 뜻이라 프롬프트를 고쳐야 한다.
 
     **재현성 30회 때 함께 잴 것**(9회 표본으로는 갈리지 않아 미룬다).
-    지금까지 폐기 2건이 둘 다 phase_reading 이었지만 성격이 달라 보인다.
+    지금까지 폐기 3건 중 둘은 phase_reading 이었고 성격이 달라 보인다.
+      171   목표 18 로 바꾼 뒤 picks[2] 의 trap_note·before_apply 두 곳에 같은 값이
+            걸렸다. 한 숫자를 잘못 옮긴 것으로 보이나 그때는 문장을 안 남겨 못 봤다.
+            (그래서 문장을 함께 담게 고쳤다 — 2026-08-31)
       6600  프롬프트의 6,660·6,710 을 반올림한 값으로 보인다 -> 파생 계산
       100   '100%'·'100만원' 같은 관용 표현일 수 있다
     관용 표현이면 숫자 금지를 되살려도 안 잡히고 검증기 쪽을 손봐야 한다.
@@ -411,8 +415,12 @@ def build_advice(
     bad: list[str] = []
 
     def check(where: str, text: str | None) -> None:
+        # **문장까지 함께 남긴다.** 자리와 숫자만으로는 재현성 실측에서 "왜 그 숫자가
+        # 나왔나"를 되짚을 수 없다. 실제로 목표 18 로 바꾼 뒤 picks[2] 의 두 필드에
+        # 같은 값(171)이 걸렸는데, 어느 값을 잘못 옮긴 것인지 문장이 없어 못 봤다.
+        # 30회 실측에서 반복되는 패턴을 찾으려면 문장이 있어야 한다.
         for number in _unknown_numbers(text, allowed):
-            bad.append(f"{where}: {number}")
+            bad.append(f"{where}: {number} | {(text or '').strip()[:120]}")
 
     picks: list[Pick] = []
     for index, item in enumerate(picks_raw):
