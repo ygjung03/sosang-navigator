@@ -187,12 +187,34 @@ def summarize_uploaded(raw_bytes: bytes, name: str) -> pos.PosSummary:
     return pos.summarize(pos.load(buffer))
 
 
+DEMO_END_DATE = datetime.date(2026, 7, 31)
+"""데모 POS 의 마지막 날. **고정한다.**
+
+`synthetic_pos.generate(end_date=None)` 은 "전월 말일"을 쓴다. 그대로 두면 달이
+바뀔 때마다 12개월 창이 통째로 밀리고, 그 안의 계절 구간·변곡점이 달라져 baseline 이
+움직인다. **데모는 재현 가능해야 한다** — 재무값을 프리셋으로 고정한 것과 같은 이유다.
+
+2026-09-01 에 실제로 깨졌다. 창이 2025-08~2026-07 에서 2025-09~2026-08 로 밀리면서
+C 의 baseline 이 6 -> 5 개월이 됐고, 새출발기금 확정 시점(6개월)에 못 미쳐 **감면이
+통째로 사라졌다.** `test_debt_relief_reaches_confirmation` 이 그것을 잡았다 —
+테스트가 제 일을 한 것이다.
+
+**날짜는 새로 고른 값이 아니다.** `tests/test_pos.py` 와 `tests/test_synthetic_pos.py`
+가 재현성 때문에 이미 2026-07-31 로 고정해 두었고, 데모만 안 하고 있었다. 데모가
+그 값에 맞추는 것이라 일관성을 되찾는 쪽이다.
+
+**실제 사용자에게는 영향이 없다.** 자기 POS 파일을 올리므로 이 경로를 안 탄다.
+"""
+
+
 @st.cache_data(show_spinner=False)
 def summarize_scenario(key: str, months: int) -> pos.PosSummary:
     """데모 시나리오(A/B/C)의 합성 POS에서 지표를 뽑는다."""
     from data.synthetic_pos import generate
 
-    return pos.summarize(pos.load(generate(key, months=months)))
+    return pos.summarize(
+        pos.load(generate(key, months=months, end_date=DEMO_END_DATE))
+    )
 
 
 # ══════════════════════════════════════════════════════════
