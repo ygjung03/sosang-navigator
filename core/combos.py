@@ -79,9 +79,6 @@ class UserContext:
     region: str = "서울"
     """사업장 소재 지역. 서울시 자금의 자격 요건."""
 
-    industry_code: str | None = None
-    """한국표준산업분류 코드. 융자제외업종 판정용. 모르면 None(통과)."""
-
     credit_score: int | None = None
     """개인신용점수(NICE/NCB). 모르면 None -> 점수 제한이 있는 자금은 통과시킨다.
 
