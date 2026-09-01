@@ -2288,15 +2288,40 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
         st.caption("추세·반기 비교를 위해 12개월치로 생성합니다.")
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     elif source == "파일 업로드":
+        # 기간이 길수록 비교할 수 있는 단위가 는다. 각 단위는 "직전 N개월 합계 vs 그 전
+        # N개월 합계"라 2N개월이 필요하다(분기 6 · 반기 12 · 연도 24). 정책은 신청자가
+        # 유리한 단위를 고르게 하므로(소진공 긴급경영안정자금 월·분기·반기·연도),
+        # 가진 자료를 잘라 올리면 될 자격이 안 되는 것으로 판정된다.
+        st.caption(
+            "**업력 전체 기간의 파일을 올려 주세요.** 2년이 넘으면 최근 2년만 "
+            "올리셔도 됩니다."
+        )
         uploaded = _file("POS 파일 (CSV/Excel)", "pos_file", type=["csv", "xlsx", "xls"])
         if uploaded is None:
             ready = False
         else:
             try:
-                st.caption(summarize_uploaded(uploaded.getvalue(), uploaded.name).describe())
+                uploaded_summary = summarize_uploaded(uploaded.getvalue(), uploaded.name)
             except Exception as error:
                 st.error(f"POS 파일을 읽지 못했습니다: {error}")
                 ready = False
+            else:
+                st.caption(uploaded_summary.describe())
+                # 반기 비교에 필요한 길이(6개월 x 2)에 못 미치면 **더 올리라고** 안내한다.
+                # "좁게 판정됐습니다"로 끝나는 문구는 알리기만 하고 풀지 않는다.
+                #
+                # 업력이 12개월 미만이라 애초에 비교할 기간이 없는 경우에는 이 안내로
+                # 할 수 있는 일이 없는데, 그때 월·분기로만 판정하는 것은 결함이 아니다 —
+                # 비교할 '그 앞 6개월'이 존재하지 않고 소진공도 그렇게 판정한다
+                # (2026-09-01).
+                half_months = 2 * pos.COMPARE_WINDOWS["반기"]
+                if len(uploaded_summary.monthly_revenue) < half_months:
+                    st.warning(
+                        f"올리신 자료는 {len(uploaded_summary.monthly_revenue)}개월치입니다. "
+                        f"{half_months}개월이 안 되면 **최근 6개월과 그 앞 6개월을 견주는 "
+                        "비교**를 할 수 없어, 일부 정책이 제한될 수 있습니다. "
+                        "**자료가 더 있으시면 전체를 올려 주세요.**"
+                    )
     else:
         _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
         _select("국면 (직접 선택)", "phase_simple", ("일시적자금난", "개선여지", "회복불가"), "일시적자금난")
