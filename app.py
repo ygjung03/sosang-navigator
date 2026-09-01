@@ -2268,6 +2268,31 @@ def render_situation(fields: list[str]) -> None:
     _nav(S_SITUATION, fields)
 
 
+# 간편 모드에서 국면을 직접 고를 때 보여줄 설명. 이름만 나열하면 "개선여지"와
+# "회복불가"의 차이를 알 수 없어 아무거나 고르게 된다.
+#
+# 설명은 phase.py 의 국면 정의(모범규준 B·C·D 등급에 대응)를 옮긴 것이고, 예시는 그
+# 정의를 가게 말로 바꾼 것이다. **판정 기준이 아니다** — 정밀 모드의 기준은 지표 4종이고
+# 여기서는 사용자의 자기 판단을 그대로 받는다.
+_PHASE_CHOICES: list[tuple[str, str, str]] = [
+    (
+        "일시적 자금난",
+        "매출이 줄었지만 반등이나 계절 요인일 수 있고, 아직 버틸 현금이 남아 있습니다.",
+        "최근 몇 달 손님이 줄었지만 작년 이맘때도 비슷했습니다",
+    ),
+    (
+        "개선 여지",
+        "완만한 하락이 이어집니다. 구조를 바꾸면 회복할 수 있는 상태입니다.",
+        "1년 넘게 조금씩 줄고, 이자는 내지만 남는 것이 거의 없습니다",
+    ),
+    (
+        "회복 불가",
+        "급격한 하락이 이어지고 버틸 현금이 곧 바닥납니다.",
+        "매출이 반으로 줄었고 몇 달 안에 결정을 내려야 합니다",
+    ),
+]
+
+
 def render_revenue(revenue: dict, fields: list[str]) -> None:
     st.markdown("**매출 자료가 있으신가요?** 있으면 추세를 분석해 더 정확히 진단해 드려요.")
     source = _radio(
@@ -2324,6 +2349,22 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
                     )
     else:
         _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
+        # 고르기 **전에** 셋을 나란히 읽을 수 있어야 자기 자리를 찾는다. 고른 것 아래에만
+        # 설명을 두면 셋을 차례로 열어 봐야 비교가 된다.
+        st.markdown("**어느 쪽에 가까우신가요?**")
+        st.markdown(
+            _card(
+                "".join(
+                    f"<div style='margin-bottom:{0 if i == len(_PHASE_CHOICES) - 1 else 12}px;'>"
+                    f"<div style='font-weight:700;color:{_INK};'>{name}</div>"
+                    f"<div style='color:#2d3748;line-height:1.5;'>{body}</div>"
+                    f"<div style='color:#4a5568;line-height:1.5;'>예) {example}</div></div>"
+                    for i, (name, body, example) in enumerate(_PHASE_CHOICES)
+                ),
+                "margin-bottom:12px;",
+            ),
+            unsafe_allow_html=True,
+        )
         _select("국면 (직접 선택)", "phase_simple", ("일시적자금난", "개선여지", "회복불가"), "일시적자금난")
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     _nav(S_REVENUE, fields, ready=ready)
@@ -2588,8 +2629,21 @@ def _score_frac(score: float) -> float:
     return min(max(score, 0), MAX_PHASE_SCORE) / (MAX_PHASE_SCORE + 1)
 
 
-def _phase_gauge_svg(total: int) -> str:
+# 간편 모드에서 **고르지 않은** 구간을 낮출 색. 카드 배경(#f0f2f6)보다 확실히 어두워
+# 띠가 사라지지 않고, 신호등 네 색 중 어느 것으로도 읽히지 않는 무채색이다.
+_MUTED = "#c9ced6"
+
+
+def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
     """국면 눈금 — 자동차 계기판형 게이지(SVG) 문자열. 카드로 감싸 쓴다.
+
+    `total=None` 은 **간편 모드**다. 국면을 사용자가 직접 골랐을 뿐 지표를 재지 않았으므로
+    바늘을 그리지 않고, `phase` 구간만 색을 남기고 나머지 셋을 회색으로 낮춘다.
+    바늘은 눈금 위의 한 점을 찍는데 그 점은 우리가 재지 않은 점수다. 구간은 다르다 —
+    구간 경계는 phase.py 의 `SCORE_TEMPORARY`·`SCORE_IMPROVABLE` 에서 온 실제 값이라
+    "고른 국면이 3~5점 구간"이라고 말해도 없는 값을 주장하지 않는다.
+    눈금 숫자 0~8 은 그대로 둔다 — 그 숫자가 구간의 폭과 위치를 말해 준다.
+    색만으로 뜻을 전하지 않게 호 아래 점수 자리에 **국면명**을 적는다.
 
     이전 가로 막대는 9칸을 균등 분할해, 0점 하나뿐인 '정상'과 3점 폭인 '개선여지'가
     같은 비중으로 보였다. 여기서는 호의 길이를 **점수 폭에 비례**시킨다.
@@ -2647,8 +2701,13 @@ def _phase_gauge_svg(total: int) -> str:
         large = 1 if abs(f1 - f0) * GAUGE_SWEEP_DEG > 180 else 0
         return f"M {x0:.1f} {y0:.1f} A {r} {r * GAUGE_SQUASH:.1f} 0 {large} 1 {x1:.1f} {y1:.1f}"
 
+    def band_color(name: str, color: str) -> str:
+        """간편 모드에서는 고른 국면만 제 색을 쓰고 나머지는 회색으로 낮춘다."""
+        return color if total is not None or name == phase else _MUTED
+
     bands, labels, seps = [], [], []
     for lo, hi, name, color in _PHASE_BANDS:
+        color = band_color(name, color)
         f0, f1 = lo / cells, (hi + 1) / cells
         # 띠를 **채운 부채꼴**로 그린다(두꺼운 선이 아니라). 타원에서는 굵은 선의 가장자리가
         # 타원이 아니라서, 선으로 그리면 윤곽선(r_in·r_out 타원호)이 띠 가장자리와 어긋난다.
@@ -2708,7 +2767,10 @@ def _phase_gauge_svg(total: int) -> str:
     # 세로 압축 때문에 끝면(r_in~r_out)의 실제 길이가 각도마다 달라, 그 길이의 절반을
     # 반지름으로 삼아야 마개가 띠 두께에 딱 맞는다.
     caps = []
-    for f, color in ((0.0, _PHASE_BANDS[0][3]), (1.0, _PHASE_BANDS[-1][3])):
+    for f, color in (
+        (0.0, band_color(_PHASE_BANDS[0][2], _PHASE_BANDS[0][3])),
+        (1.0, band_color(_PHASE_BANDS[-1][2], _PHASE_BANDS[-1][3])),
+    ):
         ix, iy = _gauge_point(cx, cy, r_in, f)
         ox, oy = _gauge_point(cx, cy, r_out, f)
         ex, ey = (ix + ox) / 2, (iy + oy) / 2
@@ -2748,32 +2810,36 @@ def _phase_gauge_svg(total: int) -> str:
     # 회전축과 점수를 **함께** 같은 만큼 내린다(둘 사이 간격은 그대로). 호·눈금·라벨은
     # 움직이지 않는다 — 이 값은 바늘과 점수에만 더한다.
     drop = 12.0
-    pivot_y = cy + r_mid * GAUGE_SQUASH * 0.42 + drop
-    target_x, target_y = _gauge_point(cx, cy, r_tick, _score_frac(total))  # 눈금 숫자의 자리
-    span = math.hypot(target_x - cx, target_y - pivot_y) or 1.0
-    ux, uy = (target_x - cx) / span, (target_y - pivot_y) / span
-    tip_x, tip_y = target_x - ux * 9.0, target_y - uy * 9.0  # 숫자 안쪽 가장자리에서 멈춘다
-    px, py = -uy, ux  # 뿌리의 폭 방향
-    root = 7.0
-    needle = (
-        f"<polygon points='{tip_x:.1f},{tip_y:.1f} "
-        f"{cx + px * root:.1f},{pivot_y + py * root:.1f} "
-        f"{cx - px * root:.1f},{pivot_y - py * root:.1f}' fill='{edge}'/>"
-        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='{root + 1.5}' fill='{edge}'/>"
-        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='3.2' fill='#ffffff'/>"
-    )
-    # 점수 — 게이지 중심선(x = cx) 위, **말굽 양 끝과 같은 높이**. 글자 기준선을 호 끝의
-    # 세로 위치에 맞춰 나란히 보이게 한다.
+    needle = ""
+    if total is not None:
+        pivot_y = cy + r_mid * GAUGE_SQUASH * 0.42 + drop
+        target_x, target_y = _gauge_point(cx, cy, r_tick, _score_frac(total))  # 눈금 숫자의 자리
+        span = math.hypot(target_x - cx, target_y - pivot_y) or 1.0
+        ux, uy = (target_x - cx) / span, (target_y - pivot_y) / span
+        tip_x, tip_y = target_x - ux * 9.0, target_y - uy * 9.0  # 숫자 안쪽 가장자리에서 멈춘다
+        px, py = -uy, ux  # 뿌리의 폭 방향
+        root = 7.0
+        needle = (
+            f"<polygon points='{tip_x:.1f},{tip_y:.1f} "
+            f"{cx + px * root:.1f},{pivot_y + py * root:.1f} "
+            f"{cx - px * root:.1f},{pivot_y - py * root:.1f}' fill='{edge}'/>"
+            f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='{root + 1.5}' fill='{edge}'/>"
+            f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='3.2' fill='#ffffff'/>"
+        )
+    # 호 아래 한 줄 — 게이지 중심선(x = cx) 위, **말굽 양 끝과 같은 높이**. 글자 기준선을
+    # 호 끝의 세로 위치에 맞춰 나란히 보이게 한다.
+    # 정밀 모드는 점수, 간편 모드는 국면명이다(색만으로 뜻을 전하지 않게).
     score_size = 17.0
     score_y = _gauge_point(cx, cy, r_mid, 0.0)[1] + drop  # 회전축과 같은 만큼 내린다
+    caption = f"{total} / {MAX_PHASE_SCORE}점" if total is not None else (phase or "")
     score_text = (
         f"<text x='{cx}' y='{score_y:.1f}' text-anchor='middle' font-family='inherit' "
-        f"font-size='{score_size:.0f}' font-weight='700' fill='{edge}'>"
-        f"{total} / {MAX_PHASE_SCORE}점</text>"
+        f"font-size='{score_size:.0f}' font-weight='700' fill='{edge}'>{caption}</text>"
     )
     # 글자 상자를 실제 크기로만 잡는다(넉넉한 정사각으로 잡으면 아래 여백이 부풀어
     # viewBox 가 세로로 늘어난다). 기준선 위로 대문자 높이, 아래로 디센더.
-    score_half_w = len(f"{total} / {MAX_PHASE_SCORE}점") * score_size * 0.55 / 2
+    # 폭 계수는 한글이 1글자당 거의 한 칸이라 숫자 섞인 '5 / 8점'보다 크게 잡는다.
+    score_half_w = len(caption) * score_size * (0.55 if total is not None else 1.0) / 2
     mark(cx - score_half_w, score_y - score_size * 0.78)
     mark(cx + score_half_w, score_y + score_size * 0.26)
 
@@ -2928,6 +2994,19 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
     # 간편 모드 — 국면을 직접 선택했으므로 지표 판정이 없다
     phase = "회복불가" if is_closed else revenue["phase_simple"]
     _phase_box(phase)
+    # 게이지 — 고른 국면이 **나머지 셋에 비해 어디쯤인지** 보여준다. 국면 박스만 있으면
+    # 이름 하나만 떠서 그 위치가 안 보인다. 점수는 재지 않았으므로 바늘을 그리지 않고
+    # 구간만 색으로 남긴다(_phase_gauge_svg 참조).
+    # 폭은 정밀 모드의 게이지 카드(좌우 2분할 중 왼쪽)와 같게 가운데 열에 둔다.
+    _, middle, _ = st.columns([1, 2, 1])
+    middle.markdown(
+        _card(
+            f"<div style='width:100%;height:100%;'>{_phase_gauge_svg(None, phase=phase)}</div>",
+            "height:210px;display:flex;align-items:center;justify-content:center;"
+            "padding:8px;margin-top:12px;",
+        ),
+        unsafe_allow_html=True,
+    )
     st.markdown("매출 추세가 없어 입력하신 값과 선택하신 국면으로 진행합니다. 결과 수치는 **추정치**입니다.")
     _nav(S_DIAGNOSIS, fields)
 
