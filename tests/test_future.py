@@ -154,7 +154,8 @@ def test_future_pipeline_leaves_main_result_alone():
         preset, summary, rev, profile, ctx, drop = _demo(key)
         before = app.run_pipeline(DB, profile, ctx, None, preset["goal_months"], drop)
         app.run_future_pipeline(
-            DB, profile, ctx, summary, rev, before[0][:3], preset["goal_months"], drop)
+            DB, profile, ctx, summary, rev, before[0][:3], preset["goal_months"], drop,
+            from_ensemble=True)
         after = app.run_pipeline(DB, profile, ctx, None, preset["goal_months"], drop)
 
         assert len(before[0]) == len(after[0]), f"[{key}] 그룹 수가 달라졌다"
@@ -164,6 +165,36 @@ def test_future_pipeline_leaves_main_result_alone():
             assert b.debt_at_exit == a.debt_at_exit, f"[{key}] 부채가 달라졌다"
         assert len(before[1]) == len(after[1]), f"[{key}] 함정 리포트 수가 달라졌다"
     print("   본 결과 불변 — 그룹·순위·두 축·함정 (A/B/C) ✓")
+
+
+def test_trend_fallback_gets_no_future_card():
+    """추세선으로 떨어졌으면 미래 자격을 내지 않는다.
+
+    POS 가 12개월 미만이면 `forecast.MIN_MONTHS` 에 걸려 앙상블이 None 을 주고
+    호출부가 `trend_revenue` 로 돌아간다. **정밀 모드는 그대로 유지되므로** 다른
+    계산은 다 도는데, 미래 자격만은 그 선 위에서 말하면 안 된다 — 추세선은 반등
+    계열에서 3년 뒤 33배를 그린다.
+    """
+    import datetime
+
+    from data.synthetic_pos import generate
+    from core import pos
+
+    short = pos.summarize(pos.load(
+        generate("A", months=8, end_date=datetime.date(2026, 7, 31))))
+    assert len(short.monthly_revenue) < forecast.MIN_MONTHS
+
+    line, from_ensemble, _ = app.revenue_line(True, short, 0)
+    assert not from_ensemble, "12개월 미만인데 앙상블에서 나왔다고 표시됐다"
+    assert line, "추세선조차 안 나왔다"
+
+    profile = _profile(monthly_revenue=line)
+    ctx = UserContext(phase="일시적자금난", region="서울")
+    groups, reports, months = app.run_future_pipeline(
+        DB, profile, ctx, short, line, [], 18, None, None,
+        from_ensemble=from_ensemble)
+    assert groups == [] and reports == {} and months == {}
+    print(f"   POS {len(short.monthly_revenue)}개월 → 추세선 폴백 · 미래 카드 없음 ✓")
 
 
 def test_simple_mode_has_no_future_card():
@@ -189,6 +220,7 @@ def main() -> None:
         test_no_future_when_inputs_missing,
         test_already_eligible_gets_no_future_card,
         test_future_pipeline_leaves_main_result_alone,
+        test_trend_fallback_gets_no_future_card,
         test_simple_mode_has_no_future_card,
     ):
         fn()

@@ -389,15 +389,36 @@ def build_monthly_revenue(precise: bool, summary: pos.PosSummary | None, rough_r
     것이라 최근 구간이 가파르면 폭주한다 — 급락 후 반등한 계열에서 3개월 증감률이
     +35.1% 라 3년 뒤가 현재의 33배로 나왔다. fallback 으로만 두고 평소에는 앙상블을 쓴다.
     """
+    line, _, _ = revenue_line(precise, summary, rough_revenue)
+    return line
+
+
+def revenue_line(
+    precise: bool, summary: pos.PosSummary | None, rough_revenue: int
+) -> tuple[list[int], bool, bool]:
+    """`build_monthly_revenue` 와 같되 **플래그 둘을 함께** 돌려준다.
+
+        from_ensemble   앙상블 예측선인가, 추세선 폴백인가
+        all_models      그 앙상블에 세 모델이 다 들어갔는가
+
+    미래 자격은 앙상블 예측선 위에서만 말할 수 있다. 추세선 폴백이면 그 기능을 꺼야
+    하는데, 나중에 매출선만 보고 되짚으려면 앙상블을 다시 부르거나(한 번에 287ms)
+    값을 비교해야 한다. **만든 자리에서 플래그를 세워 넘긴다.**
+
+    `all_models` 는 **미래 자격을 가르지 않는다.** 모델 하나가 빠져도 남은 것으로 나온
+    예측선은 추세선보다 낫고, 그때 미래 카드를 없애면 문제를 알리는 대신 기능만
+    사라진다. 이 플래그는 **두 모델짜리로 도는 것을 모르고 지나가지 않으려고** 둔다 —
+    prophet 이 빠진 채 한동안 그렇게 돌았다(2026-09-01). `test_forecast` 가 검사한다.
+    """
     if precise and summary is not None:
-        predicted = forecast.ensemble_revenue(summary.monthly_revenue)
+        predicted, models = forecast.ensemble_detail(summary.monthly_revenue)
         if predicted is not None:
-            return predicted
+            return predicted, True, len(models) == len(forecast.MODEL_NAMES)
         current = max(summary.recent_3m_avg, 1)
         # 3개월 증감률을 월율로: (1+change_3m)^(1/3) - 1
         monthly_change = (1 + summary.revenue_change_3m) ** (1 / 3) - 1
-        return trend_revenue(current, monthly_change)
-    return flat_revenue(max(rough_revenue, 1))
+        return trend_revenue(current, monthly_change), False, False
+    return flat_revenue(max(rough_revenue, 1)), False, False
 
 
 def build_profile(finance: dict, monthly_revenue: list[int], current_revenue: int) -> UserProfile:
@@ -721,6 +742,7 @@ def run_future_pipeline(
     target_months: int | None = None,
     drop_ids: set[str] | None = None,
     confirm_answers: dict[str, str] | None = None,
+    from_ensemble: bool = False,
 ):
     """미래 자격 조합. **본 결과와 완전히 분리된 두 번째 파이프라인이다.**
 
@@ -742,8 +764,15 @@ def run_future_pipeline(
     `optimizer._dominates` 를 그대로 쓴다 — 새 기준을 만들지 않는다.
 
     간편 모드(POS 없음)에서는 `summary` 가 None 이라 곧바로 빈 결과를 준다.
+
+    **`from_ensemble` 이 False 면 아무것도 내지 않는다.** 미래 자격은 앙상블 예측선
+    위에서만 말할 수 있다. POS 가 12개월 미만이면 `forecast.MIN_MONTHS` 에 걸려
+    추세선으로 돌아가는데(정밀 모드는 그대로 유지된다), 추세선은 최근 3개월 증감률을
+    36개월 등비로 미는 것이라 반등 계열에서 3년 뒤 33배를 그린다(실측). 그런 선으로
+    "N개월 뒤 자격이 생깁니다"를 말하면 "예측선대로 움직이면"이라는 단서로도 가려지지
+    않는다. 기본값을 False 로 두어 **호출부가 앙상블이었다고 밝힐 때만** 계산한다.
     """
-    if summary is None or not monthly_revenue:
+    if summary is None or not monthly_revenue or not from_ensemble:
         return [], {}, {}
 
     past = [float(v) for v in summary.monthly_revenue.values]
@@ -2167,9 +2196,20 @@ def collect_revenue() -> dict:
 
 
 def compute_profile(revenue: dict) -> UserProfile:
-    """session_state 의 재무·매출 답으로 UserProfile 을 조립한다."""
+    """session_state 의 재무·매출 답으로 UserProfile 을 조립한다.
+
+    매출선이 앙상블에서 나왔는지를 `revenue["forecast_is_ensemble"]` 에, 그 앙상블에
+    세 모델이 다 들어갔는지를 `revenue["forecast_all_models"]` 에 적어 둔다.
+    미래 자격이 앞의 플래그를 본다 — `revenue` 는 매출에서 나온 값들을 담아 화면까지
+    가는 자루이므로 여기 두는 것이 맞고, 나중에 매출선만 보고 되짚지 않아도 된다.
+    뒤의 플래그는 아무것도 가르지 않는다(`revenue_line` 참조).
+    """
     finance = collect_finance()
-    monthly_revenue = build_monthly_revenue(revenue["precise"], revenue["summary"], revenue["rough"])
+    monthly_revenue, from_ensemble, all_models = revenue_line(
+        revenue["precise"], revenue["summary"], revenue["rough"]
+    )
+    revenue["forecast_is_ensemble"] = from_ensemble
+    revenue["forecast_all_models"] = all_models
     return build_profile(finance, monthly_revenue, revenue["current_revenue"])
 
 
@@ -2964,6 +3004,7 @@ def render_results_step(
     future_groups, future_reports, future_months = run_future_pipeline(
         db, profile, ctx, revenue["summary"], profile.monthly_revenue, shown,
         target_months, drop_ids, _answers(),
+        from_ensemble=revenue.get("forecast_is_ensemble", False),
     )
 
     render_results(
