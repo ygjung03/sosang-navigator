@@ -158,6 +158,84 @@ def _prophet(index: pd.PeriodIndex, values: np.ndarray, horizon: int) -> list[fl
     return [float(np.exp(o)) for o in model.predict(future)["yhat"].iloc[-horizon:]]
 
 
+MODEL_NAMES: tuple[str, ...] = ("linear", "ets", "prophet")
+"""앙상블을 이루는 모델. `ensemble_detail` 이 이 중 실제로 적합된 것을 함께 돌려준다."""
+
+RETRY_ON_PARTIAL = 1
+"""세 모델이 다 돌지 않았을 때 다시 시도하는 횟수.
+
+**`ImportError` 로만 실패했으면 다시 시도하지 않는다.** 설치되지 않은 패키지는 다시
+불러도 생기지 않고, 그때 재시도는 요청마다 적합을 두 번 하게 만들 뿐이다. 되살릴 수
+있는 것은 메모리·경합 같은 일시적 실패다."""
+
+
+def _fit_all(
+    monthly_revenue: pd.Series, values: np.ndarray, horizon: int
+) -> tuple[list[list[float]], list[str], list[Exception]]:
+    """세 모델을 한 번씩 적합한다. (예측선들, 성공한 이름들, 실패 예외들)."""
+    paths: list[list[float]] = []
+    used: list[str] = []
+    failures: list[Exception] = []
+    for name, fit in (
+        ("linear", lambda: _linear(values, horizon)),
+        ("ets", lambda: _ets(values, horizon)),
+        ("prophet", lambda: _prophet(monthly_revenue.index, values, horizon)),
+    ):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                paths.append(fit())
+            used.append(name)
+        except Exception as exc:  # 모델 하나의 실패가 예측 전체를 죽이지 않게 한다
+            _log.warning("매출 예측 모델 %s 실패: %s: %s", name, type(exc).__name__, exc)
+            failures.append(exc)
+    return paths, used, failures
+
+
+def ensemble_detail(
+    monthly_revenue: pd.Series, horizon: int = SIM_MONTHS
+) -> tuple[list[int] | None, tuple[str, ...]]:
+    """`ensemble_revenue` 의 본체. 예측선과 **실제로 적합된 모델 이름**을 함께 돌려준다.
+
+    이름을 함께 내는 이유 — 하나가 빠져도 남은 것으로 값이 나오는데, 어디에도 표시가
+    없으면 **두 모델짜리 앙상블이 도는 것을 모르고 지나간다.** 실제로 prophet 이
+    설치되지 않은 채 한동안 그렇게 돌았고 결과가 그럴듯해 알아채지 못했다(2026-09-01).
+    `len(models) == len(MODEL_NAMES)` 가 "세 모델이 다 돌았다" 플래그다.
+
+    Returns:
+        (예측선, 적합된 모델 이름들). 예측선이 None 이면 이름도 비어 있다.
+    """
+    if not ENABLED:
+        return None, ()
+    values = np.asarray(monthly_revenue, dtype=float)
+    if len(values) < MIN_MONTHS:
+        return None, ()
+
+    paths, used, failures = _fit_all(monthly_revenue, values, horizon)
+    retries = 0
+    while (
+        len(used) < len(MODEL_NAMES)
+        and retries < RETRY_ON_PARTIAL
+        and not all(isinstance(exc, ImportError) for exc in failures)
+    ):
+        retries += 1
+        _log.warning(
+            "매출 예측 %d/%d 모델만 적합 — 다시 시도 (%d/%d)",
+            len(used), len(MODEL_NAMES), retries, RETRY_ON_PARTIAL,
+        )
+        paths, used, failures = _fit_all(monthly_revenue, values, horizon)
+
+    if len(used) < len(MODEL_NAMES):
+        _log.warning(
+            "매출 예측 앙상블 %d/%d 모델로 계산 (적합: %s)",
+            len(used), len(MODEL_NAMES), ", ".join(used) or "없음",
+        )
+    if not paths:
+        return None, ()
+    line = [max(int(np.median([p[h] for p in paths])), FLOOR) for h in range(horizon)]
+    return line, tuple(used)
+
+
 def ensemble_revenue(
     monthly_revenue: pd.Series, horizon: int = SIM_MONTHS
 ) -> list[int] | None:
@@ -175,28 +253,6 @@ def ensemble_revenue(
     **모델 하나가 실패해도 남은 것으로 낸다.** 셋 중 둘이면 중앙값이 평균이 되고
     하나면 그 모델의 값이 된다. Prophet 은 환경에 따라 초기화가 실패하는데
     (CLAUDE.md 의 cmdstanpy 항목), 그때 예측 전체가 죽는 것보다 낫다.
+    몇 개가 돌았는지 알아야 하면 `ensemble_detail` 을 쓴다.
     """
-    if not ENABLED:
-        return None
-    values = np.asarray(monthly_revenue, dtype=float)
-    if len(values) < MIN_MONTHS:
-        return None
-
-    paths: list[list[float]] = []
-    for name, fit in (
-        ("linear", lambda: _linear(values, horizon)),
-        ("ets", lambda: _ets(values, horizon)),
-        ("prophet", lambda: _prophet(monthly_revenue.index, values, horizon)),
-    ):
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                paths.append(fit())
-        except Exception as exc:  # 모델 하나의 실패가 예측 전체를 죽이지 않게 한다
-            _log.warning("매출 예측 모델 %s 실패: %s: %s", name, type(exc).__name__, exc)
-
-    if not paths:
-        return None
-    return [
-        max(int(np.median([p[h] for p in paths])), FLOOR) for h in range(horizon)
-    ]
+    return ensemble_detail(monthly_revenue, horizon)[0]

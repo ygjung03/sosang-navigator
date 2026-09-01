@@ -100,19 +100,22 @@ def test_survives_model_failure() -> None:
     print("  Prophet 실패 → 남은 두 모델로 예측")
 
 
-def test_prophet_actually_runs_here() -> None:
-    """이 환경에서 Prophet 이 실제로 도는가.
+def test_all_three_models_run_here() -> None:
+    """세 모델이 **전부** 도는가. 하나라도 빠지면 실패로 알린다.
 
-    실패해도 앙상블은 값을 내므로 위 검사들은 전부 통과한다. 그래서 조용히
-    두 모델만 도는 상태가 될 수 있다. 여기서만 따로 확인한다.
+    빠져도 앙상블은 값을 내므로 위 검사들은 전부 통과한다. 그래서 prophet 이 설치되지
+    않은 채 두 모델로 도는 상태를 한동안 모르고 지나갔다(2026-09-01). 흔한 원인 둘:
+        · prophet 미설치 — requirements.txt 대로 설치했는지
+        · PYTHONUTF8=1 로 실행 — 이 파일만은 붙이지 않는다(CLAUDE.md 의 cmdstanpy 항목)
+
+    옛 이름은 `test_prophet_actually_runs_here` 였고 실패해도 경고만 찍었다. 경고는
+    지나쳐 읽힌다.
     """
-    data = decline_12()
-    try:
-        out = forecast._prophet(data.index, np.asarray(data, dtype=float), 6)
-        print(f"  Prophet 동작 확인 (6개월: {out[-1] / MAN:,.0f}만)")
-    except Exception as exc:
-        print(f"  [경고] Prophet 이 이 환경에서 실패한다: {type(exc).__name__}: {exc}")
-        print("         PYTHONUTF8=1 을 붙이고 실행하지 않았는지 확인할 것.")
+    line, models = forecast.ensemble_detail(decline_12())
+    assert line is not None, "예측선이 안 나왔다"
+    missing = [m for m in forecast.MODEL_NAMES if m not in models]
+    assert not missing, f"적합되지 않은 모델: {', '.join(missing)}"
+    print(f"  세 모델 전부 적합: {', '.join(models)}")
 
 
 def test_app_path_uses_the_ensemble() -> None:
@@ -127,8 +130,11 @@ def test_app_path_uses_the_ensemble() -> None:
     from data.synthetic_pos import generate
 
     summary = pos.summarize(pos.load(generate("A", months=12)))
-    on = app.build_monthly_revenue(True, summary, 0)
+    on, from_ensemble, all_models = app.revenue_line(True, summary, 0)
     assert on == ensemble_revenue_of(summary), "앱 경로가 앙상블 결과와 다르다"
+    # 앱까지 오는 플래그 둘. 화면을 가르지는 않지만 여기서 값이 맞는지는 확인한다.
+    assert from_ensemble, "앙상블에서 나왔는데 플래그가 False 다"
+    assert all_models, "세 모델이 다 돌았는데 플래그가 False 다"
 
     forecast.ENABLED = False
     try:
@@ -156,7 +162,7 @@ def main() -> None:
         test_disabled_switch,
         test_survives_model_failure,
         test_app_path_uses_the_ensemble,
-        test_prophet_actually_runs_here,
+        test_all_three_models_run_here,
     ):
         fn()
     print("\n" + "=" * 62)
