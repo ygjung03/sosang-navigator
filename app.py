@@ -2018,9 +2018,16 @@ def _select(label, key, options, default, **kw):
 
 
 def _radio(label, key, options, default, **kw):
+    """라디오. 저장된 답이 선택지에 없으면 **`default` 로** 돌아간다.
+
+    옛 코드는 그때 0번을 골랐다. 자격 확인 질문의 0번은 '예'라서, 선택지가 바뀐
+    뒤(예: 택1 질문이 객관식이 되면서 옛 '예'가 사라진 뒤) 답이 조용히 '예'가 되어
+    **자격을 주는 쪽으로 기운다.** 확인되지 않은 것은 통과시키지 않는 규칙과 반대다.
+    """
     ans = _answers()
     current = ans.get(key, default)
-    idx = options.index(current) if current in options else 0
+    fallback = options.index(default) if default in options else len(options) - 1
+    idx = options.index(current) if current in options else fallback
     ans[key] = st.radio(label, options, index=idx, key=f"{key}_w", **kw)
     return ans[key]
 
