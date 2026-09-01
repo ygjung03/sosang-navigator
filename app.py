@@ -326,13 +326,18 @@ def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     key = hashlib.sha256(
         "\x00".join((prompt_text, agent.SYSTEM_PROMPT, agent.MODEL)).encode("utf-8")
     ).hexdigest()[:16]
-    cached = st.session_state.get("_advice")
-    if cached and cached[0] == key:
-        return cached[1]
     # 1~2분 걸린다. 기본 st.spinner 는 작은 글씨 한 줄이라 멈춘 줄 안다.
     # placeholder 를 쓰는 이유 — st.spinner 는 문구와 크기를 못 바꾼다. 직접 그리고
     # 끝나면 비운다.
+    #
+    # ⚠ 자리는 **캐시가 맞을 때도** 잡는다. 캐시 적중일 때만 st.empty() 를 건너뛰면
+    #   그 실행에서만 요소가 하나 적어져 뒤따르는 결과 카드가 한 칸씩 앞으로 밀린다.
+    #   Streamlit 은 요소를 위치로 잇기 때문에 접힘 상자가 새로 그려지며 expanded
+    #   기본값으로 돌아간다 — 슬라이더를 **처음** 움직였을 때만 카드가 접히던 원인이다.
     slot = st.empty()
+    cached = st.session_state.get("_advice")
+    if cached and cached[0] == key:
+        return cached[1]
     slot.markdown(_LOADING_HTML, unsafe_allow_html=True)
     try:
         advice = agent.select_final_three(prompt_text, labels)
@@ -1388,7 +1393,14 @@ def render_group_card(
     else:
         head = f"**{rank}위**" if rank is not None else "**후보**"
     title = f"{head}  │  :blue[{member.label}]{trap_icon}  │  {perf}"
-    with st.expander(title, expanded=expanded):
+    # key 를 카드 번호(idx)가 아니라 **조합 이름**으로 잡는다. LLM 이 순서를 바꾸면
+    # (재시도 등) idx 기준 key 는 슬라이더 값이 엉뚱한 조합에 붙는다.
+    card_id = stable_key(
+        "future_card" if future_months is not None else "card", member.label
+    )
+    # 접힘 상자에도 key 를 준다. key 가 없으면 Streamlit 이 제목·위치로 정체성을
+    # 만들어서, 앞쪽 요소가 하나 늘거나 줄면 상자가 새로 그려지며 펼침 상태가 풀린다.
+    with st.expander(title, expanded=expanded, key=f"exp_{card_id}"):
         if future_months is not None:
             # 조건부로 쓴다. 두 가지를 밝혀야 정직하다 —
             #   ① 매출이 예측선대로 움직여야 성립한다
@@ -1442,11 +1454,6 @@ def render_group_card(
         # 바뀌지 않는다. 그 경계가 화면에 안 보이면 어디까지가 조정 결과인지 알 수 없어,
         # 이 안쪽만 연한 하늘색 상자로 묶는다(.st-key-adjust_*).
         # 신청처·자격 확인 문구는 상자 밖이다 — 슬라이더로 바뀌지 않는다.
-        # key 를 카드 번호(idx)가 아니라 **조합 이름**으로 잡는다. LLM 이 순서를 바꾸면
-        # (재시도 등) idx 기준 key 는 슬라이더 값이 엉뚱한 조합에 붙는다.
-        card_id = stable_key(
-            "future_card" if future_months is not None else "card", member.label
-        )
         with st.container(key=f"adjust_{card_id}"):
             # 안내는 **모든 카드에** 같은 자리로. 카드를 펼치는 순서가 정해져 있지
             # 않아 첫 카드에만 두면 후보 3만 펼친 사람은 이 설명을 못 본다.
@@ -1500,7 +1507,9 @@ def render_group_card(
                 f"상환 스케줄 보기 (총 {rows}회차 · 월 단위 금액, 만원)" if rows
                 else "상환 스케줄 보기 (월 단위 금액, 만원)"
             )
-            with st.expander(title):
+            # 제목에 회차 수가 들어 있어 슬라이더로 금액을 바꾸면 제목이 바뀐다.
+            # key 가 없으면 그때마다 상자가 새것으로 취급돼 펼쳐둔 것이 접힌다.
+            with st.expander(title, key=f"sched_{card_id}"):
                 # 옛 문구('대출잔액은 기존 부채와 신규 융자를 합친 값입니다')는 지웠다 —
                 # 이제 잔액도 기존/신규로 나뉘어 있어 틀린 말이 된다.
                 render_schedule_table(shown.result)
@@ -1685,12 +1694,12 @@ def render_results(
     # 화면에는 3개만 뜨므로 여기 처음 보는 조합 이름이 나온다 — 접힘을 여는 사람은
     # "뭘 안 골랐나"가 궁금해서 여는 것이라 그게 맞다.
     if advice is not None and advice.ok and advice.excluded:
-        with st.expander("추천에서 배제한 조합과 이유"):
+        with st.expander("추천에서 배제한 조합과 이유", key="exp_excluded"):
             for item in advice.excluded:
                 st.markdown(f"- **{item.get('label', '')}** — {item.get('reason', '')}")
 
     # LLM 프롬프트·응답 (심사용)
-    with st.expander("심사용: LLM 프롬프트 보기"):
+    with st.expander("심사용: LLM 프롬프트 보기", key="exp_prompt"):
         if advice is not None and not advice.ok:
             st.error(f"실패 유형: {advice.failure} · {advice.detail}")
             if advice.bad_numbers:
