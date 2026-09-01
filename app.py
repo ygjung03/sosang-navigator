@@ -187,24 +187,28 @@ def summarize_uploaded(raw_bytes: bytes, name: str) -> pos.PosSummary:
     return pos.summarize(pos.load(buffer))
 
 
+# 데모 POS 의 마지막 날. 고정한다.
+#
+# ⚠ 이 설명은 반드시 `#` 주석이어야 한다. app.py 는 Streamlit 이 직접 실행하는
+#   스크립트라, 홀로 놓인 문자열 리터럴을 magic 이 st.write 로 바꿔 **화면에 그대로
+#   출력한다.** 한때 이 자리에 """..."""" 로 적혀 있었고, 모든 단계 맨 위에 개발
+#   메모가 떴다. 모듈 상수 아래 설명을 붙일 때는 이 파일에서만 규칙이 다르다.
+#
+# synthetic_pos.generate(end_date=None) 은 "전월 말일"을 쓴다. 그대로 두면 달이
+# 바뀔 때마다 12개월 창이 통째로 밀리고, 그 안의 계절 구간·변곡점이 달라져
+# baseline 이 움직인다. 데모는 재현 가능해야 한다 — 재무값을 프리셋으로 고정한
+# 것과 같은 이유다.
+#
+# 2026-09-01 에 실제로 깨졌다. 창이 2025-08~2026-07 에서 2025-09~2026-08 로
+# 밀리면서 C 의 baseline 이 6 -> 5 개월이 됐고, 새출발기금 확정 시점(6개월)에 못
+# 미쳐 감면이 통째로 사라졌다. test_debt_relief_reaches_confirmation 이 그것을
+# 잡았다 — 테스트가 제 일을 한 것이다.
+#
+# 날짜는 새로 고른 값이 아니다. tests/test_pos.py 와 tests/test_synthetic_pos.py 가
+# 재현성 때문에 이미 2026-07-31 로 고정해 두었고, 데모만 안 하고 있었다.
+#
+# 실제 사용자에게는 영향이 없다. 자기 POS 파일을 올리므로 이 경로를 안 탄다.
 DEMO_END_DATE = datetime.date(2026, 7, 31)
-"""데모 POS 의 마지막 날. **고정한다.**
-
-`synthetic_pos.generate(end_date=None)` 은 "전월 말일"을 쓴다. 그대로 두면 달이
-바뀔 때마다 12개월 창이 통째로 밀리고, 그 안의 계절 구간·변곡점이 달라져 baseline 이
-움직인다. **데모는 재현 가능해야 한다** — 재무값을 프리셋으로 고정한 것과 같은 이유다.
-
-2026-09-01 에 실제로 깨졌다. 창이 2025-08~2026-07 에서 2025-09~2026-08 로 밀리면서
-C 의 baseline 이 6 -> 5 개월이 됐고, 새출발기금 확정 시점(6개월)에 못 미쳐 **감면이
-통째로 사라졌다.** `test_debt_relief_reaches_confirmation` 이 그것을 잡았다 —
-테스트가 제 일을 한 것이다.
-
-**날짜는 새로 고른 값이 아니다.** `tests/test_pos.py` 와 `tests/test_synthetic_pos.py`
-가 재현성 때문에 이미 2026-07-31 로 고정해 두었고, 데모만 안 하고 있었다. 데모가
-그 값에 맞추는 것이라 일관성을 되찾는 쪽이다.
-
-**실제 사용자에게는 영향이 없다.** 자기 POS 파일을 올리므로 이 경로를 안 탄다.
-"""
 
 
 @st.cache_data(show_spinner=False)

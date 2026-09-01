@@ -1309,6 +1309,45 @@ def test_no_unreachable_code():
     print(f"   도달 불가 코드 없음 · 파일 {len(files)}개 ✓")
 
 
+def test_no_bare_expressions_in_app():
+    """app.py 에 홀로 놓인 식이 없는지. **Streamlit 이 그것을 화면에 출력한다.**
+
+    app.py 는 Streamlit 이 직접 실행하는 스크립트라 magic 이 AST 를 훑어 bare
+    expression 을 `st.write` 로 바꾼다. 상수 아래 설명을 파이썬 관례대로
+    `\"\"\"...\"\"\"` 로 붙이면 그것이 **모든 단계 맨 위에 그대로 출력된다.**
+    실제로 `DEMO_END_DATE` 설명이 그렇게 떴다(2026-09-01). 이 파일에서는 상수
+    설명을 `#` 주석으로 쓴다.
+
+    함수·클래스·모듈의 **첫 문장**은 진짜 docstring 이라 건너뛴다. `core/` 는
+    import 되는 모듈이라 magic 이 닿지 않으므로 검사하지 않는다.
+    """
+    tree = ast.parse(pathlib.Path(app.__file__).read_text(encoding="utf-8"))
+    found: list[str] = []
+
+    def check(body: list, is_scope: bool) -> None:
+        for i, node in enumerate(body):
+            if i == 0 and is_scope and isinstance(node, ast.Expr) \
+               and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                continue  # 진짜 docstring
+            # 호출은 st.markdown(...) 같은 정상 출력이라 문제가 아니다
+            if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Call):
+                found.append(f"app.py:{node.lineno} — {ast.unparse(node)[:60]}")
+
+    check(tree.body, True)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            check(node.body, True)
+        elif isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+            check(node.body, False)
+            check(getattr(node, "orelse", []) or [], False)
+
+    assert not found, (
+        "Streamlit 이 화면에 출력할 식이 있다. 설명이면 `#` 주석으로 바꿔라.\n  "
+        + "\n  ".join(found)
+    )
+    print("   화면에 새어 나가는 개발 메모 없음 ✓")
+
+
 def main() -> None:
     print("=" * 50)
     print("app.py UI 헬퍼·배선 검증")
@@ -1332,6 +1371,7 @@ def main() -> None:
     test_demo_confirm_presets_match_real_questions()
     test_zero_candidates_message_by_cause()
     test_no_unreachable_code()
+    test_no_bare_expressions_in_app()
     test_simresult_split_identity()
     test_month_display_sums()
     test_trap_message_matches_table()
