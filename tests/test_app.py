@@ -410,7 +410,7 @@ def _demo_profile_ctx(key: str):
     ctx = app.build_context(
         phase,
         dict(region="서울", restart_status="안함", is_closed=preset.get("is_closed", False),
-             tax_delinquent=False, include_loans=True, credit_score=None),
+             tax_delinquent=False, in_debt_restructuring=False, include_loans=True, credit_score=None),
         dict(business_started=preset["cond_bstart"], store_area_pyeong=preset.get("cond_area"),
              policy_loan_count_5y=0),
         summary, summary.rolling_annual_revenue,
@@ -438,7 +438,7 @@ def _demo_evals(key: str):
     ctx = app.build_context(
         phase,
         dict(region="서울", restart_status="안함", is_closed=preset.get("is_closed", False),
-             tax_delinquent=False, include_loans=True, credit_score=None),
+             tax_delinquent=False, in_debt_restructuring=False, include_loans=True, credit_score=None),
         dict(business_started=preset["cond_bstart"], store_area_pyeong=preset.get("cond_area"),
              policy_loan_count_5y=0),
         summary, summary.rolling_annual_revenue,

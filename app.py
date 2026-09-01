@@ -483,6 +483,7 @@ def build_context(
         restart_status=elig["restart_status"],
         is_closed=elig["is_closed"],
         tax_delinquent=elig["tax_delinquent"],
+        in_debt_restructuring=elig["in_debt_restructuring"],
         store_area_pyeong=conditional["store_area_pyeong"],
         business_started=conditional["business_started"],
         revenue_drop_by_window=drop_by_window,
@@ -623,7 +624,7 @@ def confirm_question_lines(question: str) -> list[str]:
     return lines
 
 
-def confirm_questions(pool) -> list[dict]:
+def confirm_questions(pool, ctx=None) -> list[dict]:
     """후보에 붙은 **사용자 확인 질문**. 같은 문구는 하나로 묶는다.
 
     질문 문구가 조합과 무관하게 완결돼 있어(8개 후보 전부 확인) 코드가 그대로 띄운다.
@@ -649,6 +650,7 @@ def confirm_questions(pool) -> list[dict]:
                     "ids": [],
                     # '지금 하면 되는 일'(교육 이수 등)은 '아니오'여도 제외하지 않는다.
                     "now_possible": bool(cand.get("_확인필요_자격_지금가능")),
+                    **_confirm_options(cand, key, ctx),
                 },
             )
             entry["ids"].append(cand.candidate_id)
@@ -656,6 +658,30 @@ def confirm_questions(pool) -> list[dict]:
                 cand.get("_확인필요_자격_지금가능")
             )
     return list(found.values())
+
+
+def _confirm_options(cand, field: str, ctx) -> dict:
+    """확인 질문의 선택지와 **통과로 치는 답**.
+
+    기본은 예/아니오/모름이고 '예'만 통과다. 택1요건처럼 갈래가 여럿이면 정책
+    데이터의 `_확인필요_자격_선택지` 를 그대로 쓴다 — 예/아니오로 받으면 **어느
+    갈래인지 알 수 없다.** 제외로 치는 답(`_확인필요_자격_제외선택지`, 보통 '해당
+    없음')을 빼고 나머지가 통과이며, 답하지 않은 것도 제외다(기존 규칙과 같다).
+
+    ⑤에서 채무조정 이행 중이 **아니라고** 답했으면 그 갈래를 선택지에서 뺀다.
+    방금 아니라고 답한 것을 다시 물으면 어긋난 답이 생길 자리만 만든다.
+    반대로 '예'라고 답했어도 그 갈래를 지우지는 않는다 — 그쪽은 회차 조건까지
+    요구해서 ⑤의 답보다 좁다(`UserContext.in_debt_restructuring` 참조).
+    """
+    options = cand.get(f"{field}_선택지")
+    if not options:
+        return {"options": (CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE),
+                "pass_answers": frozenset({CONFIRM_YES})}
+    excluded = cand.get(f"{field}_제외선택지")
+    if ctx is not None and not getattr(ctx, "in_debt_restructuring", False):
+        options = [o for o in options if "채무조정 이행 중" not in o]
+    return {"options": tuple(options),
+            "pass_answers": frozenset(o for o in options if o != excluded)}
 
 
 def excluded_by_confirm(questions: list[dict], answers: dict) -> set[str]:
@@ -672,7 +698,9 @@ def excluded_by_confirm(questions: list[dict], answers: dict) -> set[str]:
     for item in questions:
         if item["now_possible"]:
             continue
-        if answers.get(item["key"]) != CONFIRM_YES:
+        # 통과로 치는 답은 질문마다 다르다. 예/아니오 질문은 '예' 하나뿐이고,
+        # 택1 객관식은 '해당 없음'을 뺀 나머지가 전부 통과다(_confirm_options).
+        if answers.get(item["key"]) not in item.get("pass_answers", {CONFIRM_YES}):
             dropped.update(item["ids"])
     return dropped
 
@@ -790,7 +818,7 @@ def run_future_pipeline(
     )
     if drop_ids:
         months_by_id = {k: v for k, v in months_by_id.items() if k not in drop_ids}
-    months_by_id = _drop_unconfirmed_future(db, months_by_id, confirm_answers)
+    months_by_id = _drop_unconfirmed_future(db, months_by_id, confirm_answers, ctx)
     if not months_by_id:
         return [], {}, {}
 
@@ -831,7 +859,8 @@ def run_future_pipeline(
 
 
 def _drop_unconfirmed_future(
-    db: PolicyDB, months_by_id: dict[str, int], answers: dict[str, str] | None
+    db: PolicyDB, months_by_id: dict[str, int], answers: dict[str, str] | None,
+    ctx: UserContext | None = None,
 ) -> dict[str, int]:
     """자격 확인 질문에 '예'를 못 받은 미래 후보를 뺀다.
 
@@ -852,7 +881,7 @@ def _drop_unconfirmed_future(
         return months_by_id
     by_id = {c.candidate_id: c for c in db.candidates}
     cands = [by_id[cid] for cid in months_by_id if cid in by_id]
-    blocked = excluded_by_confirm(confirm_questions(cands), answers or {})
+    blocked = excluded_by_confirm(confirm_questions(cands, ctx), answers or {})
     return {cid: n for cid, n in months_by_id.items() if cid not in blocked}
 
 
@@ -2407,6 +2436,14 @@ def render_debt2(fields: list[str]) -> None:
     st.markdown("**연체·신용 상황**이 궁금해요. 해당 없으면 그대로 두시면 됩니다.")
     _num("연체 일수", "overdue_days", 0, min_value=0, step=1)
     _check("국세·지방세 체납 중", "tax_delinquent", False)
+    # 체납과 같은 성격의 사실이라 같은 자리에 둔다. ⑥ 추가 확인이 아닌 이유는
+    # 두 가지다 — ⑥의 규칙은 '예 = 통과'인데 이 답은 '예'가 자격을 뺏어 방향이
+    # 반대고, 후보를 만들기 전에 답이 있어야 자격 필터가 처음부터 맞는다.
+    _check(
+        "새출발기금·신용회복위원회 채무조정을 이행 중", "in_debt_restructuring", False,
+        help="이행 중이면 소진공 일반 정책자금과 상환연장은 신청할 수 없습니다. "
+             "대신 재도전특별자금(채무조정 유형)이 그 경우를 위한 자금입니다.",
+    )
     if _select(
         "고금리(연 7%+) 부채", "high_rate_choice", ("모름", "없음", "금액 입력"), "모름",
         help="대환대출 대상이자 자격 요건. '모름'과 '없음'은 다르게 취급됩니다.",
@@ -2453,6 +2490,7 @@ def collect_eligibility() -> dict:
         restart_status=a.get("restart", "안함"),
         is_closed=a.get("is_closed", False),
         tax_delinquent=a.get("tax_delinquent", False),
+        in_debt_restructuring=a.get("in_debt_restructuring", False),
         include_loans=a.get("include_loans", True),
         credit_score=(int(a.get("credit_score_val", 850)) if a.get("credit_known") else None),
     )
@@ -3053,13 +3091,21 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
     # 사실대로 답하는 것 말고 다른 선택지가 있는 것처럼 보인다.
     for item in questions or []:
         st.markdown("---")
-        st.markdown("**해당사항이 있는지 체크해주세요.**")
-        for line in confirm_question_lines(item["question"]):
-            st.markdown(line)
+        options = item.get("options") or (CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE)
+        # 선택지가 문장이면 가로 라디오에 안 들어가 줄바꿈이 지저분해진다.
+        # 짧은 예/아니오/모름만 가로로 두고, 택1 객관식은 세로로 늘어놓는다.
+        short = len(options) <= 3 and max(len(o) for o in options) <= 12
+        if short:
+            st.markdown("**해당사항이 있는지 체크해주세요.**")
+            for line in confirm_question_lines(item["question"]):
+                st.markdown(line)
+        else:
+            # 객관식은 선택지가 이미 갈래를 담고 있다. 질문 원문까지 풀어 쓰면
+            # 같은 문장이 목록과 라디오에 두 번 나온다.
+            st.markdown("**해당하는 것에 체크해주세요.**")
         _radio(
-            "해당하시나요?", item["key"],
-            (CONFIRM_YES, CONFIRM_NO, CONFIRM_UNSURE), CONFIRM_UNSURE,
-            horizontal=True, label_visibility="collapsed",
+            "해당하시나요?", item["key"], options, options[-1],
+            horizontal=short, label_visibility="collapsed",
         )
     _nav(S_CONDITIONAL, fields)
 
@@ -3213,7 +3259,7 @@ def main() -> None:
         phase, elig, collect_conditional(fields),
         revenue["summary"] if revenue["precise"] else None, annual,
     )
-    questions = confirm_questions(eligible_candidates(db, profile, ctx_now))
+    questions = confirm_questions(eligible_candidates(db, profile, ctx_now), ctx_now)
     # 진행바·단계 이동(_step_after/_step_before)도 이 목록을 봐야 ⑥ 을 건너뛸지 안다.
     ss["_confirm_questions"] = questions
 

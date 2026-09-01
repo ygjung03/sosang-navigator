@@ -123,7 +123,7 @@ def _demo(key: str):
     ctx = app.build_context(
         phase.phase,
         dict(region="서울", restart_status="안함", is_closed=closed,
-             tax_delinquent=False, include_loans=True, credit_score=850),
+             tax_delinquent=False, in_debt_restructuring=False, include_loans=True, credit_score=850),
         dict(store_area_pyeong=preset.get("cond_area"),
              business_started=preset["cond_bstart"], policy_loan_count_5y=0),
         summary, int(max(summary.recent_3m_avg, 1) * 12))
