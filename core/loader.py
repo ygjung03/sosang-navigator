@@ -26,7 +26,8 @@ from typing import Any, Literal
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "policies_all.json"
 
-# 현금효과 6종. 시뮬레이터의 계산 분기와 1:1로 대응한다.
+# 현금효과 7종. 시뮬레이터의 계산 분기와 1:1로 대응한다.
+# `없음` 도 한 종으로 센다 — 현금효과가 없다는 판정 자체가 순위 제외로 이어진다.
 CashEffect = Literal[
     "신규유입", "대환전환", "이자조정", "부채감면", "상환연장", "비용감면", "없음"
 ]
