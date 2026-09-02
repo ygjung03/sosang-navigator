@@ -1911,6 +1911,31 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
            본문 텍스트를 어절 단위로 끊어 좁은 칸에서도 자연스럽게 접히게 한다. */
         .block-container p, .block-container li,
         .block-container h1, .block-container h2, .block-container h3 { word-break: keep-all; }
+
+        /* ── 좁은 화면에서 가로로 넘치는 두 곳만 막는다 ──────────────────
+           범위를 딱 둘로 못박는다. 터치 타깃 크기·카드 재배치·그래프 비율·폰트
+           스케일은 하지 않는다 — 며칠짜리라 마감 안에 넣을 범위가 아니다.
+
+           640px 는 Streamlit 이 st.columns 를 세로로 쌓기 시작하는 폭과 같은 대역이라,
+           이 선에서 함께 접히면 화면이 한 번에 바뀐다.
+
+           **넓은 화면에는 이 블록 밖에 규칙이 없다.** 미디어 쿼리 안에서만 인라인
+           스타일을 덮으므로 데스크톱은 한 픽셀도 안 바뀐다. !important 가 필요한 것은
+           덮을 대상이 인라인 스타일이기 때문이다. */
+        @media (max-width: 640px) {
+            /* ① 진행바 — 세그먼트 9개가 flex:1 + nowrap 이라, flex 항목이
+                  min-content(=글자 폭) 아래로 안 줄어들어 가로로 넘쳤다.
+                  줄바꿈을 열고 한 줄에 셋씩 놓는다. 줄 수만 늘고 글자는 그대로다. */
+            .sn-progress { flex-wrap: wrap !important; }
+            .sn-seg { flex: 1 1 30% !important; min-width: 0 !important; }
+
+            /* ② 진단 화면 매출 요약 — 네 항목이 nowrap 이라 넘쳤다.
+                  줄바꿈을 열고, 줄이 바뀌면 뜻을 잃는 세로 구분선은 감춘다.
+                  항목 자체의 nowrap 은 유지한다 — "최근 3개월 평균 매출"이 중간에
+                  끊기면 오히려 읽기 나쁘다. */
+            .sn-revsum { flex-wrap: wrap !important; gap: 4px 14px; }
+            .sn-revline { display: none !important; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1978,10 +2003,14 @@ def render_progress(cur: int, fields: list[str]) -> None:
     for step in segments:
         state = "done" if step < cur else ("cur" if step == cur else "todo")
         cells.append(
-            f'<div style="{_seg_style(step in OUTPUT_STEPS, state)}">{STEP_TITLES[step]}</div>'
+            f'<div class="sn-seg" style="{_seg_style(step in OUTPUT_STEPS, state)}">'
+            f"{STEP_TITLES[step]}</div>"
         )
+    # 클래스를 붙이는 이유는 좁은 화면용 미디어 쿼리가 인라인 스타일을 덮어야 해서다.
+    # 넓은 화면에서는 이 클래스에 걸린 규칙이 없어 지금과 똑같이 그려진다.
     bar = (
-        '<div style="display:flex;gap:4px;width:100%;margin:2px 0 8px 0;">'
+        '<div class="sn-progress" style="display:flex;gap:4px;width:100%;'
+        'margin:2px 0 8px 0;">'
         + "".join(cells)
         + "</div>"
     )
@@ -2992,14 +3021,19 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
         # 6/6/18/24px 로 제각각이 된다. (나)는 남는 폭을 6개 틈에 똑같이 나눠 주므로
         # **항목 사이 여백이 전부 같다** — 실제로 균등해 보이는 쪽이다.
         # 구분자는 문자가 아니라 1px 세로선(div)이라 폭 계산에 끼어들지 않는다.
+        # 클래스는 좁은 화면용 미디어 쿼리가 인라인 스타일을 덮으려고 붙인다.
+        # 넓은 화면에서는 이 클래스에 걸린 규칙이 없어 지금과 똑같이 그려진다.
         cell = "display:flex;align-items:center;gap:5px;"
-        line = "<div style='width:1px;background:#cbd5e0;align-self:stretch;'></div>"
+        line = ("<div class='sn-revline' style='width:1px;background:#cbd5e0;"
+                "align-self:stretch;'></div>")
         st.markdown(
             _card(
-                "<div style='display:flex;flex-wrap:nowrap;align-items:stretch;"
+                "<div class='sn-revsum' style='display:flex;flex-wrap:nowrap;"
+                "align-items:stretch;"
                 "justify-content:space-between;line-height:1.45;color:#2d3748;"
                 "font-size:0.88rem;white-space:nowrap;'>"
-                + line.join(f"<div style='{cell}'>{item}</div>" for item in summary_items)
+                + line.join(f"<div class='sn-revcell' style='{cell}'>{item}</div>"
+                            for item in summary_items)
                 + "</div>",
                 # 형광펜을 빼서 생긴 폭(항목당 12px)을 **카드 좌우 여백으로** 돌린다 —
                 # 첫 항목이 카드 왼쪽 벽에 붙어 답답했다.
