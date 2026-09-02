@@ -2362,10 +2362,34 @@ def apply_demo_preset(scenario_key: str) -> None:
     ans = _answers()
     if ans.get("_applied_scenario") == scenario_key:
         return
+    # 프리셋이 덮기 **전에** 사용자의 원래 답을 보관한다(`restore_from_demo` 가 되돌린다).
+    #
+    # ② 의 기본값이 '데모 시나리오'라, 사용자가 데모를 고르지 않아도 이 화면에 **도착만
+    # 하면** 프리셋이 한 번 돈다. 그때 ① 에서 체크한 폐업 여부(`is_closed`)가 사라졌다 —
+    # A·B 프리셋에 그 키가 없어 위 pop 에 걸리기 때문이다. 데모로 시연하면 C 프리셋이
+    # 값을 다시 넣어 줘서 안 드러나고, **자기 값을 입력하는 실제 사용자에게만** 났다.
+    #
+    # 보관 시점은 **프리셋 적용 직전**이다. ① 을 떠날 때 뜨면 ① 키만 잡히고 프리셋이
+    # 건드리는 나머지(`cond_area` 등)를 놓친다. 그리고 **처음 한 번만** 뜬다 — 시나리오를
+    # 바꿀 때 또 뜨면 앞 프리셋 값이 원본으로 둔갑한다.
+    if "_preset_backup" not in ans:
+        ans["_preset_backup"] = {k: ans[k] for k in _PRESET_KEYS if k in ans}
     preset = DEMO_PRESETS.get(scenario_key)
     if preset:
-        for stale in _PRESET_KEYS - preset.keys():
-            ans.pop(stale, None)  # 다른 시나리오가 남긴 값 제거 (위젯 기본값으로 복귀)
+        # **앞 프리셋이 넣은 키만** 지운다. 예전에는 (합집합 − 이번 프리셋)을 지웠는데,
+        # 그러면 프리셋이 처음 적용될 때 **사용자가 ① 에서 답한 `is_closed` 까지** 지웠다
+        # — 그 키가 C 프리셋에만 있어 합집합에 들어가기 때문이다.
+        # 앞 프리셋을 기준으로 삼으면 첫 적용에서는 지울 것이 없고, 시나리오를 갈아탈
+        # 때만 앞 값이 걷힌다(원래 이 정리를 넣은 이유가 그것이다).
+        # 걷어낸 자리는 **사용자가 답했던 값**으로 되돌린다. 그냥 지우면 사용자가 ① 에서
+        # False 로 답한 것과 답한 적 없는 것(None)이 구분되지 않는다.
+        previous = DEMO_PRESETS.get(ans.get("_applied_scenario")) or {}
+        backup = ans.get("_preset_backup") or {}
+        for stale in previous.keys() - preset.keys():
+            if stale in backup:
+                ans[stale] = backup[stale]
+            else:
+                ans.pop(stale, None)  # 답한 적 없으면 위젯 기본값으로 돌아간다
         # 자격 확인 답은 key 가 질문 문구에서 나오므로 위 목록으로는 못 지운다.
         # 시나리오를 바꿀 때 앞 시나리오의 답이 남지 않게 접두로 걷어낸다.
         for stale in [k for k in ans if str(k).startswith("confirm_")]:
@@ -2378,6 +2402,31 @@ def apply_demo_preset(scenario_key: str) -> None:
             if key := confirm_key_of(db, candidate_id):
                 ans[key] = CONFIRM_YES
     ans["_applied_scenario"] = scenario_key
+
+
+def restore_from_demo() -> None:
+    """데모를 떠날 때(파일 업로드 · 없어요) **프리셋이 덮기 전의 답으로 되돌린다.**
+
+    ② 의 기본값이 '데모 시나리오'라 사용자가 데모를 고르지 않아도 프리셋이 한 번
+    적용된다. 그대로 두면 ① 에서 체크한 폐업 여부가 사라진 채로 진행된다.
+
+    프리셋이 넣은 값은 **전부** 걷어낸다. 일부만 되돌리면 이번 시나리오의 재무값이
+    사용자 입력에 섞여 어느 값이 자기 것인지 알 수 없게 된다.
+
+    `_preset_backup` 과 `_applied_scenario` 를 함께 지운다 — 다시 데모로 돌아오면
+    프리셋이 새로 적용되고, 그 사이 고친 값이 새 원본으로 잡혀야 한다.
+    """
+    ans = _answers()
+    backup = ans.pop("_preset_backup", None)
+    if backup is None:
+        return  # 데모를 거친 적이 없거나 이미 되돌렸다
+    for key in _PRESET_KEYS:
+        ans.pop(key, None)
+    # 자격 확인 답은 key 가 질문 문구 해시라 위 목록으로 못 지운다(접두로 걷어낸다).
+    for key in [k for k in ans if str(k).startswith("confirm_")]:
+        ans.pop(key, None)
+    ans.update(backup)
+    ans.pop("_applied_scenario", None)
 
 
 # ── 답 수집 (위젯을 그리지 않고 ss.answers 에서만 읽는다) ──
@@ -2538,6 +2587,9 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
         st.caption("추세·반기 비교를 위해 12개월치로 생성합니다.")
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     elif source == "파일 업로드":
+        # 데모를 거쳐 왔다면 프리셋이 덮은 답을 되돌린다(② 기본값이 데모라 그냥 지나가도
+        # 한 번 적용된다). 되돌릴 것이 없으면 아무 일도 안 한다.
+        restore_from_demo()
         # 기간이 길수록 비교할 수 있는 단위가 는다. 각 단위는 "직전 N개월 합계 vs 그 전
         # N개월 합계"라 2N개월이 필요하다(분기 6 · 반기 12 · 연도 24). 정책은 신청자가
         # 유리한 단위를 고르게 하므로(소진공 긴급경영안정자금 월·분기·반기·연도),
@@ -2573,6 +2625,10 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
                         "**자료가 더 있으시면 전체를 올려 주세요.**"
                     )
     else:
+        # 여기서는 **월 매출 대략값만** 받는다. 국면 선택은 진단 화면으로 옮겼다 —
+        # 이 자리에서는 아무 근거 없이 고르게 되는데, ③④⑤ 를 받고 나면 지표 셋을
+        # 계산할 수 있어 가능한 국면이 좁혀진다(`simple_mode_phases`).
+        restore_from_demo()  # 데모 프리셋이 덮은 답을 되돌린다(위 분기와 같은 이유)
         _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     _nav(S_REVENUE, fields, ready=ready)

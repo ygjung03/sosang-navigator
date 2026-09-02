@@ -761,6 +761,46 @@ def _drive(scenarios: list[str]) -> dict:
     return _ans(at)
 
 
+def test_user_answers_survive_demo_preset():
+    """① 에서 답한 값이 ② 를 지나며 **데모 프리셋에 지워지지 않는지.**
+
+    ② 의 기본값이 '데모 시나리오'라, 사용자가 데모를 고르지 않아도 이 화면에 도착만
+    하면 `apply_demo_preset` 이 한 번 돈다. A·B 프리셋에는 `is_closed` 가 없어
+    (합집합 − 이번 프리셋) 정리에 걸려 **① 에서 체크한 폐업 여부가 사라졌다.**
+
+    데모로 시연하면 C 프리셋이 값을 다시 넣어 줘서 안 드러나고, 자기 값을 입력하는
+    **실제 사용자에게만** 났다. 폐업이 풀리면 하드 규칙 ①(폐업·휴업 → 회복불가)이
+    안 걸려 국면이 바뀌고 추천 정책이 통째로 달라진다. 조용히 풀리는 종류라
+    테스트가 없으면 다시 나도 모른다.
+    """
+    at = _fresh_app()
+    at.checkbox(key="is_closed_w").set_value(True)
+    at.run(timeout=120)
+    assert _ans(at).get("is_closed") is True, "① 에서 체크가 안 들어갔다(전제 실패)"
+
+    _advance(at)  # ② 매출 자료 — 여기서 기본 데모 프리셋이 한 번 적용된다
+    assert _ans(at).get("is_closed") is True, (
+        "② 에 도착만 했는데 폐업 체크가 사라졌다 — 데모 프리셋이 지웠다."
+    )
+
+    # 데모를 떠나면 프리셋이 덮은 값이 전부 되돌아와야 한다.
+    for source in ("파일 업로드", "없어요 (간편 진행)"):
+        at.radio(key="rev_source_w").set_value(source)
+        at.run(timeout=120)
+        ans = _ans(at)
+        assert ans.get("is_closed") is True, f"{source} 로 바꾼 뒤 폐업 체크가 사라졌다"
+        left = {k for k in app.DEMO_PRESETS["B"] if k in ans and k != "is_closed"}
+        assert not left, f"{source} 인데 데모 프리셋 값이 남았다: {sorted(left)}"
+
+    # 다시 데모로 돌아오면 프리셋이 새로 적용된다(복원이 한 번만 되고 끝나면 안 된다).
+    at.radio(key="rev_source_w").set_value("데모 시나리오")
+    at.run(timeout=120)
+    assert _ans(at).get("fixed_man") == app.DEMO_PRESETS["B"]["fixed_man"], (
+        "데모로 돌아왔는데 프리셋이 다시 적용되지 않았다"
+    )
+    print("   ① 답이 데모 프리셋에 안 지워짐 · 데모 이탈 시 복원 · 재진입 시 재적용 ✓")
+
+
 def test_preset_switch_no_leak():
     """시나리오를 갈아탈 때 앞 시나리오의 프리셋 값이 남지 않는지.
 
@@ -1377,6 +1417,7 @@ def main() -> None:
     test_trap_message_matches_table()
     test_schedule_stops_at_exhaustion()
     test_conditional_gating()
+    test_user_answers_survive_demo_preset()
     test_preset_switch_no_leak()
     test_answers_survive_navigation()
     test_edit_and_return()
