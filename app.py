@@ -99,6 +99,9 @@ from core.metrics import TrapKind, detect_all, detect_traps
 from core.optimizer import (CandidateGroup, _dominates, apply_links, prerequisites,
                             select, to_prompt_text)
 from core.phase import (
+    DROP_SEVERE,
+    DROP_WARN,
+    PHASE_ORDER,
     SCORE_IMPROVABLE,
     SCORE_TEMPORARY,
     PhaseResult,
@@ -500,6 +503,17 @@ def build_context(
     )
 
 
+def _profit_and_interest(profile: UserProfile, current_revenue: int) -> tuple[float, float]:
+    """월 영업이익과 월 이자비용. **두 모드가 이 한 곳을 함께 쓴다.**
+
+    정밀 모드(`_phase_inputs`)와 간편 모드(`simple_mode_phases`)가 같은 식을 쓰는데,
+    각자 계산하면 한쪽만 고쳤을 때 두 모드가 조용히 갈린다.
+    """
+    operating_profit = current_revenue * (1 - profile.variable_ratio) - profile.fixed_cost
+    interest_cost = profile.existing_debt * (profile.existing_debt_rate or 0.0) / 12
+    return operating_profit, interest_cost
+
+
 def _phase_inputs(
     profile: UserProfile, summary: pos.PosSummary, current_revenue: int
 ) -> tuple[float, float, float, int]:
@@ -509,9 +523,7 @@ def _phase_inputs(
     함께 넘겨야 근거 문장이 "최근 6개월 …"처럼 실제 기간을 말한다(반기 값을 3개월이라
     쓰면 매출 요약 바의 3개월 수치와 어긋나 보인다).
     """
-    operating_profit = current_revenue * (1 - profile.variable_ratio) - profile.fixed_cost
-    rate = profile.existing_debt_rate or 0.0
-    interest_cost = profile.existing_debt * rate / 12
+    operating_profit, interest_cost = _profit_and_interest(profile, current_revenue)
     drop_rate, window = summary.drop_rate_detail(("분기", "반기"))
     # 단위가 안 잡히면(데이터 부족) 감소율이 0.0 이라 0점 → 문장이 없다. 기본 3을 준다.
     window_months = pos.COMPARE_WINDOWS.get(window or "", 3)
@@ -535,6 +547,121 @@ def judge_phase(
         is_closed=is_closed,  # 하드 규칙 ①: 폐업·휴업 확정이면 회복불가
         buffer_months=buffer_months,
     )
+
+
+def simple_mode_phases(
+    profile: UserProfile, current_revenue: int, is_closed: bool
+) -> tuple[list[str], list[tuple[str, int, str | None]], int]:
+    """간편 모드에서 **가능한 국면들**과 잴 수 있는 지표 3종, 무지원 생존 개월수.
+
+    POS 가 없어도 ③④⑤ 단계에서 받은 값으로 지표 4종 중 **셋이 계산된다** —
+    ICR(부채·금리·영업이익) · 연체(연체 일수) · 영업이익(매출 대략값·비용).
+    못 재는 것은 매출 감소율 하나뿐이다. 그것을 버리고 사용자 선택만 쓰는 것은
+    있는 근거를 안 쓰는 것이다.
+
+    **그렇다고 셋으로 총점을 내 국면을 확정할 수는 없다.** 국면 경계(2점·5점)가
+    8점 만점 기준이라, 넷 중 셋으로 낸 합계에 그 경계를 그대로 쓰면 근거가 없다.
+    매출감소를 0점으로 채우면 항상 낙관 쪽으로 기운다.
+
+    그래서 **못 잰 지표가 낼 수 있는 점수 범위만큼만 열어 둔다.** 매출감소는
+    0·1·2점 중 하나이므로, 그 셋을 각각 넣어 `judge()` 를 세 번 부르고 나온
+    국면들을 후보로 삼는다. 임의로 좁히는 것이 아니라 계산으로 나온다.
+
+    **`judge()` 를 그대로 부르는 것이 중요하다.** 하드 규칙 셋(폐업·휴업 확정 /
+    총점 0인데 36개월 미생존 / 한 지표라도 2점)이 정밀 모드와 똑같이 적용된다.
+    범위를 우리가 다시 계산하면 그 규칙을 재구현하게 되고 두 모드가 갈린다.
+
+    후보가 하나로 좁혀지면 물을 것이 없다 — 호출부가 그대로 확정한다.
+
+    Returns:
+        (가능한 국면들, 잴 수 있는 지표 3종의 행). 국면은 `PHASE_ORDER` 순이다.
+    """
+    operating_profit, interest_cost = _profit_and_interest(profile, current_revenue)
+    buffer_months = simulate(profile, []).survival_months
+
+    # 매출감소가 0·1·2점이 되는 감소율. 경계값은 phase.py 의 DROP_WARN·DROP_SEVERE 를
+    # 그대로 가져오고, 점수 매김은 judge() 에 맡긴다 — 여기서 숫자를 다시 쓰면
+    # 경계가 바뀔 때 두 모드가 갈린다. 0.0 은 DROP_WARN 미만이면 되는 자리다.
+    rates = (0.0, DROP_WARN, DROP_SEVERE)
+    phases = {
+        judge(
+            operating_profit=operating_profit,
+            interest_cost=interest_cost,
+            revenue_drop_rate=rate,
+            overdue_days=profile.overdue_days,
+            is_closed=is_closed,
+            buffer_months=buffer_months,
+        ).phase
+        for rate in rates
+    }
+    rows = [
+        ("이자보상배율", *score_icr(operating_profit, interest_cost)),
+        ("연체", *score_overdue(profile.overdue_days)),
+        ("영업이익", *score_operating_profit(operating_profit)),
+    ]
+    return sorted(phases, key=PHASE_ORDER.get), rows
+
+
+def exclusion_note(
+    phases: list[str], rows: list[tuple[str, int, str | None]], is_closed: bool = False
+) -> str:
+    """어느 국면이 왜 빠졌는지 한 줄. "좁혀집니다"의 근거다.
+
+    **규칙을 다시 구현하지 않는다.** 어느 지표가 어느 국면을 배제했는지는
+    `judge()` 안의 점수·하드 규칙이 얽혀 결정되므로 밖에서 되짚으면 두 모드가
+    갈릴 위험이 있다. 대신 **측정된 사실과 방향만** 말한다.
+
+        빠진 국면이 남은 것보다 나쁜 쪽   -> 0점인 지표를 든다("위험 신호가 없어")
+        빠진 국면이 남은 것보다 가벼운 쪽 -> 1점 이상인 지표를 든다("위험 신호가 있어")
+
+    방향은 `PHASE_ORDER` 로 정한다 — 국면 순서는 제도에서 온 참인 값이다.
+    지표 점수도 계산된 값이라, 둘을 잇는 문장은 우리가 지어내는 것이 아니다.
+    """
+    excluded = [p for p in PHASE_ORDER if p not in phases]
+    if not excluded:
+        return ""
+    # 하드 규칙 ①이 걸렸으면 **지표가 아니라 그 규칙이 정한 것**이다. 지표 탓으로 쓰면
+    # 사실과 다르다 — 같은 지표로 폐업이 아니면 다른 국면도 가능하다.
+    # 문구는 정밀 모드의 `hard_rule_sentence` 와 맞춘다.
+    if is_closed:
+        return f"폐업·휴업으로 인해 {phases[0]} 국면으로 판정되었습니다."
+    ranks = [PHASE_ORDER[p] for p in phases]
+    worse = [p for p in excluded if PHASE_ORDER[p] > max(ranks)]
+    lighter = [p for p in excluded if PHASE_ORDER[p] < min(ranks)]
+
+    def names(pick) -> str:
+        return "·".join(n for n, s, _ in rows if pick(s))
+
+    def quoted(group: list[str]) -> str:
+        """'정상'·'일시적자금난' 처럼. 따옴표를 국면마다 씌워야 경계가 보인다."""
+        return "·".join(f"'{p}'" for p in group)
+
+    parts = []
+    if worse:
+        clean = names(lambda s: s == 0)
+        parts.append(
+            f"{clean}에 위험 신호가 없어 {quoted(worse)}{_eun_neun(worse[-1])} 제외했습니다."
+            if clean else f"측정된 지표로는 {quoted(worse)}까지 가지 않습니다."
+        )
+    if lighter:
+        risky = names(lambda s: s >= 1)
+        parts.append(
+            f"{risky}에 위험 신호가 있어 {quoted(lighter)}{_eun_neun(lighter[-1])} 제외했습니다."
+            if risky else f"측정된 지표로는 {quoted(lighter)}에 해당하지 않습니다."
+        )
+    return " ".join(parts)
+
+
+def _eun_neun(word: str) -> str:
+    """'은' / '는' 을 고른다. 앞 글자에 받침이 있으면 '은'.
+
+    국면 이름이 상황마다 달라 조사를 붙박이로 쓸 수 없다 — '정상은'인데 '회복불가는'이다.
+    한글 음절은 0xAC00 부터 28개씩 묶여 있고, 그 나머지가 0이면 받침이 없다.
+    """
+    last = word.strip("'")[-1]
+    if not ("가" <= last <= "힣"):
+        return "는"  # 한글이 아니면 판단하지 않는다
+    return "는" if (ord(last) - 0xAC00) % 28 == 0 else "은"
 
 
 def phase_indicator_rows(
@@ -2086,11 +2213,19 @@ def _radio(label, key, options, default, **kw):
     옛 코드는 그때 0번을 골랐다. 자격 확인 질문의 0번은 '예'라서, 선택지가 바뀐
     뒤(예: 택1 질문이 객관식이 되면서 옛 '예'가 사라진 뒤) 답이 조용히 '예'가 되어
     **자격을 주는 쪽으로 기운다.** 확인되지 않은 것은 통과시키지 않는 규칙과 반대다.
+
+    **`default=None` 이면 아무것도 고르지 않은 상태로 시작한다.** 기본값을 주면
+    사용자가 안 골랐는데 고른 것처럼 되는 자리가 있다(간편 모드 국면 선택).
+    그때는 호출부가 `_nav(ready=...)` 로 다음 단계를 막는다.
     """
     ans = _answers()
-    current = ans.get(key, default)
-    fallback = options.index(default) if default in options else len(options) - 1
-    idx = options.index(current) if current in options else fallback
+    if default is None:
+        current = ans.get(key)
+        idx = options.index(current) if current in options else None
+    else:
+        current = ans.get(key, default)
+        fallback = options.index(default) if default in options else len(options) - 1
+        idx = options.index(current) if current in options else fallback
     ans[key] = st.radio(label, options, index=idx, key=f"{key}_w", **kw)
     return ans[key]
 
@@ -2273,7 +2408,9 @@ def collect_revenue() -> dict:
     current_revenue = summary.recent_3m_avg if (precise and summary is not None) else rough
     return dict(
         summary=summary, precise=precise, rough=rough,
-        phase_simple=ans.get("phase_simple", "일시적자금난"),
+        # 아직 안 고른 상태(None)면 임시로 이 값을 쓴다. 진단 화면이 `ready=False` 로
+        # 다음 단계를 막고 있어 이 값이 결과 화면까지 가지는 않는다.
+        phase_simple=ans.get("phase_simple") or "일시적자금난",
         current_revenue=current_revenue, ready=ready,
     )
 
@@ -2342,27 +2479,41 @@ def render_situation(fields: list[str]) -> None:
     _nav(S_SITUATION, fields)
 
 
-# 간편 모드에서 국면을 직접 고를 때 보여줄 설명. 이름만 나열하면 "개선여지"와
-# "회복불가"의 차이를 알 수 없어 아무거나 고르게 된다.
+# 간편 모드에서 국면을 고를 때 보여줄 설명. 이름만 나열하면 "개선여지"와 "회복불가"의
+# 차이를 알 수 없어 아무거나 고르게 된다.
+#
+# 첫 항목은 **국면 값**이고 `phase.PHASE_ORDER` 의 키와 같아야 한다.
+#
+# **표기를 그 값으로 통일한다.** 한때 화면용으로 "개선 여지"처럼 띄어 쓴 이름을 따로
+# 들었는데, 정밀 모드의 진단 박스·하드 규칙 문장·LLM 프롬프트가 전부 붙여 쓴 값을
+# 쓰고 있어 한 화면에 두 표기가 섞였다. 훑을 곳이 적은 쪽으로 맞춘다.
+#
+# '정상'도 넣는다. 지표 셋이 전부 0점이면 가능한 국면에 오르는데, 선택지에 없으면
+# 고를 수 없는 것이 후보로 뜬다. 정책 데이터의 `적용국면` 은 셋뿐이라 '정상'을 고르면
+# 후보가 0개가 되고 화면이 그 사실을 말한다 — 정밀 모드와 같은 동작이다.
 #
 # 설명은 phase.py 의 국면 정의(모범규준 B·C·D 등급에 대응)를 옮긴 것이고, 예시는 그
-# 정의를 가게 말로 바꾼 것이다. **판정 기준이 아니다** — 정밀 모드의 기준은 지표 4종이고
-# 여기서는 사용자의 자기 판단을 그대로 받는다.
+# 정의를 가게 말로 바꾼 것이다. 순서는 `PHASE_ORDER` 와 같다(좋음 → 나쁨).
 _PHASE_CHOICES: list[tuple[str, str, str]] = [
     (
-        "일시적 자금난",
+        "정상",
+        "매출·비용·부채 어느 쪽에도 위험 신호가 없습니다.",
+        "지금 벌이로 비용과 상환을 감당하고 있고 현금도 남습니다.",
+    ),
+    (
+        "일시적자금난",
         "매출이 줄었지만 반등이나 계절 요인일 수 있고, 아직 버틸 현금이 남아 있습니다.",
-        "최근 몇 달 손님이 줄었지만 작년 이맘때도 비슷했습니다",
+        "최근 몇 달 손님이 줄었지만 작년 이맘때도 비슷했습니다.",
     ),
     (
-        "개선 여지",
+        "개선여지",
         "완만한 하락이 이어집니다. 구조를 바꾸면 회복할 수 있는 상태입니다.",
-        "1년 넘게 조금씩 줄고, 이자는 내지만 남는 것이 거의 없습니다",
+        "1년 넘게 조금씩 줄고, 이자는 내지만 남는 것이 거의 없습니다.",
     ),
     (
-        "회복 불가",
+        "회복불가",
         "급격한 하락이 이어지고 버틸 현금이 곧 바닥납니다.",
-        "매출이 반으로 줄었고 몇 달 안에 결정을 내려야 합니다",
+        "매출이 반으로 줄었고 몇 달 안에 결정을 내려야 합니다.",
     ),
 ]
 
@@ -2423,23 +2574,6 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
                     )
     else:
         _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
-        # 고르기 **전에** 셋을 나란히 읽을 수 있어야 자기 자리를 찾는다. 고른 것 아래에만
-        # 설명을 두면 셋을 차례로 열어 봐야 비교가 된다.
-        st.markdown("**어느 쪽에 가까우신가요?**")
-        st.markdown(
-            _card(
-                "".join(
-                    f"<div style='margin-bottom:{0 if i == len(_PHASE_CHOICES) - 1 else 12}px;'>"
-                    f"<div style='font-weight:700;color:{_INK};'>{name}</div>"
-                    f"<div style='color:#2d3748;line-height:1.5;'>{body}</div>"
-                    f"<div style='color:#4a5568;line-height:1.5;'>예) {example}</div></div>"
-                    for i, (name, body, example) in enumerate(_PHASE_CHOICES)
-                ),
-                "margin-bottom:12px;",
-            ),
-            unsafe_allow_html=True,
-        )
-        _select("국면 (직접 선택)", "phase_simple", ("일시적자금난", "개선여지", "회복불가"), "일시적자금난")
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
     _nav(S_REVENUE, fields, ready=ready)
 
@@ -2632,6 +2766,15 @@ def _indicator_table_html(rows: list[tuple[str, int, str | None]]) -> str:
     pad = "padding:11px 14px;word-break:keep-all;"  # 글자가 테두리에 붙지 않게 여백도
     cells = []
     for name, score, msg in rows:
+        # score 가 None 이면 **재지 못한 지표**다(간편 모드의 매출감소). 0점으로 채우지
+        # 않는다 — 0점은 "문제 없음"이라는 판정이고, 그렇게 채우면 낙관 쪽으로 기운다.
+        if score is None:
+            cells.append(
+                f"<tr><td style='{pad}border:{border};color:#9aa0a6;'>{name}</td>"
+                f"<td style='{pad}border:{border};white-space:nowrap;color:#9aa0a6;'>—</td>"
+                f"<td style='{pad}border:{border};color:#9aa0a6;'>{msg or '측정 불가'}</td></tr>"
+            )
+            continue
         detail = msg if msg else ("문제 없음" if score == 0 else "위험 신호")
         color = _SCORE_COLORS.get(score, "#718096")
         dot = (
@@ -2712,21 +2855,12 @@ def _score_frac(score: float) -> float:
     return min(max(score, 0), MAX_PHASE_SCORE) / (MAX_PHASE_SCORE + 1)
 
 
-# 간편 모드에서 **고르지 않은** 구간을 낮출 색. 카드 배경(#f0f2f6)보다 확실히 어두워
-# 띠가 사라지지 않고, 신호등 네 색 중 어느 것으로도 읽히지 않는 무채색이다.
-_MUTED = "#c9ced6"
-
-
-def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
+def _phase_gauge_svg(total: int) -> str:
     """국면 눈금 — 자동차 계기판형 게이지(SVG) 문자열. 카드로 감싸 쓴다.
 
-    `total=None` 은 **간편 모드**다. 국면을 사용자가 직접 골랐을 뿐 지표를 재지 않았으므로
-    바늘을 그리지 않고, `phase` 구간만 색을 남기고 나머지 셋을 회색으로 낮춘다.
-    바늘은 눈금 위의 한 점을 찍는데 그 점은 우리가 재지 않은 점수다. 구간은 다르다 —
-    구간 경계는 phase.py 의 `SCORE_TEMPORARY`·`SCORE_IMPROVABLE` 에서 온 실제 값이라
-    "고른 국면이 3~5점 구간"이라고 말해도 없는 값을 주장하지 않는다.
-    눈금 숫자 0~8 은 그대로 둔다 — 그 숫자가 구간의 폭과 위치를 말해 준다.
-    색만으로 뜻을 전하지 않게 호 아래 점수 자리에 **국면명**을 적는다.
+    **정밀 모드 전용이다.** 간편 모드에는 쓰지 않는다 — 0~8 눈금이 있어 점수를 말하는
+    장치인데 그쪽은 점수를 재지 않았고, 구간만 강조해도 형태 자체가 계산된 값처럼
+    읽힌다. 간편 모드는 순서만 보이는 세로 축을 쓴다(`render_phase_axis`).
 
     이전 가로 막대는 9칸을 균등 분할해, 0점 하나뿐인 '정상'과 3점 폭인 '개선여지'가
     같은 비중으로 보였다. 여기서는 호의 길이를 **점수 폭에 비례**시킨다.
@@ -2784,13 +2918,8 @@ def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
         large = 1 if abs(f1 - f0) * GAUGE_SWEEP_DEG > 180 else 0
         return f"M {x0:.1f} {y0:.1f} A {r} {r * GAUGE_SQUASH:.1f} 0 {large} 1 {x1:.1f} {y1:.1f}"
 
-    def band_color(name: str, color: str) -> str:
-        """간편 모드에서는 고른 국면만 제 색을 쓰고 나머지는 회색으로 낮춘다."""
-        return color if total is not None or name == phase else _MUTED
-
     bands, labels, seps = [], [], []
     for lo, hi, name, color in _PHASE_BANDS:
-        color = band_color(name, color)
         f0, f1 = lo / cells, (hi + 1) / cells
         # 띠를 **채운 부채꼴**로 그린다(두꺼운 선이 아니라). 타원에서는 굵은 선의 가장자리가
         # 타원이 아니라서, 선으로 그리면 윤곽선(r_in·r_out 타원호)이 띠 가장자리와 어긋난다.
@@ -2851,8 +2980,8 @@ def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
     # 반지름으로 삼아야 마개가 띠 두께에 딱 맞는다.
     caps = []
     for f, color in (
-        (0.0, band_color(_PHASE_BANDS[0][2], _PHASE_BANDS[0][3])),
-        (1.0, band_color(_PHASE_BANDS[-1][2], _PHASE_BANDS[-1][3])),
+        (0.0, _PHASE_BANDS[0][3]),
+        (1.0, _PHASE_BANDS[-1][3]),
     ):
         ix, iy = _gauge_point(cx, cy, r_in, f)
         ox, oy = _gauge_point(cx, cy, r_out, f)
@@ -2893,28 +3022,25 @@ def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
     # 회전축과 점수를 **함께** 같은 만큼 내린다(둘 사이 간격은 그대로). 호·눈금·라벨은
     # 움직이지 않는다 — 이 값은 바늘과 점수에만 더한다.
     drop = 12.0
-    needle = ""
-    if total is not None:
-        pivot_y = cy + r_mid * GAUGE_SQUASH * 0.42 + drop
-        target_x, target_y = _gauge_point(cx, cy, r_tick, _score_frac(total))  # 눈금 숫자의 자리
-        span = math.hypot(target_x - cx, target_y - pivot_y) or 1.0
-        ux, uy = (target_x - cx) / span, (target_y - pivot_y) / span
-        tip_x, tip_y = target_x - ux * 9.0, target_y - uy * 9.0  # 숫자 안쪽 가장자리에서 멈춘다
-        px, py = -uy, ux  # 뿌리의 폭 방향
-        root = 7.0
-        needle = (
-            f"<polygon points='{tip_x:.1f},{tip_y:.1f} "
-            f"{cx + px * root:.1f},{pivot_y + py * root:.1f} "
-            f"{cx - px * root:.1f},{pivot_y - py * root:.1f}' fill='{edge}'/>"
-            f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='{root + 1.5}' fill='{edge}'/>"
-            f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='3.2' fill='#ffffff'/>"
-        )
+    pivot_y = cy + r_mid * GAUGE_SQUASH * 0.42 + drop
+    target_x, target_y = _gauge_point(cx, cy, r_tick, _score_frac(total))  # 눈금 숫자의 자리
+    span = math.hypot(target_x - cx, target_y - pivot_y) or 1.0
+    ux, uy = (target_x - cx) / span, (target_y - pivot_y) / span
+    tip_x, tip_y = target_x - ux * 9.0, target_y - uy * 9.0  # 숫자 안쪽 가장자리에서 멈춘다
+    px, py = -uy, ux  # 뿌리의 폭 방향
+    root = 7.0
+    needle = (
+        f"<polygon points='{tip_x:.1f},{tip_y:.1f} "
+        f"{cx + px * root:.1f},{pivot_y + py * root:.1f} "
+        f"{cx - px * root:.1f},{pivot_y - py * root:.1f}' fill='{edge}'/>"
+        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='{root + 1.5}' fill='{edge}'/>"
+        f"<circle cx='{cx}' cy='{pivot_y:.1f}' r='3.2' fill='#ffffff'/>"
+    )
     # 호 아래 한 줄 — 게이지 중심선(x = cx) 위, **말굽 양 끝과 같은 높이**. 글자 기준선을
     # 호 끝의 세로 위치에 맞춰 나란히 보이게 한다.
-    # 정밀 모드는 점수, 간편 모드는 국면명이다(색만으로 뜻을 전하지 않게).
     score_size = 17.0
     score_y = _gauge_point(cx, cy, r_mid, 0.0)[1] + drop  # 회전축과 같은 만큼 내린다
-    caption = f"{total} / {MAX_PHASE_SCORE}점" if total is not None else (phase or "")
+    caption = f"{total} / {MAX_PHASE_SCORE}점"
     score_text = (
         f"<text x='{cx}' y='{score_y:.1f}' text-anchor='middle' font-family='inherit' "
         f"font-size='{score_size:.0f}' font-weight='700' fill='{edge}'>{caption}</text>"
@@ -2922,7 +3048,7 @@ def _phase_gauge_svg(total: int | None, phase: str | None = None) -> str:
     # 글자 상자를 실제 크기로만 잡는다(넉넉한 정사각으로 잡으면 아래 여백이 부풀어
     # viewBox 가 세로로 늘어난다). 기준선 위로 대문자 높이, 아래로 디센더.
     # 폭 계수는 한글이 1글자당 거의 한 칸이라 숫자 섞인 '5 / 8점'보다 크게 잡는다.
-    score_half_w = len(caption) * score_size * (0.55 if total is not None else 1.0) / 2
+    score_half_w = len(caption) * score_size * 0.55 / 2
     mark(cx - score_half_w, score_y - score_size * 0.78)
     mark(cx + score_half_w, score_y + score_size * 0.26)
 
@@ -3079,24 +3205,123 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
         _nav(S_DIAGNOSIS, fields)
         return
 
-    # 간편 모드 — 국면을 직접 선택했으므로 지표 판정이 없다
-    phase = "회복불가" if is_closed else revenue["phase_simple"]
-    _phase_box(phase)
-    # 게이지 — 고른 국면이 **나머지 셋에 비해 어디쯤인지** 보여준다. 국면 박스만 있으면
-    # 이름 하나만 떠서 그 위치가 안 보인다. 점수는 재지 않았으므로 바늘을 그리지 않고
-    # 구간만 색으로 남긴다(_phase_gauge_svg 참조).
-    # 폭은 정밀 모드의 게이지 카드(좌우 2분할 중 왼쪽)와 같게 가운데 열에 둔다.
-    _, middle, _ = st.columns([1, 2, 1])
-    middle.markdown(
+    # ── 간편 모드 ── **한 장으로 끝낸다.**
+    # POS 가 없어도 ③④⑤ 에서 받은 값으로 지표 4종 중 **셋**이 계산된다. 그 셋으로
+    # 가능한 국면을 좁히고, 남은 것 중에서 사용자가 고른다(`simple_mode_phases`).
+    #
+    # 확정 박스(`_phase_box`)와 무지원 생존 개월 박스는 두지 않는다. 국면은 시뮬레이션의
+    # **입력 조건**이지 결과가 아니라, 결과값과 같은 층위로 놓으면 확정된 진단처럼 읽힌다.
+    #
+    # '추정치' 고지는 여기 두지 않는다 — 결과 화면 상단이 이미 말한다. 고를 자리에서
+    # 미리 말하면 아직 나오지도 않은 결과를 깎는다.
+    phases, rows = simple_mode_phases(profile, revenue["current_revenue"], is_closed)
+    auto = len(phases) == 1
+    if auto:
+        # 지표 셋만으로 이미 하나다. 물을 것이 없으므로 확정하고 넘어간다.
+        phase = phases[0]
+        _answers()["phase_simple"] = phase
+        st.markdown(f"**입력하신 값으로 국면이 하나로 정해집니다 — {phase}.**")
+    else:
+        phase = _answers().get("phase_simple")
+        st.markdown(
+            f"**입력하신 값으로는 아래 {len(phases)}개 중 하나입니다.** "
+            "어느 쪽에 더 가깝다고 보시나요?"
+        )
+    if note := exclusion_note(phases, rows, is_closed):
+        st.markdown(note)
+    render_indicator_expander(rows)
+    render_phase_axis(phases, phase)
+
+    if auto:
+        st.caption("이 국면으로 정책 추천이 진행됩니다.")
+    else:
+        # default=None — **아직 안 고른 상태**로 시작한다. 기본값을 주면 사용자가
+        # 고르지 않았는데 고른 것처럼 되고, 그러면 좁혀 놓은 의미가 없다.
+        phase = _radio(
+            "국면 선택", "phase_simple", list(phases), None,
+            horizontal=len(phases) <= 3, label_visibility="collapsed",
+        )
+        # 아직 안 골랐을 때의 안내는 여기 두지 않는다 — `_nav` 이 ready=False 면
+        # "입력을 마치면 다음으로 넘어갈 수 있어요"를 이미 띄운다.
+        if phase:
+            st.caption("선택하신 국면으로 정책 추천이 진행됩니다.")
+    _nav(S_DIAGNOSIS, fields, ready=auto or phase is not None)
+
+
+def render_indicator_expander(rows: list[tuple[str, int, str | None]]) -> None:
+    """계산 근거 — 접어 둔다. 펼치면 잴 수 있었던 지표와 점수 방향이 나온다.
+
+    접힘으로 두는 이유는 이 화면의 주인공이 국면 선택이기 때문이다. 그렇다고 빼면
+    "좁혀집니다"가 근거 없는 주장이 된다 — 접어 두면 한 줄만 차지하면서 계산 근거를
+    보여준다는 이 서비스의 핵심을 지킬 수 있다.
+
+    매출감소는 점수 대신 '측정 불가'로 남긴다. **총점은 보여주지 않는다** — 넷 중
+    셋으로 낸 합계는 8점 만점 기준의 국면 경계와 견줄 수 없다.
+    """
+    with st.expander("어떻게 판단했는지 보기", key="exp_simple_scores"):
+        st.caption(
+            "지표마다 **0점이 좋고 2점이 나쁩니다.** 매출 자료가 없어 매출 감소는 "
+            "재지 못했고, 그래서 국면이 하나로 정해지지 않고 범위로 남습니다."
+        )
+        st.markdown(
+            _indicator_table_html(
+                list(rows) + [("매출 감소", None, "매출 자료가 없어 측정 불가")]
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def render_phase_axis(phases: list[str], picked: str | None) -> None:
+    """국면 넷을 **좋음 → 나쁨** 세로 축으로 보여준다. 가능한 것에만 테두리.
+
+    **게이지를 쓰지 않는다.** 게이지에는 0~8 눈금이 있어 점수를 말하는 장치인데,
+    간편 모드는 점수를 재지 않았다. 구간만 강조해도 그 형태 자체가 계산된 값처럼
+    읽힌다(정밀 모드는 실제 점수가 있어 그대로 둔다).
+
+    대신 **순서**만 보인다. 국면 순서는 `phase.PHASE_ORDER` 가 정한 값이라 근거가
+    있고, 점수를 보여주는 것과 다르다. 카드가 세로로 쌓이므로 축도 세로로 둔다.
+
+    걸러진 국면을 숨기지 않는다 — 숨기면 "왜 이것만 나오나"에 답이 없고, 다 똑같이
+    보이면 좁혀졌다는 사실이 안 보인다.
+    """
+    cards = []
+    for value, body, example in _PHASE_CHOICES:
+        live = value in phases
+        chosen = value == picked
+        edge = ("2.5px solid #2b6cb0" if chosen else
+                "1.5px solid #9dbbe0" if live else "1px solid #e3e6ea")
+        ink = _INK if live else "#a8adb3"
+        sub = "#2d3748" if live else "#bcc0c5"
+        cards.append(
+            f"<div style='border:{edge};border-radius:{_CARD_RADIUS};"
+            f"padding:9px 13px;margin-bottom:7px;background:#fff;'>"
+            f"<div style='font-weight:700;color:{ink};'>{value}</div>"
+            f"<div style='color:{sub};line-height:1.5;font-size:0.92rem;'>{body}</div>"
+            f"<div style='color:{sub};line-height:1.5;font-size:0.92rem;'>"
+            f"예) {example}</div></div>"
+        )
+    # 축 — 위(좋음) 파랑에서 아래(나쁨) 빨강으로. 색만으로 뜻을 전하지 않게
+    # '좋음'·'나쁨' 글자를 함께 둔다.
+    axis = (
+        "<div style='display:flex;flex-direction:column;align-items:center;"
+        "flex:0 0 auto;padding:2px 0;'>"
+        "<div style='font-size:0.78rem;color:#2b6cb0;font-weight:700;'>좋음</div>"
+        f"<div style='color:{_GREEN};line-height:1;font-size:0.8rem;'>&#9650;</div>"
+        "<div style='flex:1;width:5px;border-radius:3px;"
+        f"background:linear-gradient(#2b6cb0,{_RED});'></div>"
+        f"<div style='color:{_RED};line-height:1;font-size:0.8rem;'>&#9660;</div>"
+        "<div style='font-size:0.78rem;color:#CF4E4E;font-weight:700;'>나쁨</div>"
+        "</div>"
+    )
+    st.markdown(
         _card(
-            f"<div style='width:100%;height:100%;'>{_phase_gauge_svg(None, phase=phase)}</div>",
-            "height:210px;display:flex;align-items:center;justify-content:center;"
-            "padding:8px;margin-top:12px;",
+            "<div style='display:flex;gap:12px;align-items:stretch;'>"
+            + axis
+            + f"<div style='flex:1;'>{''.join(cards)}</div></div>",
+            "margin:8px 0;",
         ),
         unsafe_allow_html=True,
     )
-    st.markdown("매출 추세가 없어 입력하신 값과 선택하신 국면으로 진행합니다. 결과 수치는 **추정치**입니다.")
-    _nav(S_DIAGNOSIS, fields)
 
 
 def render_conditional(fields: list[str], questions: list[dict] | None = None) -> None:
