@@ -313,7 +313,7 @@ _LOADING_HTML = """
     <rect class="sn-fill" x="9" y="25" width="12" height="11" fill="#2b6cb0" opacity="0.55"/>
   </svg>
   <div class="sn-text">AI가 최종 3개를 고르는 중입니다<br>
-    <span class="sn-sub">1~2분 정도 소요됩니다. 창을 닫지 마세요.</span></div>
+    <span class="sn-sub">1분 정도 소요됩니다. 창을 닫지 마세요.</span></div>
 </div>
 """
 
@@ -333,7 +333,9 @@ def get_advice(prompt_text: str, labels: list[str]) -> agent.Advice:
     key = hashlib.sha256(
         "\x00".join((prompt_text, agent.SYSTEM_PROMPT, agent.MODEL)).encode("utf-8")
     ).hexdigest()[:16]
-    # 1~2분 걸린다. 기본 st.spinner 는 작은 글씨 한 줄이라 멈춘 줄 안다.
+    # 실측 25~28초(데모 A·B·C 각 1회, 2026-09-02). 화면에는 여유를 둬 '1분'이라 쓴다
+    # — 짧게 적었다가 넘기면 멈춘 줄 안다. 기본 st.spinner 는 작은 글씨 한 줄이라
+    # 같은 오해를 부른다.
     # placeholder 를 쓰는 이유 — st.spinner 는 문구와 크기를 못 바꾼다. 직접 그리고
     # 끝나면 비운다.
     #

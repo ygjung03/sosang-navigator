@@ -259,12 +259,22 @@ def _check_immediate(profile: UserProfile, result: SimResult) -> Trap | None:
     if payment <= operating:
         return None
 
+    # 차액을 문구에 적는다. 예전에는 "부족분은 보유 현금으로 메우게 됩니다"로 끝나
+    # **값을 말하지 않은 채 부족분을 가리켰고**, LLM 이 그것을 직접 빼서 썼다
+    # (2026-09-02 실측: 205 - 39 = 166, 206 - 39 = 167). 프롬프트에 없는 숫자라
+    # 숫자 검증이 응답을 통째로 버렸다. 후보 간 차이값을 미리 실어 뺄셈 이유를
+    # 없앤 것과 같은 처방이다(기획서 5.5 ⑦).
+    #
+    # **표시되는 반올림값끼리 뺀다.** 원값으로 빼서 반올림하면 화면의 두 수를
+    # 빼도 안 맞는 값이 나온다.
+    pay_man = round(payment / MAN)
+    op_man = round(operating / MAN)
     return Trap(
         kind=TrapKind.IMMEDIATE,
         message=(
-            f"첫 달부터 월 상환액 {payment / MAN:,.0f}만원이 "
-            f"월 영업이익 {operating / MAN:,.0f}만원을 넘습니다. "
-            f"부족분은 보유 현금으로 메우게 됩니다."
+            f"첫 달부터 월 상환액 {pay_man:,}만원이 "
+            f"월 영업이익 {op_man:,}만원을 넘습니다. "
+            f"차액 {pay_man - op_man:,}만원을 매달 보유 현금에서 메우게 됩니다."
         ),
         at=1,
     )
