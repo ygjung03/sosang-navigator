@@ -835,8 +835,11 @@ def simulate(
                         f"⚠ {cand}: {bal_at}개월차에 원금 {bal_amount:,.0f}원이 "
                         f"일시상환으로 남는다 (시뮬레이션 {horizon}개월 밖)"
                     )
+                # '@ 3.00%' 는 개발자 표기다. 화면에 그대로 나가므로 무엇을 가리키는지
+                # 말로 쓴다.
                 notes.append(
-                    f"융자 {cand} {amount:,}원 @ {float(cand.get('금리_연', 0)):.2%}"
+                    f"융자 {cand} {amount:,}원 · 금리 "
+                    f"{float(cand.get('금리_연', 0)):.2%}"
                 )
             else:
                 # 보조금은 유출이 없다

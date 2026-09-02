@@ -1734,8 +1734,8 @@ def render_results(
 
     # 두 축이 무엇인지 상단에 한 번 설명한다 (카드마다 축별 강점 라벨이 붙으므로).
     st.info(
-        "두 축은 **생존 개월수**(지원을 받으면 몇 개월 버티는가)와 "
-        "**종료 시점 부채**(그때 빚이 얼마 남는가)입니다."
+        "핵심 평가 지표: **생존 개월 수**(지원을 받으면 몇 개월 버티는가), "
+        "**종료 시점 부채**(그때 빚이 얼마 남는가)"
     )
     # 국면 판단은 카드가 아니라 목록 위 한 곳에 — 조합 하나가 아니라 전체에 대한 판단이다.
     if advice is not None and advice.ok and advice.phase_reading:
@@ -2123,7 +2123,9 @@ def render_progress(cur: int, fields: list[str]) -> None:
     if cur == S_DONE:
         counter = "완료"
     elif cur in OUTPUT_STEPS:
-        counter = STEP_TITLES[cur]
+        # 화면 이름을 그대로 쓰면 바로 아래 칩과 **같은 말이 두 번** 나온다("진단"·"진단").
+        # 카운터의 일은 '어디쯤 왔나'이므로, 지나온 입력 단계 수를 말한다.
+        counter = f"입력 {sum(1 for s in answer_steps if s < cur)} / {total} 완료"
     else:
         pos = answer_steps.index(cur) + 1 if cur in answer_steps else total
         counter = f"{pos} / {total}"
@@ -3416,8 +3418,14 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
         # 짧은 예/아니오/모름만 가로로 두고, 택1 객관식은 세로로 늘어놓는다.
         short = len(options) <= 3 and max(len(o) for o in options) <= 12
         if short:
-            st.markdown("**해당사항이 있는지 체크해주세요.**")
-            for line in confirm_question_lines(item["question"]):
+            # 항목이 여럿(①②③)이면 "하나라도"를 밝힌다 — 택1 요건이라 전부 해당해야
+            # 하는 것으로 읽히면 안 된다. 단문 예/아니오에는 그 말이 군더더기다.
+            lines = confirm_question_lines(item["question"])
+            st.markdown(
+                "**아래 항목 중 하나라도 해당사항이 있는지 체크해주세요.**"
+                if len(lines) > 1 else "**해당사항이 있는지 체크해주세요.**"
+            )
+            for line in lines:
                 st.markdown(line)
         else:
             # 객관식은 선택지가 이미 갈래를 담고 있다. 질문 원문까지 풀어 쓰면
@@ -3432,11 +3440,20 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
 
 def render_goals(fields: list[str]) -> None:
     """⑦ 희망 금액 / 목표 생존 개월수 (둘 다 선택). 답은 collect_goals 이 읽는다."""
-    st.markdown("**마지막이에요.** 필요한 금액이나 버티고 싶은 기간이 정해져 있나요? (선택)")
+    st.markdown("**마지막이에요.** 필요한 금액이나 기간이 정해져 있나요? (선택)")
     if _check("필요한 금액이 정해져 있음", "goal_amt_on", False):
         _num("희망 금액 (만원)", "goal_amt_man", 3_000, min_value=0, step=100)
     if _check("목표 생존 개월수 지정", "goal_months_on", True):
-        _slider("몇 개월 이상 버티고 싶으세요?", "goal_months", 1, SIM_MONTHS, DEFAULT_TARGET_MONTHS)
+        # "버티고 싶은 기간"으로 물으면 희망을 묻는 말이 되어 "영원히"가 답이 된다.
+        # 필요 최소치를 묻는 쪽으로 쓴다.
+        st.markdown(
+            "사업 상황을 다시 살펴볼 여유를 얻기 위해, "
+            "꼭 필요한 최소한의 버팀 기간을 알려주세요."
+        )
+        _slider(
+            "목표 생존 개월수", "goal_months", 1, SIM_MONTHS, DEFAULT_TARGET_MONTHS,
+            label_visibility="collapsed",
+        )
     _nav(S_GOALS, fields)
 
 
