@@ -318,6 +318,63 @@ def test_payment_identity():
     assert checked > 50, f"조합이 너무 적다({checked}개) — 커버리지 부족"
 
 
+def test_survival_means_last_month_with_cash():
+    """`survival_months` 가 **잔고가 남아 있던 마지막 달**인지 전수 검증한다.
+
+    "0 이하가 되는 첫 시점"으로 읽으면 한 칸 밀린다. 상환 스케줄을 자르는 자리와
+    함정 판정이 이 뜻에 기대고 있어, 한 칸 어긋나면 조용히 틀린 표가 나간다.
+
+        balance_at[survival]     > 0     아직 남아 있다
+        balance_at[survival + 1] == 0    여기서 말랐다
+        payment_during[survival:]        전부 0 (못 갚았다)
+    """
+    from core.combos import (
+        build_combos,
+        default_loan_amounts,
+        eligible_candidates,
+        evaluate,
+        fixed_amounts,
+        grant_amounts,
+    )
+    from tests.cases_phase import CASES, context_of, profile_of
+
+    checked = died = 0
+    for name, c in CASES.items():
+        profile = profile_of(c)
+        ctx = context_of(c)
+        results = [simulate(profile)]
+        pool = eligible_candidates(db, profile, ctx)
+        amounts = default_loan_amounts(db, pool, profile, target_months=6)
+        amounts.update(fixed_amounts(profile, pool))
+        amounts.update(grant_amounts(db, pool, ctx))
+        results += [ev.result for ev in evaluate(profile, build_combos(db, pool, amounts))]
+
+        for r in results:
+            months = r.survival_months
+            checked += 1
+            if months >= SIM_MONTHS:
+                assert r.balance_at[SIM_MONTHS] > 0, f"{name}: 36개월 생존인데 잔고 0"
+                continue
+            died += 1
+            assert r.balance_at[months] > 0, (
+                f"{name}: survival={months} 인데 "
+                f"balance_at[{months}]={r.balance_at[months]:,.0f} <= 0"
+            )
+            assert r.balance_at[months + 1] <= 0.5, (
+                f"{name}: survival={months} 인데 "
+                f"balance_at[{months + 1}]={r.balance_at[months + 1]:,.0f} > 0"
+            )
+            assert all(v < 0.5 for v in r.payment_during[months:]), (
+                f"{name}: survival={months} 뒤에도 상환액이 있다"
+            )
+
+    print()
+    print("-- 생존 개월수의 뜻 전수 검증")
+    print(f"   조합 {checked}개(그중 파산 {died}개) · "
+          "survival = 잔고가 남아 있던 마지막 달")
+    assert died > 20, f"파산 사례가 너무 적다({died}개) — 검사가 헐겁다"
+
+
 def main() -> None:
     print("=" * 62)
     print("현금흐름 엔진 검증 - 현금효과 6종 + 조합")
@@ -333,6 +390,7 @@ def main() -> None:
         test_cost_relief,
         test_combination,
         test_payment_identity,
+        test_survival_means_last_month_with_cash,
     ):
         fn()
     print("\n" + "=" * 62)
