@@ -1241,6 +1241,25 @@ def render_support_detail(evaluated: Evaluated) -> None:
             st.caption(f"부채 감소 {fmt_man(result.forgiven)} (추정치)")
 
 
+def _repeats_warning(note: str, traps) -> bool:
+    """AI 풀이가 코드 경고를 되풀이하는지. 되풀이하면 화면에 두 번 안 띄운다.
+
+    판정 기준은 **숫자를 다시 말하는가**다. 시점·금액이 겹치면 사용자에게는 같은
+    문장이 두 번 뜬 것으로 보인다(데모 B: 경고와 풀이가 13개월차·128만원·18개월차를
+    똑같이 말했다). 두 개 이상 겹칠 때만 중복으로 본다 — 하나는 우연히 겹칠 수 있다.
+
+    숫자가 없는 풀이는 감추지 않는다. 그런 문장은 경고를 되풀이하는 것이 아니라
+    "그 전까지 매출 회복 계획을 세우세요" 같은 조언이라 남길 값이 있다.
+    """
+    note_numbers = agent._numbers_in(note)
+    if not note_numbers:
+        return False
+    warning_numbers: set[str] = set()
+    for trap in traps:
+        warning_numbers |= agent._numbers_in(trap.message)
+    return len(note_numbers & warning_numbers) >= 2
+
+
 def render_traps(report) -> None:
     """함정 경고.
 
@@ -1657,8 +1676,12 @@ def render_group_card(
             render_traps(report)
             # LLM 이 푼 말은 원문 경고 **바로 아래**에 둔다. 숫자가 든 원문을 지우지
             # 않는 이유는 그게 근거이기 때문이고, 풀이는 그 옆에 있어야 이어 읽힌다.
+            # 다만 **같은 말을 두 번 하면 빼는 게 낫다** — 데모 B 에서 노란 경고와
+            # 회색 풀이가 시점·금액·결과를 똑같이 말해 같은 문장이 두 번 뜬 것처럼
+            # 보였다. 풀이가 경고의 숫자를 되풀이하면 중복으로 보고 감춘다.
             if pick is not None and pick.trap_note and report.traps:
-                st.caption(f"↳ {pick.trap_note}")
+                if not _repeats_warning(pick.trap_note, report.traps):
+                    st.caption(f"↳ {pick.trap_note}")
 
             # 창 밖 만기 일시상환 — **함정 경고 바로 아래, 같은 하늘색 상자 안**에 둔다.
             # 예전에는 컨테이너 밖(8칸 들여쓰기)에 있어 상자 밖으로 튀어나왔다.
@@ -1764,8 +1787,11 @@ def render_results(
             unsafe_allow_html=True,
         )
     if advice is not None and advice.ok and advice.picks:
+        # 📌 를 붙인다 — 회색 캡션이라 그냥 두면 눈에 안 들어오는데, 이 서비스의
+        # AI 활용을 말하는 문장이라 지나치면 안 된다. 글자 크기·색은 그대로 두고
+        # 아이콘만 얹어 무게를 올린다.
         st.caption(
-            "아래 추천 순서와 각 조합의 설명도 AI가 입력하신 상황을 "
+            "📌 아래 추천 순서와 각 조합의 설명도 AI가 입력하신 상황을 "
             "바탕으로 판단한 결과입니다."
         )
     # 무지원 생존 개월수는 여기 한 줄로 두지 않는다 — 카드마다 '지원 전 → 지원 후'로
@@ -1950,7 +1976,7 @@ def _step_before(cur: int, fields: list[str]) -> int:
     return max(prv, S_SITUATION)
 
 
-def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
+def _nav(cur: int, fields: list[str], ready: bool = True, hint: bool = True) -> None:
     """◀ 이전 / 다음 ▶. 화면 하단에 고정(sticky)하고 가운데에 배치한다.
 
     위젯이 많은 단계(⑤ 연체·신용)에서 버튼을 스크롤해야 보이는 문제를 없앤다.
@@ -1970,7 +1996,7 @@ def _nav(cur: int, fields: list[str], ready: bool = True) -> None:
                 if st.button(label, key=f"next_{cur}", disabled=not ready, use_container_width=True):
                     ss.step = nxt
                     st.rerun()
-        if not ready:
+        if not ready and hint:
             st.caption("입력을 마치면 다음으로 넘어갈 수 있어요.")
 
     # ⚠ 내부 API 의존: '.st-key-navbar' 는 st.container(key="navbar") 가 만드는
@@ -2660,7 +2686,7 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
 
 def render_cost(fields: list[str]) -> None:
     st.markdown("**한 달 비용과 보유 현금**을 알려주세요.")
-    _num("월 고정비 (만원)", "fixed_man", 500, min_value=0, step=10)
+    _num("월 고정비 (만원)", "fixed_man", 550, min_value=0, step=10)
     _num(
         "월 변동비 (만원)", "var_man", 200, min_value=0, step=10,
         help="재료비·수수료 등 매출에 비례하는 비용. 비율은 코드가 계산합니다.",
@@ -2672,10 +2698,17 @@ def render_cost(fields: list[str]) -> None:
 def render_debt(fields: list[str]) -> None:
     """④ 부채 규모 — 총잔액·월상환·금리."""
     st.markdown("**기존 부채 규모**를 알려주세요. 없으면 0으로 두시면 됩니다.")
-    _num("부채 총 잔액 (만원)", "debt_man", 3_000, min_value=0, step=50)
+    # ③④ 의 기본값은 **간편 모드에서 국면 후보가 둘로 좁혀지도록** 잡았다.
+    # 매출 800 · 고정 550 · 변동 200 이면 영업이익 50만원이고, 부채 6,000만원에
+    # 금리 7% 면 월 이자가 35만원이라 이자보상배율이 1.43 — 1점 구간(1.0~1.5)에
+    # 들어간다. 그래서 '정상'이 빠지고 일시적자금난·개선여지 둘이 남는다.
+    # 지표가 실제로 점수를 내서 좁혀지는 것이라, 화면의 제외 사유도 근거를 말한다.
+    _num("부채 총 잔액 (만원)", "debt_man", 6_000, min_value=0, step=50)
     _num("월 상환액 (만원)", "debt_pay_man", 80, min_value=0, step=5)
-    if _check("부채 금리를 안다", "rate_known", False):
-        _num("연 금리 (%)", "rate_pct", 5.0, min_value=0.0, max_value=30.0, step=0.1)
+    # 금리를 기본으로 펼친다 — 모르면 체크를 풀면 되고, 알면 이자보상배율이
+    # 계산되어 국면 판정의 지표 하나가 더 살아난다.
+    if _check("부채 금리를 안다", "rate_known", True):
+        _num("연 금리 (%)", "rate_pct", 7.0, min_value=0.0, max_value=30.0, step=0.1)
     _nav(S_DEBT, fields)
 
 
@@ -2718,12 +2751,12 @@ def collect_finance() -> dict:
     else:
         high_rate = None
     return dict(
-        fixed_cost=won(a.get("fixed_man", 500)),
+        fixed_cost=won(a.get("fixed_man", 550)),
         variable_cost=won(a.get("var_man", 200)),
         cash=won(a.get("cash_man", 1_000)),
-        debt=won(a.get("debt_man", 3_000)),
+        debt=won(a.get("debt_man", 6_000)),
         debt_payment=won(a.get("debt_pay_man", 80)),
-        debt_rate=(a.get("rate_pct", 5.0) / 100 if a.get("rate_known") else None),
+        debt_rate=(a.get("rate_pct", 7.0) / 100 if a.get("rate_known", True) else None),
         high_rate_debt=high_rate,
         overdue_days=int(a.get("overdue_days", 0)),
         policy_loan_balance=won(a.get("policy_bal_man", 0)),
@@ -3321,11 +3354,11 @@ def render_diagnosis(revenue: dict, elig: dict, profile: UserProfile, fields: li
             "국면 선택", "phase_simple", list(phases), None,
             horizontal=len(phases) <= 3, label_visibility="collapsed",
         )
-        # 아직 안 골랐을 때의 안내는 여기 두지 않는다 — `_nav` 이 ready=False 면
-        # "입력을 마치면 다음으로 넘어갈 수 있어요"를 이미 띄운다.
         if phase:
             st.caption("선택하신 국면으로 정책 추천이 진행됩니다.")
-    _nav(S_DIAGNOSIS, fields, ready=auto or phase is not None)
+    # hint=False — 이 화면은 위 안내가 이미 "어느 쪽에 더 가깝다고 보시나요?"로
+    # 무엇을 해야 하는지 말한다. `_nav` 의 "입력을 마치면 …"까지 나가면 같은 말이 둘이다.
+    _nav(S_DIAGNOSIS, fields, ready=auto or phase is not None, hint=False)
 
 
 def render_indicator_expander(rows: list[tuple[str, int, str | None]]) -> None:
