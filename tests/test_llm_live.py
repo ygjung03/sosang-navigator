@@ -20,6 +20,19 @@ from tests.test_app import _fresh_app, _to_results, _advance, _back
 IN_RATE, OUT_RATE = 2.00, 10.00   # $/MTok (claude-sonnet-5)
 ENV_FLAG = "SOSANG_LLM_LIVE"
 
+BANNED = (
+    "레이어", "그룹", "후보", "파레토", "비지배", "좌표", "함정", "4종",
+    "1번", "2번", "3번", "4번", "5번",
+)
+"""사용자 문장에 나오면 안 되는 내부 표기.
+
+시스템 프롬프트의 '절대 규칙' 과 **같은 목록이어야 한다.** 한쪽만 늘리면 검사가
+프롬프트를 못 따라간다.
+
+'그룹'·'후보'·'함정'·'4종'은 2026-09-04 실측에서 실제로 샜다. 그때까지 이 목록은
+('레이어', '1번', '2번', '3번')뿐이라 넷 다 못 잡았다.
+'함정'과 '후보'는 일상어라 자연스러워 보이는데, 그래서 오히려 눈에 안 띈다."""
+
 WARNINGS: list[str] = []
 """단언이 아니라 경고로 남길 것들. 지금은 그룹 겹침뿐이다.
 
@@ -104,7 +117,7 @@ def run_live() -> None:
         for p in advice.picks:
             texts += [p.why or "", p.trap_note or "", p.before_apply or ""] + list(p.steps or [])
         texts += [i.get("reason", "") for i in (advice.excluded or [])]
-        leaked = sorted({w for w in ("레이어", "1번", "2번", "3번") for t in texts if w in t})
+        leaked = sorted({w for w in BANNED for t in texts if w in t})
         assert not leaked, f"[{scenario}] 내부 표기가 샜다: {leaked}"
 
         print(f"[{scenario}] picks 그룹={picked} · excluded={len(advice.excluded or [])} "
