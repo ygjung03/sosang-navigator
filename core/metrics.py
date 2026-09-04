@@ -308,9 +308,16 @@ def _check_cliff(result: SimResult, horizon: int) -> tuple[Trap | None, int | No
     # 표시값은 month_display 한 곳에서만 만든다 — 상환 스케줄 표와 **같은 값**을 써야
     # 나란히 놓았을 때 어긋나지 않는다(각자 반올림하면 원금+이자가 총액과 안 맞는다).
     cells = month_display(result, cliff_at)
+    # 상환이 시작되는 달과 잔고가 마르는 달이 **같으면 한 번만 말한다.**
+    # "25개월차부터 … 25개월차에 소진됩니다"는 시차가 있는 것처럼 읽힌다.
+    same_month = cliff_at == result.survival_months
     trap = Trap(
         kind=TrapKind.CLIFF,
         message=(
+            f"{cliff_at}개월차에 월 상환액 {cells.total:,}만원 "
+            f"(원금 {cells.principal:,} + 이자 {cells.interest:,})이 시작되면서 "
+            f"잔고가 소진됩니다."
+            if same_month else
             f"{cliff_at}개월차부터 월 상환액 {cells.total:,}만원 "
             f"(원금 {cells.principal:,} + 이자 {cells.interest:,})이 시작되면서 "
             f"잔고가 다시 줄어, {result.survival_months}개월차에 소진됩니다."

@@ -315,7 +315,7 @@ _LOADING_HTML = """
           stroke="#2b6cb0" stroke-width="1.5"/>
     <rect class="sn-fill" x="9" y="25" width="12" height="11" fill="#2b6cb0" opacity="0.55"/>
   </svg>
-  <div class="sn-text">AI가 최종 3개를 고르는 중입니다<br>
+  <div class="sn-text">AI가 가장 나은 조합을 고르는 중입니다<br>
     <span class="sn-sub">1분 정도 소요됩니다. 창을 닫지 마세요.</span></div>
 </div>
 """
@@ -732,6 +732,9 @@ def confirm_question_lines(question: str) -> list[str]:
     원문은 한 문단에 '앞말 + ①②③' 이 이어 붙어 있어 읽히지 않는다. 앞말은 버리고
     (화면이 '해당사항이 있는지 체크해주세요.' 를 대신 쓴다) 번호마다 줄을 나눈다.
 
+    **번호는 줄을 가르는 데만 쓰고 화면에는 남기지 않는다.** 화면은 체크박스라
+    번호가 붙으면 객관식으로 읽혀, 하나만 고르는 것으로 오해된다.
+
     ①의 나열은 15개가 넘어 한 줄로도 길다. 굵은 표제와 나열을 갈라 두 줄로 만들고,
     나열은 가운뎃점을 쉼표로 바꿔 눈이 끊어 읽게 한다.
     """
@@ -743,10 +746,10 @@ def confirm_question_lines(question: str) -> list[str]:
 
     lines: list[str] = []
     parts = re.split(r"(?=[" + _CIRCLED + r"])", body)
-    for part in (p.strip() for p in parts):
+    for part in (p.strip(" \t" + _CIRCLED) for p in parts):
         if not part:
             continue
-        # '① **표제** — 나열' 을 표제 줄과 나열 줄로 가른다
+        # '**표제** — 나열' 을 표제 줄과 나열 줄로 가른다
         if " — " in part and part.count("·") >= 3:
             label, rest = part.split(" — ", 1)
             lines.append(f"- {label}")
@@ -1202,7 +1205,13 @@ def render_flow_chart(
             font=dict(size=11, color="#dd6b20"),
         )
 
-    # 우측 상단 구석에 단위 표기
+    # 좌측 상단에 제목, 같은 높이 우측 끝에 단위. 무슨 값을 그린 그래프인지
+    # 밝히지 않으면 막대가 매출인지 잔고인지 구분되지 않는다.
+    fig.add_annotation(
+        xref="paper", yref="paper", x=0, y=1.14, showarrow=False,
+        text="<b>보유 금액 추이</b> (매달 말 기준)",
+        font=dict(size=12, color="#2d3748"), xanchor="left",
+    )
     fig.add_annotation(
         xref="paper", yref="paper", x=1, y=1.14, showarrow=False,
         text="단위: 만원", font=dict(size=11, color="#888"), xanchor="right",
@@ -1738,13 +1747,26 @@ def render_results(
         "**종료 시점 부채**(그때 빚이 얼마 남는가)"
     )
     # 국면 판단은 카드가 아니라 목록 위 한 곳에 — 조합 하나가 아니라 전체에 대한 판단이다.
+    #
+    # 제목이 'AI 판단'이면 층위를 말하지 못한다. 상단 상자는 **국면을 보고 어느 축을
+    # 중시했나**(전체 기준)이고, 카드 안 설명은 **이 조합을 왜 이 순위에 뒀나**(개별)다.
+    # 둘 다 AI 가 쓰는데 제목이 하나만 그렇게 불리면 카드 안 설명이 AI 산출물로 안 보인다.
+    # 그래서 왼쪽 제목을 'AI가 본 상황'으로 바꾸고, 상자 아래 한 줄로 카드까지 잇는다.
+    #
+    # 폴백(advice 없음·실패·검증 폐기)이면 **둘 다 띄우지 않는다.** 그때는 코드 순서이고
+    # 카드 안에 AI 설명이 없다.
     if advice is not None and advice.ok and advice.phase_reading:
         st.markdown(
             f"<div style='{_CARD}padding:14px 16px;margin-bottom:10px;"
             "border-left:4px solid #2b6cb0;'>"
-            f"<div style='font-weight:700;margin-bottom:4px;'>AI 판단</div>"
+            f"<div style='font-weight:700;margin-bottom:4px;'>AI가 본 상황</div>"
             f"<div style='color:#2d3748;'>{advice.phase_reading}</div></div>",
             unsafe_allow_html=True,
+        )
+    if advice is not None and advice.ok and advice.picks:
+        st.caption(
+            "아래 추천 순서와 각 조합의 설명도 AI가 입력하신 상황을 "
+            "바탕으로 판단한 결과입니다."
         )
     # 무지원 생존 개월수는 여기 한 줄로 두지 않는다 — 카드마다 '지원 전 → 지원 후'로
     # 나란히 보여야 정책이 얼마나 늘려주는지가 읽힌다(상단에 baseline 만 있으면
@@ -3440,16 +3462,34 @@ def render_conditional(fields: list[str], questions: list[dict] | None = None) -
 
 def render_goals(fields: list[str]) -> None:
     """⑦ 희망 금액 / 목표 생존 개월수 (둘 다 선택). 답은 collect_goals 이 읽는다."""
-    st.markdown("**마지막이에요.** 필요한 금액이나 기간이 정해져 있나요? (선택)")
-    if _check("필요한 금액이 정해져 있음", "goal_amt_on", False):
-        _num("희망 금액 (만원)", "goal_amt_man", 3_000, min_value=0, step=100)
-    if _check("목표 생존 개월수 지정", "goal_months_on", True):
-        # "버티고 싶은 기간"으로 물으면 희망을 묻는 말이 되어 "영원히"가 답이 된다.
-        # 필요 최소치를 묻는 쪽으로 쓴다.
+    # '(선택)'만 붙이면 안 골라도 되는지, 골라야 하는지가 모호하고 둘 다 고를 수 있다는
+    # 것도 안 보인다. 무엇을 고를 수 있는지 괄호로 밝힌다.
+    st.markdown(
+        "**마지막이에요.** 미리 정해둔 필요한 금액이나 기간이 있다면 알려주세요.  \n"
+        "(금액·기간 중 하나 또는 모두 선택)"
+    )
+    # 체크박스 아래 예시 한 줄. "정해져 있음"이 무슨 뜻인지 말로 풀면 길어져,
+    # 사용자가 실제로 할 법한 말을 그대로 보여준다. 제목보다 작고 연하게 둔다 —
+    # 같은 크기면 둘 다 제목으로 읽혀 무엇을 고르는 화면인지 흐려진다.
+    def _example(text: str) -> None:
         st.markdown(
-            "사업 상황을 다시 살펴볼 여유를 얻기 위해, "
-            "꼭 필요한 최소한의 버팀 기간을 알려주세요."
+            "<div style='color:#718096;font-size:0.85rem;line-height:1.4;"
+            f"margin:-6px 0 6px 28px;'>└ 예: \"{text}\"</div>",
+            unsafe_allow_html=True,
         )
+
+    amt_on = _check("필요한 금액이 정해져 있음", "goal_amt_on", False)
+    _example("당장 3,000만 원 정도 자금이 필요해요")
+    if amt_on:
+        _num("희망 금액 (만원)", "goal_amt_man", 3_000, min_value=0, step=100)
+
+    # "버티고 싶은 기간"으로 물으면 희망을 묻는 말이 되어 "영원히"가 답이 된다.
+    # 필요 최소치를 묻는 쪽으로 쓴다.
+    months_on = _check("버텨야 하는 기간이 정해져 있음", "goal_months_on", True)
+    _example("최소 3개월은 버틸 자금이 필요해요")
+    if months_on:
+        # (단위: 개월)은 뺄 수 없다 — 슬라이더 눈금이 단위를 말하지 않는다.
+        st.markdown("최소한 몇 개월은 자금을 확보해야 하나요? (단위: 개월)")
         _slider(
             "목표 생존 개월수", "goal_months", 1, SIM_MONTHS, DEFAULT_TARGET_MONTHS,
             label_visibility="collapsed",
@@ -3567,7 +3607,12 @@ def main() -> None:
     with header[0]:
         if ss.step == S_SITUATION:
             st.title("🧭 소상공인 나침반")
-            st.caption("융자·보조금·채무조정을 36개월 현금흐름으로 함께 계산해 정책 조합을 추천합니다.")
+            # 두 줄로 나눈다 — 첫 줄이 사용자의 질문, 둘째 줄이 그 답이다.
+            # 한 줄에 수단(36개월 현금흐름)부터 말하면 무슨 뜻인지 안 읽힌다.
+            st.caption(
+                "정부 지원 정책, 어떻게 묶어야 우리 가게에 가장 유리할까요?  \n"
+                "융자·보조금·채무조정을 미리 계산해 가장 나은 조합을 찾아드립니다."
+            )
         else:
             st.markdown(
                 "<div style='font-size:1.05rem;font-weight:700;padding:2px 0;'>"
