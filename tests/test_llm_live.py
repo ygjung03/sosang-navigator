@@ -3,7 +3,7 @@
     SOSANG_LLM_LIVE=1 python -m tests.test_llm_live
 
 프롬프트가 제대로 나가는지, JSON 이 파싱되는지, 숫자 검증에 걸리지 않는지는 실제로
-불러 봐야 안다. 다만 호출마다 돈이 나가고(약 $0.03) 응답이 매번 달라 결과가 흔들리므로
+불러 봐야 안다. 다만 호출마다 돈이 나가고(약 $0.04) 응답이 매번 달라 결과가 흔들리므로
 `tests/test_app.py` 에서는 부르지 않는다 — 거기는 고정 응답으로 돌린다.
 
 **언제 돌리나** — 시스템 프롬프트나 `to_prompt_text()` 를 고친 뒤, 그리고 배포 전.
@@ -135,7 +135,7 @@ def main() -> None:
     print("실제 LLM 호출 검증")
     print("=" * 58)
     if os.environ.get(ENV_FLAG) != "1":
-        print(f"건너뜀 — 실제 API 를 호출하므로 기본으로는 돌지 않는다(호출당 약 $0.03).")
+        print(f"건너뜀 — 실제 API 를 호출하므로 기본으로는 돌지 않는다(호출당 약 $0.04).")
         print(f"돌리려면:  {ENV_FLAG}=1 python -m tests.test_llm_live")
         return
     if not agent._api_key():

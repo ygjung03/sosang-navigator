@@ -528,13 +528,17 @@ def _repayment_summary(result: Any, report: Any, items: Sequence[Any] = ()) -> l
     bullet = _is_bullet(items)
 
     if cliff_total is not None:
+        # 【예방】 1개월차 대비 증가폭. 관측된 적은 없으나 두 값이 나란히 있어
+        # "N만원 늘어난다"로 뺄 수 있는 자리다.
+        jump = f" (1개월차보다 {cliff_total - first:,}만원 늘어남)" if cliff_total > first else ""
         out.append(
-            f"만기 일시상환 — {cliff}개월차에 원금 전액 포함 {cliff_total:,}만원"
+            f"만기 일시상환 — {cliff}개월차에 원금 전액 포함 {cliff_total:,}만원{jump}"
             if bullet else
-            f"원금 상환 시작 — {cliff}개월차부터 {cliff_total:,}만원"
+            f"원금 상환 시작 — {cliff}개월차부터 {cliff_total:,}만원{jump}"
         )
         out.append(
             f"가장 큰 달 — {peak_month}개월차 {peak_total:,}만원"
+            f" (1개월차보다 {peak_total - first:,}만원 늘어남)"
             if rises_later else "이후 변동 없음"
         )
     elif cliff:
@@ -612,8 +616,11 @@ def to_prompt_text(
             lines.append(f"목표 {goal_months}개월. 아래 조합은 모두 목표를 채운다.")
         else:
             # 이 문구를 빠뜨리면 "24개월 버틸 수 있습니다"라고 잘못 안내하게 된다.
+            # 【예방】 미달 폭. 관측된 적은 없으나 목표와 생존이 둘 다 있어 뺄 수 있다.
+            best = max((g.survival_months for g in groups), default=0)
             lines.append(
                 f"⚠ 목표 {goal_months}개월을 채우는 조합이 **하나도 없다.** "
+                f"가장 오래 버티는 것도 {best}개월로 {goal_months - best}개월 모자란다. "
                 f"아래는 그중 나은 차선이며 모두 목표에 미달한다. "
                 f"사용자에게 이 사실을 반드시 알리고, 목표를 낮추거나 "
                 f"고정비 절감 같은 다른 방법을 함께 제안할 것."
@@ -679,10 +686,23 @@ def to_prompt_text(
         )
         lines.append("")
 
+    # 조합마다 번호를 붙인다. 아래 [조합 사이의 차이] 표가 이 번호로 가리킨다.
+    numbered: list[tuple[int, Any, Any]] = []
     for group in groups:
+        for member in group.members:
+            numbered.append((len(numbered) + 1, group, member))
+
+    for group in groups:
+        # 【예방】 무지원 대비 몇 개월 더 버티는지. 폐기로 관측된 적은 없고,
+        # 프롬프트에 두 값(baseline·생존)이 따로 있어 뺄 수 있는 자리라 미리 막는다.
+        gain = (
+            f" · 지원 없이보다 {group.survival_months - baseline_survival}개월 더"
+            if baseline_survival is not None
+            and group.survival_months > baseline_survival else ""
+        )
         head = (
             f"[레이어 {group.layer}] 생존 {group.survival_months}개월"
-            f"(생존 축 {group.survival_rank}위) · "
+            f"(생존 축 {group.survival_rank}위{gain}) · "
             f"종료 시점 부채 {round(group.debt_at_exit / MAN):,}만원"
             f"(부채 축 {group.debt_rank}위)"
         )
@@ -702,7 +722,8 @@ def to_prompt_text(
         lines.append(head)
         for member in group.members:
             report = reports[member.label]
-            lines.append(f"  - {member.label}")
+            idx = next(i for i, _, m in numbered if m is member)
+            lines.append(f"  - ({idx}) {member.label}")
             # 총 상환액은 축이 아니라 정보다. 두 축이 동점인 조합들의 이자 부담
             # 차이가 여기서만 드러난다(거치 중 파산하면 종료 시점 부채가 같아짐).
             # 생존 개월수와 함께 읽어야 한다 — 일찍 죽으면 낼 것이 없어 작아진다.
@@ -749,6 +770,45 @@ def to_prompt_text(
                 "함정이 있거나 신청할 정책이 많아 제외했다."
             )
         lines.append("")
+
+    # ── 조합 쌍 사이의 차이 ──
+    # 【관측】 3차 폐기(2026-09-04)가 여기서 났다. '1번 대비'는 기준 하나에 대한
+    # 값이라, LLM 이 기준이 아닌 두 조합을 비교하면(6,660 - 6,610 = 50) 그 값이
+    # 프롬프트에 없다. excluded 를 쓸 때 "2위로 고른 조합보다"로 비교하므로 자주 닿는다.
+    #
+    # ※ 뺄셈 자리를 찾는 기준 — **프롬프트에서 붙어 있는 값끼리** 먼저 본다.
+    #   폐기 세 건이 모두 그랬다(같은 목록의 총상환 둘 · 같은 경고 안의 상환액과 영업이익 ·
+    #   같은 목록의 부채 둘). 멀리 떨어진 값(머리말의 무지원 생존 vs 그룹 머리의 생존)은
+    #   실측에서 절대값을 그대로 인용했다.
+    #
+    # 쌍마다 한 줄이라 조합이 늘면 **제곱으로** 는다 — 세 값이 모두 같은 쌍은 뺀다.
+    # 데모는 조합 6~9개(15~36쌍)라 차이표가 프롬프트의 20~25%다. 조합이 12개면 66쌍이
+    # 되어 절반을 넘길 수 있다. 재현성 30회에서 실사용자 조합 수·차지 비율·비용을 잰다.
+    # 문제로 확인되면 '상위 N쌍만' 또는 '최종 3개와의 비교만' 같은 대안을 본다.
+    # 부호 표기(+3,926)로 줄이는 안은 이미 기각했다 — 위 _compare 주석 참조.
+    if len(numbered) > 1:
+        pair_lines: list[str] = []
+        for a, (ia, ga, ma) in enumerate(numbered):
+            for ib, gb, mb in numbered[a + 1:]:
+                parts = []
+                d_surv = gb.survival_months - ga.survival_months
+                if d_surv:
+                    parts.append("생존 " + _compare(d_surv, "개월", "더 버팀", "덜 버팀"))
+                d_debt = round(gb.debt_at_exit / MAN) - round(ga.debt_at_exit / MAN)
+                if d_debt:
+                    parts.append("부채 " + _compare(d_debt, "만원", "많음", "적음"))
+                d_total = (round(mb.result.total_payment / MAN)
+                           - round(ma.result.total_payment / MAN))
+                if d_total:
+                    parts.append("총상환 " + _compare(d_total, "만원", "많음", "적음"))
+                if parts:
+                    pair_lines.append(f"  ({ia})→({ib}) " + " · ".join(parts))
+        if pair_lines:
+            lines.append("[조합 사이의 차이] 뒤쪽 조합이 앞쪽보다 어떤지를 적었다. "
+                         "두 조합을 비교할 때는 이 값을 쓰고 직접 빼지 마라.")
+            lines.extend(pair_lines)
+            lines.append("※ 여기 없는 쌍은 세 값이 모두 같다.")
+            lines.append("")
 
     if extras:
         lines.append("")
