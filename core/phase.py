@@ -418,16 +418,23 @@ def judge(
 def neighbor_phases(result: PhaseResult) -> tuple[Phase, ...]:
     """애매할 때 사용자에게 보여줄 선택지.
 
-    기획서 4.2 — 경계면에서는 3지선다로 확인받는다.
-    판정된 국면을 가운데 두고 위아래를 함께 준다.
+    **걸친 경계의 양쪽 둘만 준다.** 애매 점수는 경계 하나에 붙어 있으므로 선택지도
+    늘 둘이다.
+
+        2점·3점 -> 2|3 경계   일시적자금난 / 개선여지
+        5점·6점 -> 5|6 경계   개선여지 / 회복불가
+
+    예전에는 판정된 국면의 위아래를 함께 줘서, 선택지를 둘만 줘야 하는 자리에 셋을
+    준 일이 있었다.
+
+    "정상"은 총점 0점에서만 나오고 애매 판정은 2점 이상에서만 생기므로 선택지에
+    들어가지 않는다.
     """
     if not result.ambiguous:
         return (result.phase,)
-    # "정상"은 총점 0점에서만 나온다. 애매 판정은 2점 이상에서만 생기므로
-    # 선택지에 "정상"이 들어가면 안 된다.
-    order: list[Phase] = ["일시적자금난", "개선여지", "회복불가"]
-    i = order.index(result.phase)  # type: ignore[arg-type]
-    return tuple(order[max(0, i - 1): i + 2])
+    if result.total <= SCORE_TEMPORARY + 1:
+        return ("일시적자금난", "개선여지")
+    return ("개선여지", "회복불가")
 
 
 def describe(result: PhaseResult) -> str:
