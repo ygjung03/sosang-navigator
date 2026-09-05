@@ -2681,7 +2681,10 @@ def render_revenue(revenue: dict, fields: list[str]) -> None:
         restore_from_demo()  # 데모 프리셋이 덮은 답을 되돌린다(위 분기와 같은 이유)
         _num("월 매출 대략값 (만원)", "rough_rev_man", 800, min_value=0, step=10)
         _answers().pop("pos_file", None)  # 소스가 바뀌면 업로드 잔재 제거 (#②)
-    _nav(S_REVENUE, fields, ready=ready)
+    # hint=False — 여기서 ready 가 False 인 것은 파일을 아직 안 올렸을 때뿐이고,
+    # 업로드 상자가 바로 위에 있어 무엇을 해야 하는지 이미 보인다. 읽는 실패는
+    # 오류 문구가 따로 말한다.
+    _nav(S_REVENUE, fields, ready=ready, hint=False)
 
 
 def render_cost(fields: list[str]) -> None:
