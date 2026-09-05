@@ -1088,6 +1088,11 @@ def _cliff_marker(evaluated: Evaluated, report) -> tuple[int, str] | None:
     if cliff is None:
         return None
     at = cliff.at
+    # **소진 시점과 같은 달이면 아무것도 그리지 않는다.** 그 달에는 빨간 소진 세로선이
+    # 이미 서 있어서 ▼ 와 주석이 그 위에 포개진다. 원인과 결과가 같은 달이라 둘로
+    # 나눠 그릴 것이 없다 — 경고 문구도 같은 경우에 한 문장으로 합쳐 나간다.
+    if at == evaluated.result.survival_months:
+        return None
     # **금액을 쓰지 않는다.** 막대 높이가 이미 "여기서 꺾인다"를 보여주고, 정확한 금액은
     # 바로 아래 함정 경고가 시점과 함께 말한다. 여기서 원금만 떼어 적으면(예전 동작)
     # 경고문의 총액과 어긋나 보인다 — 같은 회차의 다른 구성인데 라벨이 그걸 안 밝혔다.

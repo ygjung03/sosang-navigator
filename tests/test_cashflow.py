@@ -110,18 +110,22 @@ def test_grace_cliff():
 
 
 def test_bullet_repayment():
-    """서울시 성장기반자금 2년만기 일시상환 - 24개월차 낭떠러지."""
+    """서울시 성장기반자금 2년만기 일시상환 - 실행 후 24개월차 낭떠러지."""
     p = long_lived_profile()
     c = db.find("seoul_growth_base__2y_bullet")
     r = simulate(p, [Applied(c, 3_000 * MAN)])
     report("서울시 성장기반 3,000만원 (2년만기 일시상환)", r)
 
-    before = r.payment_during[22]
-    at_maturity = r.payment_during[23]  # 24개월차에 원금 전액
-    print(f"   23개월차 {before/MAN:,.0f}만원 -> 24개월차 {at_maturity/MAN:,.0f}만원")
+    # 실행이 지급시점만큼 밀리면 만기도 같이 밀린다. 달을 박지 않고 지급시점에서 센다.
+    payout = int(c.get("지급시점_개월", 0) or 0)
+    before = r.payment_during[payout + 22]
+    at_maturity = r.payment_during[payout + 23]  # 실행 후 24개월차에 원금 전액
+    print(f"   {payout + 23}개월차 {before/MAN:,.0f}만원 -> "
+          f"{payout + 24}개월차 {at_maturity/MAN:,.0f}만원")
     assert at_maturity > 2_500 * MAN, "만기에 원금 전액이 나가야 함"
-    drop = r.debt_at[23] - r.debt_at[24]
-    print(f"   부채잔액 {r.debt_at[23]/MAN:,.0f} -> {r.debt_at[24]/MAN:,.0f}만원")
+    drop = r.debt_at[payout + 23] - r.debt_at[payout + 24]
+    print(f"   부채잔액 {r.debt_at[payout + 23]/MAN:,.0f} -> "
+          f"{r.debt_at[payout + 24]/MAN:,.0f}만원")
     assert drop > 2_900 * MAN, "만기 상환으로 신규 융자 잔액이 사라져야 함"
     return r
 

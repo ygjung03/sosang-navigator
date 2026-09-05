@@ -36,6 +36,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
+from .optimizer import combo_tag
+
 MODEL = "claude-sonnet-5"
 """$2/$10 per MTok. 이 작업은 판단과 서술이라 소넷 급이면 충분하다.
 (Sonnet 3.5 는 2025-10-28 에 은퇴해 쓸 수 없다.)
@@ -155,10 +157,10 @@ SYSTEM_PROMPT = """당신은 서울 소상공인에게 정책 조합을 추천�
    함정은 제외 사유가 아니라 trap_note 로 알릴 사항이다. 판단은 사용자가 한다.
    2개만 고르고 나머지를 excluded 로 보내지 마라.
 
-   **3개는 서로 다른 그룹에서 고른다. 한 그룹에서 둘 이상 뽑지 마라** — 같은 그룹은
-   두 축(생존·부채)이 완전히 같아 사용자에게 선택지가 하나로 보이고, 다른 그룹의 축
-   최상위가 화면에서 사라진다.
-   같은 그룹에 조합이 여럿이면 국면에 비추어 나은 하나만 고르고, 나머지는 excluded 에
+   **3개는 두 축(생존·부채)이 서로 다른 것에서 고른다. 두 축이 완전히 같은 조합끼리는
+   하나만 뽑아라** — 둘을 함께 올리면 사용자에게 선택지가 하나로 보이고, 두 축이 다른
+   조합의 축 최상위가 화면에서 사라진다.
+   두 축이 같은 조합이 여럿이면 국면에 비추어 나은 하나만 고르고, 나머지는 excluded 에
    왜 그쪽이 아닌지 쓴다.
 3. 경고([경고] 줄)를 **사용자의 말로** 풀어 쓴다. '함정 판정 — 4종 모두 해당 없음'
    이라고 적힌 조합은 걸린 것이 없다는 뜻이다. **그 표기를 그대로 옮기지 마라** —
@@ -167,9 +169,9 @@ SYSTEM_PROMPT = """당신은 서울 소상공인에게 정책 조합을 추천�
 4. 자격은 되지만 **추천에서 뺀 이유**를 쓴다. 고르지 않은 조합을 **전부** 넣는다.
    이유는 국면과 사용자 상황에 비추어 "이 사람에게는 왜 아닌지"로 쓴다. 두 갈래가 있고
    각각 판단 재료가 다르다.
-   - 최종 3개에 없는 후보 그룹 → 두 축(생존 개월수·종료 시점 부채)의 차이가 이 사람의
-     국면에서 어떤 뜻인지
-   - 고른 것과 **두 축이 같은 다른 조합** → 두 축으로는 구별되지 않으므로 상환 구조
+   - 고른 것과 **두 축이 다른** 조합 → 두 축(생존 개월수·종료 시점 부채)의 차이가
+     이 사람의 국면에서 어떤 뜻인지
+   - 고른 것과 **두 축이 같은** 조합 → 두 축으로는 구별되지 않으므로 상환 구조
      (거치 후 급증·균등 상환·만기 일시상환 등)가 이 사람의 현금흐름에 어떻게 작용하는지
 5. 실행 순서가 실제로 중요한 조합이면 순서를 제안한다.
 
@@ -197,7 +199,8 @@ excluded.reason)에서 **무엇을 가리킬 때는 아래 것만** 쓴다.
 특성으로만 가리킨다.
 
 **이 목록에 없는 말로 후보를 가리키지 마라.** 특히 우리가 후보를 정리·분류하려고 쓴
-표기 — 레이어 · 그룹 · 후보 · 파레토 · 좌표 · 축 N위 · N번 대비 · **함정** · **4종** —
+표기 — 레이어 · 그룹 · 후보 · 파레토 · 좌표 · 축 N위 · 조합 앞의 글자 · A 대비 ·
+**함정** · **4종** —
 는 정보로만 읽고 문장에 옮기지 마라. 목록에 없으면 위에 적히지 않은 말이라도 쓰지 않는다.
 
 '함정'과 '4종'은 화면에 없는 말이다. 사용자가 보는 것은 경고 상자뿐이다.
@@ -223,6 +226,10 @@ excluded.reason)에서 **무엇을 가리킬 때는 아래 것만** 쓴다.
 있으면 응답 전체가 버려진다.
 
 조합 이름(label)은 프롬프트에 있는 것을 **한 글자도 바꾸지 말고** 그대로 옮겨라.
+괄호가 둘 이상 붙어 있어도 끝까지 옮긴다. 함께 그 조합 앞에 적힌 글자를 tag 에 적어라.
+
+tag 는 우리가 이름과 맞춰 보는 값이다. **사용자가 읽는 문장에는 이 글자를 쓰지 마라** —
+화면에 그 글자는 없다. 조합을 가리킬 때는 이름이나 네가 정한 순위를 쓴다.
 
 ■ 출력
 
@@ -233,6 +240,7 @@ JSON 하나만 출력한다. 설명이나 코드블록 표시를 붙이지 마�
   "picks": [
     {
       "label": "<프롬프트의 조합 이름 원문 그대로>",
+      "tag": "<그 조합 앞의 글자>",
       "axis_focus": "생존 | 부채 | 균형",
       "why": "이 사용자에게 왜 이 조합인지 2~3문장",
       "trap_note": "함정을 사용자 말로. 함정이 없으면 null",
@@ -291,7 +299,7 @@ def _year_months(labels: Sequence[str]) -> set[str]:
     '1년거치 4년 균분상환'을 LLM 이 '12개월 거치'로 풀어 쓰면 프롬프트에 없는 숫자가 되어
     응답이 통째로 버려졌다(실측: A 는 48, B 는 12). 사용자에게 친절한 표기라 막을 이유가
     없다. 반면 뺄셈 같은 **파생 계산은 그대로 막는다** — 그쪽은 optimizer 가 차이값을
-    프롬프트에 실어 해결했다('1번 대비 448만원 적음').
+    프롬프트에 실어 해결했다('A 대비 448만원 적음').
 
     **조합 이름에서만 찾는다.** 프롬프트 전체를 훑으면 자격 문구의 '3년 내' 같은 것까지
     걸려 허용 목록이 넓어지고, 그만큼 환각이 통과할 자리가 생긴다.
@@ -427,6 +435,29 @@ def select_final_three(
     return build_advice(data, prompt_text, labels, usage)
 
 
+def _resolve_label(
+    item: dict, labels: Sequence[str], known: set[str]
+) -> str | None:
+    """고른 조합의 이름을 되찾는다. 못 찾으면 None (호출부가 폐기한다).
+
+    이름을 그대로 옮기는 것이 원칙이고, **태그는 옮겨적기가 어긋났을 때만** 쓴다.
+    실측(2026-09-06, 데모 A 37회 중 4회)에서 어긋난 자리가 늘 꼬리였다 —
+    `소상공인 경영안정 바우처(경영안정 바우처 25만원)` 처럼 정책 이름이 제 괄호
+    안에서 반복되는 라벨에서 뒤 괄호를 통째로 흘렸다. 앞부분은 한 글자도 안 틀렸다.
+
+    태그는 프롬프트가 조합마다 붙인 `(A)~(N)` 이고, `labels` 가 그 순서 그대로
+    넘어온다(`optimizer.to_prompt_text` 의 tagged ↔ `app` 의 members 순회).
+    """
+    label = str(item.get("label", "")).strip()
+    if label in known:
+        return label
+    tag = str(item.get("tag", "")).strip().upper()
+    for index in range(len(labels)):
+        if combo_tag(index) == tag:
+            return labels[index]
+    return None
+
+
 def build_advice(
     data: dict, prompt_text: str, labels: Sequence[str], usage: dict | None = None
 ) -> Advice:
@@ -459,11 +490,13 @@ def build_advice(
                 ok=False, failure=Failure.PARSE,
                 detail=f"picks[{index}] 형식 오류", usage=usage,
             )
-        label = str(item.get("label", "")).strip()
-        if label not in known:
+        label = _resolve_label(item, labels, known)
+        if label is None:
             return Advice(
                 ok=False, failure=Failure.VERIFY,
-                detail=f"프롬프트에 없는 조합을 골랐다: {label[:60]}", usage=usage,
+                detail="프롬프트에 없는 조합을 골랐다: "
+                       f"{str(item.get('label', '')).strip()[:60]}",
+                usage=usage,
             )
         why = str(item.get("why") or "").strip()
         trap_note = str(item.get("trap_note") or "").strip() or None

@@ -69,6 +69,18 @@ DEBT_BUCKET = 10_000
 MAN = 10_000  # 만원. 출력 포맷용
 
 
+def combo_tag(index: int) -> str:
+    """프롬프트에서 조합을 가리키는 태그. 0 -> 'A', 1 -> 'B'.
+
+    숫자가 아니라 글자를 쓴다. 번호로 쓰던 때 LLM 이 사용자 문장에 '1번 조합'을
+    옮겨 적었고(실측 3/30), 화면 카드에는 '1위'가 붙어 있어 순위로 읽힐 수 있었다.
+    글자면 그런 자리가 없다. 26개를 넘으면 두 글자로 이어 붙인다.
+    """
+    if index < 26:
+        return chr(ord("A") + index)
+    return chr(ord("A") + index // 26 - 1) + chr(ord("A") + index % 26)
+
+
 # ══════════════════════════════════════════════════════════
 # 후보 그룹
 # ══════════════════════════════════════════════════════════
@@ -642,7 +654,7 @@ def to_prompt_text(
     )
     lines.append("")
 
-    # ── 1번 후보 대비 차이를 코드가 계산해 넣는다 ──
+    # ── 맨 위 후보(A) 대비 차이를 코드가 계산해 넣는다 ──
     # 후보들이 몰려 있으면(데모 B 는 생존이 전부 같고 부채가 27만원 차이) LLM 이 구별해
     # 설명하려고 직접 뺄셈을 하는데, 그 값은 프롬프트에 없어 숫자 검증이 응답을 통째로
     # 버린다(실측 3회 연속). 차이를 미리 주면 뺄 이유가 없어진다.
@@ -657,7 +669,7 @@ def to_prompt_text(
     # 버그(LLM 이 대표 아닌 멤버를 고르면 그 pick 이 사라졌다)를 고친 사람이 "여기도
     # [0] 이네" 하고 손대기 쉬운 자리인데, 성격이 다르다.
     # 이건 화면에 보일 조합을 고르는 게 아니라 **비교의 기준점**이다. 모든 후보가 같은
-    # 하나를 기준으로 삼아야 '1번 대비'가 성립한다. 어느 것을 기준으로 잡든 상대 관계는
+    # 하나를 기준으로 삼아야 'A 대비'가 성립한다. 어느 것을 기준으로 잡든 상대 관계는
     # 보존되므로 [0] 이어도 무방하고, 기준을 후보마다 다르게 하면 오히려 비교가 깨진다.
     base = groups[0] if groups else None
     base_debt = round(base.debt_at_exit / MAN) if base else 0
@@ -686,11 +698,11 @@ def to_prompt_text(
         )
         lines.append("")
 
-    # 조합마다 번호를 붙인다. 아래 [조합 사이의 차이] 표가 이 번호로 가리킨다.
-    numbered: list[tuple[int, Any, Any]] = []
+    # 조합마다 태그를 붙인다. 아래 [조합 사이의 차이] 표가 이 태그로 가리킨다.
+    tagged: list[tuple[str, Any, Any]] = []
     for group in groups:
         for member in group.members:
-            numbered.append((len(numbered) + 1, group, member))
+            tagged.append((combo_tag(len(tagged)), group, member))
 
     for group in groups:
         # 【예방】 무지원 대비 몇 개월 더 버티는지. 폐기로 관측된 적은 없고,
@@ -707,7 +719,7 @@ def to_prompt_text(
             f"(부채 축 {group.debt_rank}위)"
         )
         if group is base:
-            head += "  ← 아래 '1번 대비'의 기준"
+            head += "  ← 아래 'A 대비'의 기준"
         else:
             parts = []
             if not same_survival:
@@ -718,12 +730,12 @@ def to_prompt_text(
             parts.append("부채 " + _compare(
                 round(group.debt_at_exit / MAN) - base_debt, "만원", "많음", "적음"
             ))
-            head += "  [1번 대비] " + " · ".join(parts)
+            head += "  [A 대비] " + " · ".join(parts)
         lines.append(head)
         for member in group.members:
             report = reports[member.label]
-            idx = next(i for i, _, m in numbered if m is member)
-            lines.append(f"  - ({idx}) {member.label}")
+            tag = next(t for t, _, m in tagged if m is member)
+            lines.append(f"  - ({tag}) {member.label}")
             # 총 상환액은 축이 아니라 정보다. 두 축이 동점인 조합들의 이자 부담
             # 차이가 여기서만 드러난다(거치 중 파산하면 종료 시점 부채가 같아짐).
             # 생존 개월수와 함께 읽어야 한다 — 일찍 죽으면 낼 것이 없어 작아진다.
@@ -733,7 +745,7 @@ def to_prompt_text(
                 f"(월평균 {member.result.monthly_payment_avg / MAN:,.0f}만원)"
             )
             if member is not base_member:
-                total_line += " · 1번 대비 " + _compare(
+                total_line += " · A 대비 " + _compare(
                     total_man - base_total, "만원", "많음", "적음"
                 )
             lines.append(total_line)
@@ -772,7 +784,7 @@ def to_prompt_text(
         lines.append("")
 
     # ── 조합 쌍 사이의 차이 ──
-    # 【관측】 3차 폐기(2026-09-04)가 여기서 났다. '1번 대비'는 기준 하나에 대한
+    # 【관측】 3차 폐기(2026-09-04)가 여기서 났다. 'A 대비'는 기준 하나에 대한
     # 값이라, LLM 이 기준이 아닌 두 조합을 비교하면(6,660 - 6,610 = 50) 그 값이
     # 프롬프트에 없다. excluded 를 쓸 때 "2위로 고른 조합보다"로 비교하므로 자주 닿는다.
     #
@@ -786,10 +798,10 @@ def to_prompt_text(
     # 되어 절반을 넘길 수 있다. 재현성 30회에서 실사용자 조합 수·차지 비율·비용을 잰다.
     # 문제로 확인되면 '상위 N쌍만' 또는 '최종 3개와의 비교만' 같은 대안을 본다.
     # 부호 표기(+3,926)로 줄이는 안은 이미 기각했다 — 위 _compare 주석 참조.
-    if len(numbered) > 1:
+    if len(tagged) > 1:
         pair_lines: list[str] = []
-        for a, (ia, ga, ma) in enumerate(numbered):
-            for ib, gb, mb in numbered[a + 1:]:
+        for a, (ta, ga, ma) in enumerate(tagged):
+            for tb, gb, mb in tagged[a + 1:]:
                 parts = []
                 d_surv = gb.survival_months - ga.survival_months
                 if d_surv:
@@ -802,7 +814,7 @@ def to_prompt_text(
                 if d_total:
                     parts.append("총상환 " + _compare(d_total, "만원", "많음", "적음"))
                 if parts:
-                    pair_lines.append(f"  ({ia})→({ib}) " + " · ".join(parts))
+                    pair_lines.append(f"  ({ta})→({tb}) " + " · ".join(parts))
         if pair_lines:
             lines.append("[조합 사이의 차이] 뒤쪽 조합이 앞쪽보다 어떤지를 적었다. "
                          "두 조합을 비교할 때는 이 값을 쓰고 직접 빼지 마라.")
